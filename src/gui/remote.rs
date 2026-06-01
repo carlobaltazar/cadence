@@ -30,7 +30,7 @@ pub unsafe fn show_remote_dialog(parent: HWND) {
     let sy = parent_rect.bottom + 4;
 
     let hwnd = register_and_create_dialog(
-        "Ranify2Remote", "Remote Control",
+        "CadenceRemote", "Remote Control",
         remote_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
@@ -552,7 +552,7 @@ unsafe fn save_remote_config<F: FnOnce(&mut config::AppConfig)>(hwnd: HWND, upda
     if !ptr.is_null() {
         updater(&mut (*ptr).config);
         if let Err(e) = config::save_config(&(*ptr).config) {
-            eprintln!("[Ranify2] Config save failed: {}", e);
+            eprintln!("[Cadence] Config save failed: {}", e);
         }
     }
 }

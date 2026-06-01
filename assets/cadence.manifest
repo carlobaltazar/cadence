@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
-    version="2.0.0.0"
+    version="3.0.0.0"
     processorArchitecture="amd64"
-    name="Ranify2"
+    name="Cadence"
     type="win32"
   />
-  <description>Ranify2</description>
+  <description>Cadence</description>
 
   <!-- Run without admin privileges -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

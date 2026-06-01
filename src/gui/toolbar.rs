@@ -23,7 +23,7 @@ pub(crate) struct ToolbarControls {
 
 pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
     unsafe {
-        let class_name = wide("Ranify2Main");
+        let class_name = wide("CadenceMain");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
 
         let wc = WNDCLASSEXW {
@@ -67,7 +67,7 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
         let x = screen_w - actual_w - 10;
         let y = 10;
 
-        let title = wide("Ranify2");
+        let title = wide("Cadence");
         let hwnd = CreateWindowExW(
             ex_style as u32,
             class_name.as_ptr(),
@@ -263,7 +263,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         player::set_loop_mode(checked);
                         (*ptr).config.loop_playback = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
-                            eprintln!("[Ranify2] Config save failed: {}", e);
+                            eprintln!("[Cadence] Config save failed: {}", e);
                         }
                     }
                 }
@@ -280,7 +280,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         SetWindowPos(hwnd, z_order, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
                         (*ptr).config.always_on_top = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
-                            eprintln!("[Ranify2] Config save failed: {}", e);
+                            eprintln!("[Cadence] Config save failed: {}", e);
                         }
                     }
                 }
@@ -310,7 +310,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         }
                         (*ptr).config.hp_monitor_enabled = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
-                            eprintln!("[Ranify2] Config save failed: {}", e);
+                            eprintln!("[Cadence] Config save failed: {}", e);
                         }
                     }
                 }
@@ -340,7 +340,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         }
                         (*ptr).config.mp_monitor_enabled = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
-                            eprintln!("[Ranify2] Config save failed: {}", e);
+                            eprintln!("[Cadence] Config save failed: {}", e);
                         }
                     }
                 }
@@ -370,7 +370,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         }
                         (*ptr).config.sp_monitor_enabled = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
-                            eprintln!("[Ranify2] Config save failed: {}", e);
+                            eprintln!("[Cadence] Config save failed: {}", e);
                         }
                     }
                 }
@@ -386,7 +386,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         }
                         (*ptr).config.pet_cycle_enabled = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
-                            eprintln!("[Ranify2] Config save failed: {}", e);
+                            eprintln!("[Cadence] Config save failed: {}", e);
                         }
                     }
                 }

@@ -1,12 +1,12 @@
-; Ranify2 Inno Setup Installer Script
+; Cadence Inno Setup Installer Script
 
-#define MyAppName "Ranify2"
-#define MyAppVersion "2.1.0"
-#define MyAppPublisher "Ranify2"
-#define MyAppExeName "ranify2.exe"
+#define MyAppName "Cadence"
+#define MyAppVersion "3.0.0"
+#define MyAppPublisher "Cadence"
+#define MyAppExeName "cadence.exe"
 
 [Setup]
-AppId={{01E74434-7C24-422E-9BD4-DCD4E0BDC2DB}
+AppId={{936CDF8F-0203-499A-8B17-D7496C621F48}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
@@ -14,7 +14,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=Output
-OutputBaseFilename=Ranify2Setup
+OutputBaseFilename=CadenceSetup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -23,8 +23,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-; Uncomment the line below after adding assets/ranify2.ico
-; SetupIconFile=..\assets\ranify2.ico
+; Uncomment the line below after adding assets/cadence.ico
+; SetupIconFile=..\assets\cadence.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

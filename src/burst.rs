@@ -47,7 +47,7 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
     ACTIVE.store(true, Ordering::Release);
 
     thread::spawn(move || {
-        println!("[Ranify2] Burst Q started ({} Hz)", rate);
+        println!("[Cadence] Burst Q started ({} Hz)", rate);
 
         let vk: u16 = 0x51; // Q
         let scan_code = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
@@ -79,7 +79,7 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
             if !game_hwnd.is_null() {
                 let fg = unsafe { GetForegroundWindow() };
                 if fg != game_hwnd {
-                    println!("[Ranify2] Burst Q stopped (focus lost).");
+                    println!("[Cadence] Burst Q stopped (focus lost).");
                     break;
                 }
             }
@@ -96,7 +96,7 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
         }
 
         ACTIVE.store(false, Ordering::Release);
-        println!("[Ranify2] Burst Q stopped.");
+        println!("[Cadence] Burst Q stopped.");
 
         // Wake the UI so the toolbar visual flips back to idle even when
         // the burst stopped by itself (focus loss).

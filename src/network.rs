@@ -34,28 +34,28 @@ pub fn start_listener(port: u16, password: Option<String>) -> Result<(), String>
     *lock_or_recover(&LISTENER_ERROR) = None;
 
     std::thread::spawn(move || {
-        println!("[Ranify2] Receiver listening on port {}", port);
+        println!("[Cadence] Receiver listening on port {}", port);
         loop {
             if LISTENER_SHUTDOWN.load(Ordering::Acquire) {
                 break;
             }
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    println!("[Ranify2] Connection from {}", addr);
+                    println!("[Cadence] Connection from {}", addr);
                     handle_client(stream, &password);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 Err(e) => {
-                    eprintln!("[Ranify2] Accept error: {}", e);
+                    eprintln!("[Cadence] Accept error: {}", e);
                     *lock_or_recover(&LISTENER_ERROR) = Some(format!("{}", e));
                     break;
                 }
             }
         }
         LISTENER_RUNNING.store(false, Ordering::Release);
-        println!("[Ranify2] Receiver stopped.");
+        println!("[Cadence] Receiver stopped.");
     });
 
     Ok(())

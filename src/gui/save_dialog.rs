@@ -27,7 +27,7 @@ pub unsafe fn show_save_dialog() {
     let sy = (screen_h - sh) / 2;
 
     let hwnd = register_and_create_dialog(
-        "Ranify2SaveDialog", "Save",
+        "CadenceSaveDialog", "Save",
         save_dialog_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
@@ -113,7 +113,7 @@ unsafe extern "system" fn save_dialog_wnd_proc(
                 if let Some(evts) = events {
                     let seq = sequence::Sequence::new(name, evts);
                     if let Err(e) = storage::save_sequence(&seq) {
-                        eprintln!("[Ranify2] Failed to save: {}", e);
+                        eprintln!("[Cadence] Failed to save: {}", e);
                     }
                     refresh_bindings();
                     // Refresh sequences window if open

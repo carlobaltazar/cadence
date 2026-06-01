@@ -20,7 +20,7 @@ pub fn start(interval_secs: u64) {
     ACTIVE.store(true, Ordering::Release);
 
     thread::spawn(move || {
-        println!("[Ranify2] Pet cycle started (interval: {}s)", interval_secs);
+        println!("[Cadence] Pet cycle started (interval: {}s)", interval_secs);
 
         // Get scan code for 'A' key (VK 0x41)
         let vk: u16 = 0x41;
@@ -30,7 +30,7 @@ pub fn start(interval_secs: u64) {
             // Sleep in 1-second chunks so we can respond to cancel quickly
             for _ in 0..interval_secs {
                 if CANCEL.load(Ordering::Acquire) {
-                    println!("[Ranify2] Pet cycle stopped.");
+                    println!("[Cadence] Pet cycle stopped.");
                     ACTIVE.store(false, Ordering::Release);
                     return;
                 }
@@ -48,10 +48,10 @@ pub fn start(interval_secs: u64) {
 
             player::send_key_press(vk, scan_code);
 
-            println!("[Ranify2] Pet cycle: hide/call sent.");
+            println!("[Cadence] Pet cycle: hide/call sent.");
         }
 
-        println!("[Ranify2] Pet cycle stopped.");
+        println!("[Cadence] Pet cycle stopped.");
         ACTIVE.store(false, Ordering::Release);
     });
 }

@@ -42,12 +42,12 @@ pub fn is_shuffle_mode() -> bool {
 
 pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
     if sequences.is_empty() {
-        println!("[Ranify2] Empty queue.");
+        println!("[Cadence] Empty queue.");
         return;
     }
 
     if PLAYING.load(Ordering::Acquire) {
-        println!("[Ranify2] Already playing.");
+        println!("[Cadence] Already playing.");
         return;
     }
 
@@ -67,7 +67,7 @@ pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
         };
 
         let total_sequences = sequences.len();
-        println!("[Ranify2] Playing queue of {} sequences...", total_sequences);
+        println!("[Cadence] Playing queue of {} sequences...", total_sequences);
 
         let mut order: Vec<usize> = (0..total_sequences).collect();
         let mut cancelled = false;
@@ -82,7 +82,7 @@ pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
             for (seq_idx, &idx) in order.iter().enumerate() {
                 for (j, event) in sequences[idx].iter().enumerate() {
                     if CANCEL.load(Ordering::Acquire) {
-                        println!("[Ranify2] Queue playback cancelled.");
+                        println!("[Cadence] Queue playback cancelled.");
                         cancelled = true;
                         break;
                     }
@@ -159,19 +159,19 @@ pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
             }
         }
 
-        println!("[Ranify2] Queue playback finished.");
+        println!("[Cadence] Queue playback finished.");
         PLAYING.store(false, Ordering::Release);
     });
 }
 
 pub fn play_sequence(events: Vec<InputEvent>) {
     if events.is_empty() {
-        println!("[Ranify2] No events to play.");
+        println!("[Cadence] No events to play.");
         return;
     }
 
     if PLAYING.load(Ordering::Acquire) {
-        println!("[Ranify2] Already playing.");
+        println!("[Cadence] Already playing.");
         return;
     }
 
@@ -192,14 +192,14 @@ pub fn play_sequence(events: Vec<InputEvent>) {
         };
 
         let event_count = events.len();
-        println!("[Ranify2] Playing {} events...", event_count);
+        println!("[Cadence] Playing {} events...", event_count);
 
         let mut cancelled = false;
         loop {
             for (i, event) in events.iter().enumerate() {
                 if CANCEL.load(Ordering::Acquire) {
                     println!(
-                        "[Ranify2] Playback cancelled at event {}/{}",
+                        "[Cadence] Playback cancelled at event {}/{}",
                         i, event_count
                     );
                     cancelled = true;
@@ -271,7 +271,7 @@ pub fn play_sequence(events: Vec<InputEvent>) {
             }
         }
 
-        println!("[Ranify2] Playback finished.");
+        println!("[Cadence] Playback finished.");
         PLAYING.store(false, Ordering::Release);
     });
 }

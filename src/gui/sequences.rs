@@ -27,7 +27,7 @@ pub unsafe fn show_sequences_window(parent: HWND) {
     let sy = parent_rect.bottom + 4;
 
     let hwnd = register_and_create_dialog(
-        "Ranify2List", "Items",
+        "CadenceList", "Items",
         sequences_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
@@ -233,7 +233,7 @@ unsafe fn handle_delete_seq(hwnd: HWND) {
         );
         if result == IDYES {
             if let Err(e) = storage::delete_sequence(&name) {
-                eprintln!("[Ranify2] Failed to delete sequence: {}", e);
+                eprintln!("[Cadence] Failed to delete sequence: {}", e);
             }
             refresh_bindings();
             // Clear default sequence if it was the deleted one

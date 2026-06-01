@@ -25,7 +25,7 @@ pub unsafe fn show_bind_key_dialog(parent: HWND) {
     let sy = parent_rect.top + 100;
 
     let hwnd = register_and_create_dialog(
-        "Ranify2BindKey", "Bind Key",
+        "CadenceBindKey", "Bind Key",
         bind_key_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
@@ -129,7 +129,7 @@ unsafe extern "system" fn bind_key_wnd_proc(
                             }
                         }
                         if let Err(e) = storage::save_sequence(&seq) {
-                            eprintln!("[Ranify2] Failed to save sequence binding: {}", e);
+                            eprintln!("[Cadence] Failed to save sequence binding: {}", e);
                         }
                         refresh_bindings();
                         sequences::refresh_sequences_list();

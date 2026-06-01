@@ -24,7 +24,7 @@ pub unsafe fn show_rename_dialog(parent: HWND) {
     let sy = parent_rect.top + 150;
 
     let hwnd = register_and_create_dialog(
-        "Ranify2RenameDialog", "Rename",
+        "CadenceRenameDialog", "Rename",
         rename_dialog_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,

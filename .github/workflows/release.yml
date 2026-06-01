@@ -25,12 +25,12 @@ jobs:
 
       - name: Build installer
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\ranify2.iss
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\cadence.iss
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            installer/Output/Ranify2Setup.exe
-            target/release/ranify2.exe
+            installer/Output/CadenceSetup.exe
+            target/release/cadence.exe
           generate_release_notes: true

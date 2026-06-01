@@ -55,7 +55,7 @@ fn main() {
     // Create GUI toolbar window
     let hwnd = gui::create_toolbar_window(&cfg);
     if hwnd.is_null() {
-        eprintln!("[Ranify2] Failed to create window.");
+        eprintln!("[Cadence] Failed to create window.");
         return;
     }
 
@@ -64,7 +64,7 @@ fn main() {
     if !hotkeys::install_hook(cfg.record_vk, cfg.stop_vk) {
         unsafe {
             let msg = win32_helpers::wide("Failed to install hotkey hook.");
-            let title = win32_helpers::wide("Ranify2 Error");
+            let title = win32_helpers::wide("Cadence Error");
             MessageBoxW(
                 std::ptr::null_mut(),
                 msg.as_ptr(),
@@ -109,7 +109,7 @@ fn main() {
             Some(cfg.remote_password.clone())
         };
         if let Err(e) = network::start_listener(cfg.remote_port, password) {
-            eprintln!("[Ranify2] Auto-listen failed: {}", e);
+            eprintln!("[Cadence] Auto-listen failed: {}", e);
         }
     }
 
@@ -171,7 +171,7 @@ fn main() {
         if msg.message == WM_APP_BURST_STOPPED {
             unsafe {
                 let toplevel = FindWindowW(
-                    win32_helpers::wide("Ranify2Main").as_ptr(),
+                    win32_helpers::wide("CadenceMain").as_ptr(),
                     std::ptr::null(),
                 );
                 if !toplevel.is_null() {
@@ -217,7 +217,7 @@ fn main() {
                                 let pw = pw.clone();
                                 std::thread::spawn(move || {
                                     if let Err(e) = network::send_command(&host, port, pw.as_deref(), &cmd) {
-                                        eprintln!("[Ranify2] Remote send to {} failed: {}", host, e);
+                                        eprintln!("[Cadence] Remote send to {} failed: {}", host, e);
                                     }
                                 });
                             }

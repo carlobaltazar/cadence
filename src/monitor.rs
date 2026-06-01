@@ -101,7 +101,7 @@ pub fn set_bar(
     b.ref_color.store(ref_color, Ordering::Release);
     b.enabled.store(true, Ordering::Release);
     println!(
-        "[Ranify2] {} monitor enabled (cx={} cy={} ref=0x{:06X})",
+        "[Cadence] {} monitor enabled (cx={} cy={} ref=0x{:06X})",
         BAR_NAME[bar as usize], x, y, ref_color
     );
     ensure_running();
@@ -111,7 +111,7 @@ pub fn set_bar(
 /// exits on its own once no bar is enabled.
 pub fn disable_bar(bar: Bar) {
     BARS[bar as usize].enabled.store(false, Ordering::Release);
-    println!("[Ranify2] {} monitor disabled.", BAR_NAME[bar as usize]);
+    println!("[Cadence] {} monitor disabled.", BAR_NAME[bar as usize]);
 }
 
 /// Stop the worker thread (and implicitly all bars stay configured but unsampled).
@@ -213,7 +213,7 @@ fn ensure_running() {
             timer.precise_wait_micros(POLL_INTERVAL_MICROS);
         }
 
-        println!("[Ranify2] Bar monitor thread stopped.");
+        println!("[Cadence] Bar monitor thread stopped.");
         ACTIVE.store(false, Ordering::Release);
     });
 }

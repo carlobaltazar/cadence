@@ -1,6 +1,6 @@
 [package]
-name = "ranify2"
-version = "2.1.0"
+name = "cadence"
+version = "3.0.0"
 edition = "2021"
 
 [dependencies]

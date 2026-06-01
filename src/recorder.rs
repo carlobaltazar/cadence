@@ -52,7 +52,7 @@ pub fn start_recording() {
         KB_HOOK.store(kb as isize, Ordering::Release);
     }
 
-    println!("[Ranify2] Recording started... Press F8 to stop.");
+    println!("[Cadence] Recording started... Press F8 to stop.");
 }
 
 pub fn stop_recording() -> Option<Vec<InputEvent>> {
@@ -77,7 +77,7 @@ pub fn stop_recording() -> Option<Vec<InputEvent>> {
             0
         };
         println!(
-            "[Ranify2] Recording stopped. {} events captured ({} ms)",
+            "[Cadence] Recording stopped. {} events captured ({} ms)",
             count, duration_ms
         );
         Some(state.events)

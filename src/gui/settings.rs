@@ -133,7 +133,7 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
     let sy = parent_rect.bottom + 4;
 
     let hwnd = register_and_create_dialog(
-        "Ranify2Settings", "Settings",
+        "CadenceSettings", "Settings",
         settings_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
@@ -621,7 +621,7 @@ unsafe extern "system" fn settings_wnd_proc(
                             (*ptr).config.sp_monitor_color = SAMPLED_COLOR[2].load(Ordering::Acquire);
 
                             if let Err(e) = config::save_config(&(*ptr).config) {
-                                eprintln!("[Ranify2] Config save failed: {}", e);
+                                eprintln!("[Cadence] Config save failed: {}", e);
                             }
 
                             // Push the just-saved settings into the live monitor so a
@@ -746,7 +746,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     let mut client_pt = pt;
                     let anchored = !top_under.is_null()
                         && !under_class.is_empty()
-                        && !under_class.starts_with("Ranify2")
+                        && !under_class.starts_with("Cadence")
                         && ScreenToClient(top_under, &mut client_pt) != 0;
 
                     let (saved_x, saved_y, saved_class, saved_title) = if anchored {
