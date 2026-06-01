@@ -42,22 +42,11 @@ pub fn start(interval_secs: u64) {
                 break;
             }
 
-            // Hold the global input lock across the entire hide→wait→call
-            // burst so HP monitor / recorded playback cannot fire keys
-            // between the two A presses and break the sequence.
-            {
-                let guard = player::lock_input_burst();
-                // Press "A" (hide pet)
-                player::send_key_input_locked(&guard, vk, scan_code, KEYEVENTF_SCANCODE);
-                player::send_key_input_locked(&guard, vk, scan_code, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
+            player::send_key_press(vk, scan_code);
 
-                // Wait 300ms
-                thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(300));
 
-                // Press "A" again (call pet)
-                player::send_key_input_locked(&guard, vk, scan_code, KEYEVENTF_SCANCODE);
-                player::send_key_input_locked(&guard, vk, scan_code, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP);
-            }
+            player::send_key_press(vk, scan_code);
 
             println!("[Ranify2] Pet cycle: hide/call sent.");
         }

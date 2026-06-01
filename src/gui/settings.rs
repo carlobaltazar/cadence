@@ -2,7 +2,7 @@ use crate::win32_helpers::{wide, create_control, register_and_create_dialog, pop
 use crate::{burst, config, hotkeys};
 use super::*;
 use super::toolbar::ToolbarControls;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -12,10 +12,109 @@ use winapi::um::winuser::*;
 const GA_ROOT: u32 = 2;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
-static SAMPLED_COLOR: AtomicU32 = AtomicU32::new(0);
+// Per-bar sampled color, indexed 0=HP, 1=MP, 2=SP.
+static SAMPLED_COLOR: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+// Window class/title are shared across bars (same game window).
 static SAMPLED_CLASS: Mutex<String> = Mutex::new(String::new());
 static SAMPLED_TITLE: Mutex<String> = Mutex::new(String::new());
 static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Which bar the live picker is currently capturing for (0=HP,1=MP,2=SP).
+static PICK_TARGET: AtomicU8 = AtomicU8::new(0);
+
+/// Map a bar target (0=HP,1=MP,2=SP) to its dialog control IDs:
+/// (edit_x, edit_y, color_label, pick_button, live_label).
+fn pick_ctrl_ids(target: u8) -> (u16, u16, u16, u16, u16) {
+    match target {
+        1 => (IDC_EDIT_MP_X, IDC_EDIT_MP_Y, IDC_STATIC_MP_COLOR, IDC_BTN_MP_PICK, IDC_STATIC_MP_LIVE),
+        2 => (IDC_EDIT_SP_X, IDC_EDIT_SP_Y, IDC_STATIC_SP_COLOR, IDC_BTN_SP_PICK, IDC_STATIC_SP_LIVE),
+        _ => (IDC_EDIT_HP_X, IDC_EDIT_HP_Y, IDC_STATIC_HP_COLOR, IDC_BTN_HP_PICK, IDC_STATIC_HP_LIVE),
+    }
+}
+
+const BAR_LABELS: [&str; 3] = ["HP", "MP", "SP"];
+
+/// Build one monitor section (header, X/Y edits, Pick/Sample buttons, color +
+/// live labels) at vertical origin `y0`. Mirrors the hand-laid HP section.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_section_controls(
+    hwnd: HWND,
+    hinstance: HINSTANCE,
+    font: HFONT,
+    label: &str,
+    y0: i32,
+    edit_x: u16,
+    edit_y: u16,
+    pick: u16,
+    sample: u16,
+    color: u16,
+    live: u16,
+) {
+    create_control(
+        hwnd, hinstance, font, "STATIC", &format!("\u{2014} {} Monitor \u{2014}", label),
+        WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, y0, 272, 18, 0,
+    );
+    create_control(
+        hwnd, hinstance, font, "STATIC", "X:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 26, 16, 20, 0,
+    );
+    create_control(
+        hwnd, hinstance, font, "EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0, 30, y0 + 24, 70, 22, edit_x,
+    );
+    create_control(
+        hwnd, hinstance, font, "STATIC", "Y:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 112, y0 + 26, 16, 20, 0,
+    );
+    create_control(
+        hwnd, hinstance, font, "EDIT", "",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0, 130, y0 + 24, 70, 22, edit_y,
+    );
+    create_control(
+        hwnd, hinstance, font, "BUTTON", "Pick",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 210, y0 + 24, 60, 22, pick,
+    );
+    create_control(
+        hwnd, hinstance, font, "BUTTON", "Sample",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, y0 + 56, 60, 24, sample,
+    );
+    create_control(
+        hwnd, hinstance, font, "STATIC", "(not sampled)",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 80, y0 + 59, 190, 20, color,
+    );
+    create_control(
+        hwnd, hinstance, font, "STATIC", "",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 86, 268, 20, live,
+    );
+}
+
+/// Read an integer from a numeric edit control, defaulting to 0.
+unsafe fn read_edit_i32(hwnd: HWND, id: u16) -> i32 {
+    let mut buf = [0u16; 16];
+    GetWindowTextW(GetDlgItem(hwnd, id as i32), buf.as_mut_ptr(), 16);
+    let s: String = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
+    s.parse().unwrap_or(0)
+}
+
+/// Pre-fill a section's X/Y edits and color label + sampled-color slot from config.
+unsafe fn prepopulate_section(hwnd: HWND, target: u8, x: i32, y: i32, color: u32) {
+    let (edit_x, edit_y, color_id, _pick, _live) = pick_ctrl_ids(target);
+    if x != 0 || y != 0 {
+        let x_text = wide(&x.to_string());
+        let y_text = wide(&y.to_string());
+        SetWindowTextW(GetDlgItem(hwnd, edit_x as i32), x_text.as_ptr());
+        SetWindowTextW(GetDlgItem(hwnd, edit_y as i32), y_text.as_ptr());
+    }
+    if color != 0 {
+        SAMPLED_COLOR[target as usize].store(color, Ordering::Release);
+        let r = color & 0xFF;
+        let g = (color >> 8) & 0xFF;
+        let b = (color >> 16) & 0xFF;
+        let text = wide(&format!("R:{} G:{} B:{}", r, g, b));
+        SetWindowTextW(GetDlgItem(hwnd, color_id as i32), text.as_ptr());
+    } else {
+        SAMPLED_COLOR[target as usize].store(0, Ordering::Release);
+    }
+}
 
 pub unsafe fn show_settings_dialog(parent: HWND) {
     let existing = SETTINGS_HWND.load(Ordering::Acquire) as HWND;
@@ -38,7 +137,7 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
         settings_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 300, 416,
+        sx, sy, 300, 630,
         parent, hinstance,
     );
     SETTINGS_HWND.store(hwnd as isize, Ordering::Release);
@@ -192,17 +291,33 @@ unsafe extern "system" fn settings_wnd_proc(
                     SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_Y as i32), y_text.as_ptr());
                 }
                 if cfg.hp_monitor_color != 0 {
-                    SAMPLED_COLOR.store(cfg.hp_monitor_color, Ordering::Release);
+                    SAMPLED_COLOR[0].store(cfg.hp_monitor_color, Ordering::Release);
                     let r = cfg.hp_monitor_color & 0xFF;
                     let g = (cfg.hp_monitor_color >> 8) & 0xFF;
                     let b = (cfg.hp_monitor_color >> 16) & 0xFF;
                     let color_text = wide(&format!("R:{} G:{} B:{}", r, g, b));
                     SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_COLOR as i32), color_text.as_ptr());
                 } else {
-                    SAMPLED_COLOR.store(0, Ordering::Release);
+                    SAMPLED_COLOR[0].store(0, Ordering::Release);
                 }
                 *lock_or_recover(&SAMPLED_CLASS) = cfg.hp_monitor_window_class.clone();
                 *lock_or_recover(&SAMPLED_TITLE) = cfg.hp_monitor_window_title.clone();
+            }
+
+            // -- MP Monitor section --
+            create_section_controls(hwnd, hinstance, font, "MP", 340,
+                IDC_EDIT_MP_X, IDC_EDIT_MP_Y, IDC_BTN_MP_PICK, IDC_BTN_MP_SAMPLE,
+                IDC_STATIC_MP_COLOR, IDC_STATIC_MP_LIVE);
+            // -- SP Monitor section --
+            create_section_controls(hwnd, hinstance, font, "SP", 452,
+                IDC_EDIT_SP_X, IDC_EDIT_SP_Y, IDC_BTN_SP_PICK, IDC_BTN_SP_SAMPLE,
+                IDC_STATIC_SP_COLOR, IDC_STATIC_SP_LIVE);
+
+            // Pre-populate MP/SP fields from config
+            if !parent_ptr.is_null() {
+                let cfg = &(*parent_ptr).config;
+                prepopulate_section(hwnd, 1, cfg.mp_monitor_x, cfg.mp_monitor_y, cfg.mp_monitor_color);
+                prepopulate_section(hwnd, 2, cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
             }
 
             // -- Burst Q section --
@@ -265,43 +380,68 @@ unsafe extern "system" fn settings_wnd_proc(
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_BURST_RATE as i32), rate_text.as_ptr());
             }
 
-            // OK button
+            let _ = parent2_ptr;
+
+            // OK button (below the SP monitor section)
             create_control(
                 hwnd, hinstance, font, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                115, 340, 70, 28, IDC_BTN_SETTINGS_OK,
+                115, 572, 70, 28, IDC_BTN_SETTINGS_OK,
             );
 
             0
         }
         WM_COMMAND => {
             let control_id = LOWORD(w_param as u32);
-            if control_id == IDC_BTN_HP_PICK {
-                // Toggle pick mode
+            if control_id == IDC_BTN_HP_PICK
+                || control_id == IDC_BTN_MP_PICK
+                || control_id == IDC_BTN_SP_PICK
+            {
+                let target: u8 = if control_id == IDC_BTN_MP_PICK {
+                    1
+                } else if control_id == IDC_BTN_SP_PICK {
+                    2
+                } else {
+                    0
+                };
+                // Toggle pick mode (only one bar picks at a time)
                 if PICKING.load(Ordering::Acquire) {
-                    // Stop picking
+                    // Stop picking — reset whichever section was active
                     PICKING.store(false, Ordering::Release);
                     KillTimer(hwnd, TIMER_HP_PICK);
-                    let text = wide("Pick");
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HP_PICK as i32), text.as_ptr());
-                    let text = wide("");
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_LIVE as i32), text.as_ptr());
+                    let active = PICK_TARGET.load(Ordering::Acquire);
+                    let (_x, _y, _c, active_pick, active_live) = pick_ctrl_ids(active);
+                    SetWindowTextW(GetDlgItem(hwnd, active_pick as i32), wide("Pick").as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, active_live as i32), wide("").as_ptr());
                 } else {
                     // Start picking — poll cursor every 50ms
+                    PICK_TARGET.store(target, Ordering::Release);
                     PICKING.store(true, Ordering::Release);
                     SetTimer(hwnd, TIMER_HP_PICK, 50, None);
-                    let text = wide("Stop");
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HP_PICK as i32), text.as_ptr());
-                    let text = wide("Move to HP pixel, press INSERT");
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_LIVE as i32), text.as_ptr());
+                    let (_x, _y, _c, pick_id, live_id) = pick_ctrl_ids(target);
+                    SetWindowTextW(GetDlgItem(hwnd, pick_id as i32), wide("Stop").as_ptr());
+                    let msg = format!("Move to {} pixel, press INSERT", BAR_LABELS[target as usize]);
+                    SetWindowTextW(GetDlgItem(hwnd, live_id as i32), wide(&msg).as_ptr());
                 }
                 return 0;
-            } else if control_id == IDC_BTN_HP_SAMPLE {
+            } else if control_id == IDC_BTN_HP_SAMPLE
+                || control_id == IDC_BTN_MP_SAMPLE
+                || control_id == IDC_BTN_SP_SAMPLE
+            {
+                let target: u8 = if control_id == IDC_BTN_MP_SAMPLE {
+                    1
+                } else if control_id == IDC_BTN_SP_SAMPLE {
+                    2
+                } else {
+                    0
+                };
+                let (edit_x_id, edit_y_id, color_id, _pick, _live) = pick_ctrl_ids(target);
+
                 // Read X, Y from edit boxes and sample pixel color
                 let mut buf_x = [0u16; 16];
                 let mut buf_y = [0u16; 16];
-                GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_X as i32), buf_x.as_mut_ptr(), 16);
-                GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_Y as i32), buf_y.as_mut_ptr(), 16);
+                GetWindowTextW(GetDlgItem(hwnd, edit_x_id as i32), buf_x.as_mut_ptr(), 16);
+                GetWindowTextW(GetDlgItem(hwnd, edit_y_id as i32), buf_y.as_mut_ptr(), 16);
 
                 let x_str: String = buf_x.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
                 let y_str: String = buf_y.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
@@ -344,7 +484,7 @@ unsafe extern "system" fn settings_wnd_proc(
 
                     if !class.is_empty() && sample_hwnd.is_null() {
                         let text = wide("(target window not found)");
-                        SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_COLOR as i32), text.as_ptr());
+                        SetWindowTextW(GetDlgItem(hwnd, color_id as i32), text.as_ptr());
                     } else {
                         let hdc = GetDC(sample_hwnd);
                         if !hdc.is_null() {
@@ -352,21 +492,21 @@ unsafe extern "system" fn settings_wnd_proc(
                             ReleaseDC(sample_hwnd, hdc);
 
                             if color != 0xFFFFFFFF {
-                                SAMPLED_COLOR.store(color, Ordering::Release);
+                                SAMPLED_COLOR[target as usize].store(color, Ordering::Release);
                                 let r = color & 0xFF;
                                 let g = (color >> 8) & 0xFF;
                                 let b = (color >> 16) & 0xFF;
                                 let text = wide(&format!("R:{} G:{} B:{}", r, g, b));
-                                SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_COLOR as i32), text.as_ptr());
+                                SetWindowTextW(GetDlgItem(hwnd, color_id as i32), text.as_ptr());
                             } else {
                                 let text = wide("(invalid pixel)");
-                                SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_COLOR as i32), text.as_ptr());
+                                SetWindowTextW(GetDlgItem(hwnd, color_id as i32), text.as_ptr());
                             }
                         }
                     }
                 } else {
                     let msg = wide("Enter valid X and Y coordinates.");
-                    let title = wide("HP Monitor");
+                    let title = wide(&format!("{} Monitor", BAR_LABELS[target as usize]));
                     MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
                 }
                 return 0;
@@ -461,23 +601,54 @@ unsafe extern "system" fn settings_wnd_proc(
                             (*ptr).config.burst_vk = new_burst_vk.unwrap_or(0);
                             (*ptr).config.burst_rate_hz = new_burst_rate;
 
-                            // Save HP monitor settings
-                            let mut buf_x = [0u16; 16];
-                            let mut buf_y = [0u16; 16];
-                            GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_X as i32), buf_x.as_mut_ptr(), 16);
-                            GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_Y as i32), buf_y.as_mut_ptr(), 16);
-                            let x_str: String = buf_x.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
-                            let y_str: String = buf_y.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
-                            (*ptr).config.hp_monitor_x = x_str.parse().unwrap_or(0);
-                            (*ptr).config.hp_monitor_y = y_str.parse().unwrap_or(0);
-                            (*ptr).config.hp_monitor_color = SAMPLED_COLOR.load(Ordering::Acquire);
+                            // Save HP monitor settings. MP/SP share the window anchor.
+                            (*ptr).config.hp_monitor_x = read_edit_i32(hwnd, IDC_EDIT_HP_X);
+                            (*ptr).config.hp_monitor_y = read_edit_i32(hwnd, IDC_EDIT_HP_Y);
+                            (*ptr).config.hp_monitor_color = SAMPLED_COLOR[0].load(Ordering::Acquire);
                             (*ptr).config.hp_monitor_window_class =
                                 lock_or_recover(&SAMPLED_CLASS).clone();
                             (*ptr).config.hp_monitor_window_title =
                                 lock_or_recover(&SAMPLED_TITLE).clone();
 
+                            // Save MP monitor settings
+                            (*ptr).config.mp_monitor_x = read_edit_i32(hwnd, IDC_EDIT_MP_X);
+                            (*ptr).config.mp_monitor_y = read_edit_i32(hwnd, IDC_EDIT_MP_Y);
+                            (*ptr).config.mp_monitor_color = SAMPLED_COLOR[1].load(Ordering::Acquire);
+
+                            // Save SP monitor settings
+                            (*ptr).config.sp_monitor_x = read_edit_i32(hwnd, IDC_EDIT_SP_X);
+                            (*ptr).config.sp_monitor_y = read_edit_i32(hwnd, IDC_EDIT_SP_Y);
+                            (*ptr).config.sp_monitor_color = SAMPLED_COLOR[2].load(Ordering::Acquire);
+
                             if let Err(e) = config::save_config(&(*ptr).config) {
                                 eprintln!("[Ranify2] Config save failed: {}", e);
+                            }
+
+                            // Push the just-saved settings into the live monitor so a
+                            // re-pick / color change takes effect immediately — no
+                            // checkbox toggle or app restart needed. MP/SP share HP's
+                            // window anchor (same game window).
+                            let cfg = &(*ptr).config;
+                            let wc = cfg.hp_monitor_window_class.clone();
+                            let wt = cfg.hp_monitor_window_title.clone();
+                            use crate::monitor::{self, Bar};
+                            if cfg.hp_monitor_enabled && cfg.hp_monitor_color != 0 {
+                                monitor::set_bar(Bar::Hp, wc.clone(), wt.clone(),
+                                    cfg.hp_monitor_x, cfg.hp_monitor_y, cfg.hp_monitor_color);
+                            } else {
+                                monitor::disable_bar(Bar::Hp);
+                            }
+                            if cfg.mp_monitor_enabled && cfg.mp_monitor_color != 0 {
+                                monitor::set_bar(Bar::Mp, wc.clone(), wt.clone(),
+                                    cfg.mp_monitor_x, cfg.mp_monitor_y, cfg.mp_monitor_color);
+                            } else {
+                                monitor::disable_bar(Bar::Mp);
+                            }
+                            if cfg.sp_monitor_enabled && cfg.sp_monitor_color != 0 {
+                                monitor::set_bar(Bar::Sp, wc, wt,
+                                    cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
+                            } else {
+                                monitor::disable_bar(Bar::Sp);
                             }
                         }
                         // If burst was running and the user changed the rate,
@@ -502,6 +673,8 @@ unsafe extern "system" fn settings_wnd_proc(
         }
         WM_TIMER => {
             if w_param == TIMER_HP_PICK && PICKING.load(Ordering::Acquire) {
+                let target = PICK_TARGET.load(Ordering::Acquire);
+                let (edit_x_id, edit_y_id, color_id, pick_id, live_id) = pick_ctrl_ids(target);
                 let mut pt: POINT = std::mem::zeroed();
                 GetCursorPos(&mut pt);
 
@@ -556,13 +729,13 @@ unsafe extern "system" fn settings_wnd_proc(
                         "X:{} Y:{} R:{} G:{} B:{} | {}",
                         pt.x, pt.y, r, g, b, win_label
                     ));
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_LIVE as i32), text.as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, live_id as i32), text.as_ptr());
                 } else {
                     let text = wide(&format!(
                         "X:{} Y:{} (unreadable) | {}",
                         pt.x, pt.y, win_label
                     ));
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_LIVE as i32), text.as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, live_id as i32), text.as_ptr());
                 }
 
                 let insert_down = GetAsyncKeyState(VK_INSERT) & (0x8000u16 as i16) != 0;
@@ -584,17 +757,17 @@ unsafe extern "system" fn settings_wnd_proc(
 
                     let x_text = wide(&saved_x.to_string());
                     let y_text = wide(&saved_y.to_string());
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_X as i32), x_text.as_ptr());
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_Y as i32), y_text.as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, edit_x_id as i32), x_text.as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, edit_y_id as i32), y_text.as_ptr());
 
                     if color != 0xFFFFFFFF {
-                        SAMPLED_COLOR.store(color, Ordering::Release);
+                        SAMPLED_COLOR[target as usize].store(color, Ordering::Release);
                         let r = color & 0xFF;
                         let g = (color >> 8) & 0xFF;
                         let b = (color >> 16) & 0xFF;
                         let text = wide(&format!("R:{} G:{} B:{}", r, g, b));
                         SetWindowTextW(
-                            GetDlgItem(hwnd, IDC_STATIC_HP_COLOR as i32),
+                            GetDlgItem(hwnd, color_id as i32),
                             text.as_ptr(),
                         );
                     }
@@ -605,14 +778,14 @@ unsafe extern "system" fn settings_wnd_proc(
                     PICKING.store(false, Ordering::Release);
                     KillTimer(hwnd, TIMER_HP_PICK);
                     let text = wide("Pick");
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_HP_PICK as i32), text.as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, pick_id as i32), text.as_ptr());
                     let captured_msg = if anchored {
                         format!("Captured: {} ({}, {})", win_label, saved_x, saved_y)
                     } else {
                         format!("Captured (legacy absolute): ({}, {})", saved_x, saved_y)
                     };
                     let text = wide(&captured_msg);
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_LIVE as i32), text.as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, live_id as i32), text.as_ptr());
                 }
             }
             0

@@ -1,4 +1,3 @@
-use crate::hp_monitor;
 use crate::player;
 use crate::timing::PrecisionTimer;
 use crate::win32_helpers::wide;
@@ -67,26 +66,16 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
         // tolerate the window briefly disappearing (it just won't fire).
         let game_hwnd: HWND = unsafe {
             if let Some(ref cw) = class_w {
-                hp_monitor::find_window_matching(cw.as_ptr(), &window_title)
+                crate::monitor::find_window_matching(cw.as_ptr(), &window_title)
             } else {
                 std::ptr::null_mut()
             }
         };
 
-        // Hold the global input lock for the entire burst. Pet cycle and
-        // HP monitor will block until burst ends — intentional, burst is a
-        // panic feature and must not interleave.
-        let guard = player::lock_input_burst();
-
-        // Accumulate against a monotonic counter so quantization in
-        // PrecisionTimer doesn't drift the long-run rate.
         let start_ticks = timer.now_ticks();
         let mut tick: i64 = 0;
 
         while !CANCEL.load(Ordering::Acquire) {
-            // Focus-loss safety: if a game window was configured, stop as
-            // soon as it isn't foreground. Without a configured window we
-            // skip this check (legacy mode).
             if !game_hwnd.is_null() {
                 let fg = unsafe { GetForegroundWindow() };
                 if fg != game_hwnd {
@@ -95,13 +84,7 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
                 }
             }
 
-            player::send_key_input_locked(&guard, vk, scan_code, KEYEVENTF_SCANCODE);
-            player::send_key_input_locked(
-                &guard,
-                vk,
-                scan_code,
-                KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
-            );
+            player::send_key_press(vk, scan_code);
 
             tick += 1;
             let elapsed = timer.ticks_to_micros(timer.now_ticks() - start_ticks);
@@ -110,11 +93,8 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
             if remaining > 0 {
                 timer.precise_wait_micros(remaining);
             }
-            // If we're behind schedule (remaining <= 0), just continue
-            // immediately — the loop will catch up on the next tick.
         }
 
-        drop(guard);
         ACTIVE.store(false, Ordering::Release);
         println!("[Ranify2] Burst Q stopped.");
 

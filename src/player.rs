@@ -10,19 +10,11 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 static LOOP_MODE: AtomicBool = AtomicBool::new(false);
 static SHUFFLE_MODE: AtomicBool = AtomicBool::new(false);
 
-// Serializes all input dispatch (keyboard + mouse) so background features
-// cannot interleave events. pet_cycle holds an InputGuard across its full
-// hide→sleep→call burst; HP monitor and recorded playback acquire the same
-// lock per-event via the public send_*_input wrappers.
+// Serializes every SendInput call so background features (HP monitor, burst,
+// pet cycle) can't interleave events with queue playback. Each dispatch is
+// one atomic syscall — synthesized down+up pairs ship as a 2-event array so
+// the game never observes an orphaned key state.
 static INPUT_LOCK: Mutex<()> = Mutex::new(());
-
-/// RAII proof that the global input lock is held by this thread. Hold across
-/// multi-event bursts that must not be interrupted by other features.
-pub struct InputGuard<'a>(#[allow(dead_code)] std::sync::MutexGuard<'a, ()>);
-
-pub fn lock_input_burst() -> InputGuard<'static> {
-    InputGuard(lock_or_recover(&INPUT_LOCK))
-}
 
 pub fn is_playing() -> bool {
     PLAYING.load(Ordering::Acquire)
@@ -284,12 +276,21 @@ pub fn play_sequence(events: Vec<InputEvent>) {
     });
 }
 
-fn send_mouse_input(flags: u32, dx: i32, dy: i32, mouse_data: i32) {
-    let _g = lock_or_recover(&INPUT_LOCK);
-    send_mouse_input_raw(flags, dx, dy, mouse_data);
+fn make_kbd(vk: u16, scan_code: u16, flags: u32) -> INPUT {
+    let mut input = unsafe { std::mem::zeroed::<INPUT>() };
+    input.type_ = INPUT_KEYBOARD;
+    unsafe {
+        let ki = input.u.ki_mut();
+        ki.wVk = vk;
+        ki.wScan = scan_code;
+        ki.dwFlags = flags;
+        ki.time = 0;
+        ki.dwExtraInfo = 0;
+    }
+    input
 }
 
-fn send_mouse_input_raw(flags: u32, dx: i32, dy: i32, mouse_data: i32) {
+fn make_mouse(flags: u32, dx: i32, dy: i32, mouse_data: i32) -> INPUT {
     let mut input = unsafe { std::mem::zeroed::<INPUT>() };
     input.type_ = INPUT_MOUSE;
     unsafe {
@@ -300,29 +301,39 @@ fn send_mouse_input_raw(flags: u32, dx: i32, dy: i32, mouse_data: i32) {
         mi.dwFlags = flags;
         mi.time = 0;
         mi.dwExtraInfo = 0;
-        SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
     }
+    input
+}
+
+fn dispatch(events: &mut [INPUT]) {
+    let _g = lock_or_recover(&INPUT_LOCK);
+    unsafe {
+        SendInput(
+            events.len() as u32,
+            events.as_mut_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        );
+    }
+}
+
+fn send_mouse_input(flags: u32, dx: i32, dy: i32, mouse_data: i32) {
+    let mut e = make_mouse(flags, dx, dy, mouse_data);
+    dispatch(std::slice::from_mut(&mut e));
 }
 
 pub fn send_key_input(vk: u16, scan_code: u16, flags: u32) {
-    let _g = lock_or_recover(&INPUT_LOCK);
-    send_key_input_raw(vk, scan_code, flags);
+    let mut e = make_kbd(vk, scan_code, flags);
+    dispatch(std::slice::from_mut(&mut e));
 }
 
-pub fn send_key_input_locked(_guard: &InputGuard, vk: u16, scan_code: u16, flags: u32) {
-    send_key_input_raw(vk, scan_code, flags);
-}
-
-fn send_key_input_raw(vk: u16, scan_code: u16, flags: u32) {
-    let mut input = unsafe { std::mem::zeroed::<INPUT>() };
-    input.type_ = INPUT_KEYBOARD;
-    unsafe {
-        let ki = input.u.ki_mut();
-        ki.wVk = vk;
-        ki.wScan = scan_code;
-        ki.dwFlags = flags;
-        ki.time = 0;
-        ki.dwExtraInfo = 0;
-        SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
-    }
+/// Atomic key down + key up in a single SendInput call. Use for synthesized
+/// presses (HP monitor, burst, pet cycle) so the game can never observe a
+/// dangling down without its matching up, even when other threads dispatch
+/// concurrently.
+pub fn send_key_press(vk: u16, scan_code: u16) {
+    let mut events = [
+        make_kbd(vk, scan_code, KEYEVENTF_SCANCODE),
+        make_kbd(vk, scan_code, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP),
+    ];
+    dispatch(&mut events);
 }

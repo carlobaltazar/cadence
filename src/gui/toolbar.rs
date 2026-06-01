@@ -1,5 +1,5 @@
 use crate::win32_helpers::{wide, create_control};
-use crate::{burst, config, hp_monitor, network, pet_cycle, player, recorder};
+use crate::{burst, config, monitor, network, pet_cycle, player, recorder};
 use super::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -14,6 +14,8 @@ pub(crate) struct ToolbarControls {
     pub hwnd_chk_topmost: HWND,
     pub hwnd_chk_pet: HWND,
     pub hwnd_chk_hp: HWND,
+    pub hwnd_chk_mp: HWND,
+    pub hwnd_chk_sp: HWND,
     pub hwnd_btn_burst: HWND,
     pub hwnd_status: HWND,
     pub config: config::AppConfig,
@@ -42,7 +44,7 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
 
         // Calculate position: top-right of screen
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let win_w = 686;
+        let win_w = 756;
         let win_h = 52;
 
         let mut rect = RECT {
@@ -90,6 +92,8 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
             hwnd_chk_topmost: std::ptr::null_mut(),
             hwnd_chk_pet: std::ptr::null_mut(),
             hwnd_chk_hp: std::ptr::null_mut(),
+            hwnd_chk_mp: std::ptr::null_mut(),
+            hwnd_chk_sp: std::ptr::null_mut(),
             hwnd_btn_burst: std::ptr::null_mut(),
             hwnd_status: std::ptr::null_mut(),
             config: cfg.clone(),
@@ -162,38 +166,56 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
         SendMessageW(chk_hp, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
     }
 
+    let chk_mp = create_control(
+        hwnd, hinstance, font, "BUTTON", "MP",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+        312, y, 36, h, IDC_CHK_MP,
+    );
+    if cfg.mp_monitor_enabled {
+        SendMessageW(chk_mp, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+    }
+
+    let chk_sp = create_control(
+        hwnd, hinstance, font, "BUTTON", "SP",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+        350, y, 36, h, IDC_CHK_SP,
+    );
+    if cfg.sp_monitor_enabled {
+        SendMessageW(chk_sp, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+    }
+
     // Burst Q button — toggles rapid Q-press mode. Owner-drawn-ish:
     // updates label/state in WM_TIMER once burst::is_active changes.
     let btn_burst = create_control(
         hwnd, hinstance, font, "BUTTON", "Burst Q",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        314, y, 62, h, IDC_BTN_BURST,
+        390, y, 62, h, IDC_BTN_BURST,
     );
 
     // -- Group 3: Navigation (gap before) --
     create_control(
         hwnd, hinstance, font, "BUTTON", "\u{2699}",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        386, y, 26, h, IDC_BTN_SETTINGS,
+        456, y, 26, h, IDC_BTN_SETTINGS,
     );
 
     create_control(
         hwnd, hinstance, font, "BUTTON", "Sequences",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        416, y, 74, h, IDC_BTN_SEQUENCES,
+        486, y, 74, h, IDC_BTN_SEQUENCES,
     );
 
     create_control(
         hwnd, hinstance, font, "BUTTON", "Remote",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        496, y, 66, h, IDC_BTN_REMOTE,
+        566, y, 66, h, IDC_BTN_REMOTE,
     );
 
     // -- Status label --
     let status = create_control(
         hwnd, hinstance, font, "STATIC", "Idle",
         WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-        570, y + 2, 110, h, IDC_STATUS,
+        640, y + 2, 110, h, IDC_STATUS,
     );
 
     // Update stored controls
@@ -205,9 +227,20 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
         (*ptr).hwnd_chk_topmost = chk_top;
         (*ptr).hwnd_chk_pet = chk_pet;
         (*ptr).hwnd_chk_hp = chk_hp;
+        (*ptr).hwnd_chk_mp = chk_mp;
+        (*ptr).hwnd_chk_sp = chk_sp;
         (*ptr).hwnd_btn_burst = btn_burst;
         (*ptr).hwnd_status = status;
     }
+}
+
+unsafe fn warn_unconfigured(hwnd: HWND, bar: &str) {
+    let msg = crate::win32_helpers::wide(&format!(
+        "Configure {} pixel in Settings first.\nSet X/Y and click Sample (or Pick).",
+        bar
+    ));
+    let title = crate::win32_helpers::wide(&format!("{} Monitor", bar));
+    MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
 }
 
 unsafe extern "system" fn toolbar_wnd_proc(
@@ -259,7 +292,8 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         if checked {
                             let cfg = &(*ptr).config;
                             if cfg.hp_monitor_color != 0 {
-                                hp_monitor::start(
+                                monitor::set_bar(
+                                    monitor::Bar::Hp,
                                     cfg.hp_monitor_window_class.clone(),
                                     cfg.hp_monitor_window_title.clone(),
                                     cfg.hp_monitor_x,
@@ -267,18 +301,74 @@ unsafe extern "system" fn toolbar_wnd_proc(
                                     cfg.hp_monitor_color,
                                 );
                             } else {
-                                let msg = crate::win32_helpers::wide(
-                                    "Configure HP pixel in Settings first.\nSet X/Y and click Sample.",
-                                );
-                                let title = crate::win32_helpers::wide("HP Monitor");
-                                MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                                warn_unconfigured(hwnd, "HP");
                                 SendMessageW((*ptr).hwnd_chk_hp, BM_SETCHECK, BST_UNCHECKED as WPARAM, 0);
                                 return 0;
                             }
                         } else {
-                            hp_monitor::stop();
+                            monitor::disable_bar(monitor::Bar::Hp);
                         }
                         (*ptr).config.hp_monitor_enabled = checked;
+                        if let Err(e) = config::save_config(&(*ptr).config) {
+                            eprintln!("[Ranify2] Config save failed: {}", e);
+                        }
+                    }
+                }
+                x if x == IDC_CHK_MP => {
+                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolbarControls;
+                    if !ptr.is_null() {
+                        let checked = SendMessageW((*ptr).hwnd_chk_mp, BM_GETCHECK, 0, 0)
+                            == BST_CHECKED as isize;
+                        if checked {
+                            let cfg = &(*ptr).config;
+                            if cfg.mp_monitor_color != 0 {
+                                monitor::set_bar(
+                                    monitor::Bar::Mp,
+                                    cfg.hp_monitor_window_class.clone(),
+                                    cfg.hp_monitor_window_title.clone(),
+                                    cfg.mp_monitor_x,
+                                    cfg.mp_monitor_y,
+                                    cfg.mp_monitor_color,
+                                );
+                            } else {
+                                warn_unconfigured(hwnd, "MP");
+                                SendMessageW((*ptr).hwnd_chk_mp, BM_SETCHECK, BST_UNCHECKED as WPARAM, 0);
+                                return 0;
+                            }
+                        } else {
+                            monitor::disable_bar(monitor::Bar::Mp);
+                        }
+                        (*ptr).config.mp_monitor_enabled = checked;
+                        if let Err(e) = config::save_config(&(*ptr).config) {
+                            eprintln!("[Ranify2] Config save failed: {}", e);
+                        }
+                    }
+                }
+                x if x == IDC_CHK_SP => {
+                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolbarControls;
+                    if !ptr.is_null() {
+                        let checked = SendMessageW((*ptr).hwnd_chk_sp, BM_GETCHECK, 0, 0)
+                            == BST_CHECKED as isize;
+                        if checked {
+                            let cfg = &(*ptr).config;
+                            if cfg.sp_monitor_color != 0 {
+                                monitor::set_bar(
+                                    monitor::Bar::Sp,
+                                    cfg.hp_monitor_window_class.clone(),
+                                    cfg.hp_monitor_window_title.clone(),
+                                    cfg.sp_monitor_x,
+                                    cfg.sp_monitor_y,
+                                    cfg.sp_monitor_color,
+                                );
+                            } else {
+                                warn_unconfigured(hwnd, "SP");
+                                SendMessageW((*ptr).hwnd_chk_sp, BM_SETCHECK, BST_UNCHECKED as WPARAM, 0);
+                                return 0;
+                            }
+                        } else {
+                            monitor::disable_bar(monitor::Bar::Sp);
+                        }
+                        (*ptr).config.sp_monitor_enabled = checked;
                         if let Err(e) = config::save_config(&(*ptr).config) {
                             eprintln!("[Ranify2] Config save failed: {}", e);
                         }
@@ -343,11 +433,15 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         "Idle"
                     };
                     let pet = pet_cycle::is_active();
-                    let hp = hp_monitor::is_active();
+                    let hp = monitor::is_active(monitor::Bar::Hp);
+                    let mp = monitor::is_active(monitor::Bar::Mp);
+                    let sp = monitor::is_active(monitor::Bar::Sp);
                     let burst_on = burst::is_active();
                     let mut status = base_status.to_string();
                     if pet { status.push_str(" [Pet]"); }
                     if hp { status.push_str(" [HP]"); }
+                    if mp { status.push_str(" [MP]"); }
+                    if sp { status.push_str(" [SP]"); }
                     if burst_on { status.push_str(" [BURST]"); }
                     SetWindowTextW((*ptr).hwnd_status, wide(&status).as_ptr());
 

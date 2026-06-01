@@ -4,7 +4,7 @@ mod burst;
 mod config;
 mod gui;
 mod hotkeys;
-mod hp_monitor;
+mod monitor;
 mod network;
 mod pet_cycle;
 mod player;
@@ -118,14 +118,35 @@ fn main() {
         pet_cycle::start(cfg.pet_cycle_interval_secs);
     }
 
-    // Auto-start HP monitor if configured
+    // Auto-start bar monitors if configured. MP/SP share HP's window anchor.
     if cfg.hp_monitor_enabled && cfg.hp_monitor_color != 0 {
-        hp_monitor::start(
+        monitor::set_bar(
+            monitor::Bar::Hp,
             cfg.hp_monitor_window_class.clone(),
             cfg.hp_monitor_window_title.clone(),
             cfg.hp_monitor_x,
             cfg.hp_monitor_y,
             cfg.hp_monitor_color,
+        );
+    }
+    if cfg.mp_monitor_enabled && cfg.mp_monitor_color != 0 {
+        monitor::set_bar(
+            monitor::Bar::Mp,
+            cfg.hp_monitor_window_class.clone(),
+            cfg.hp_monitor_window_title.clone(),
+            cfg.mp_monitor_x,
+            cfg.mp_monitor_y,
+            cfg.mp_monitor_color,
+        );
+    }
+    if cfg.sp_monitor_enabled && cfg.sp_monitor_color != 0 {
+        monitor::set_bar(
+            monitor::Bar::Sp,
+            cfg.hp_monitor_window_class.clone(),
+            cfg.hp_monitor_window_title.clone(),
+            cfg.sp_monitor_x,
+            cfg.sp_monitor_y,
+            cfg.sp_monitor_color,
         );
     }
 
@@ -146,7 +167,7 @@ fn main() {
             break;
         }
 
-        // Handle burst worker stop notification (focus loss / shutdown).
+        // Handle burst worker stop notifications (focus loss / shutdown).
         if msg.message == WM_APP_BURST_STOPPED {
             unsafe {
                 let toplevel = FindWindowW(
@@ -216,7 +237,7 @@ fn main() {
 
     // Cleanup
     burst::stop();
-    hp_monitor::stop();
+    monitor::stop_all();
     pet_cycle::stop();
     network::stop_listener();
     hotkeys::uninstall_hook();

@@ -47,6 +47,8 @@ pub(crate) const IDC_BTN_REMOTE: u16 = 108;
 pub(crate) const IDC_CHK_PET: u16 = 109;
 pub(crate) const IDC_CHK_HP: u16 = 110;
 pub(crate) const IDC_BTN_BURST: u16 = 111;
+pub(crate) const IDC_CHK_MP: u16 = 113;
+pub(crate) const IDC_CHK_SP: u16 = 114;
 
 // Settings dialog controls
 pub(crate) const IDC_COMBO_RECORD_KEY: u16 = 201;
@@ -59,6 +61,18 @@ pub(crate) const IDC_BTN_HP_SAMPLE: u16 = 207;
 pub(crate) const IDC_STATIC_HP_COLOR: u16 = 208;
 pub(crate) const IDC_BTN_HP_PICK: u16 = 209;
 pub(crate) const IDC_STATIC_HP_LIVE: u16 = 210;
+pub(crate) const IDC_EDIT_MP_X: u16 = 220;
+pub(crate) const IDC_EDIT_MP_Y: u16 = 221;
+pub(crate) const IDC_BTN_MP_SAMPLE: u16 = 222;
+pub(crate) const IDC_STATIC_MP_COLOR: u16 = 223;
+pub(crate) const IDC_BTN_MP_PICK: u16 = 224;
+pub(crate) const IDC_STATIC_MP_LIVE: u16 = 225;
+pub(crate) const IDC_EDIT_SP_X: u16 = 230;
+pub(crate) const IDC_EDIT_SP_Y: u16 = 231;
+pub(crate) const IDC_BTN_SP_SAMPLE: u16 = 232;
+pub(crate) const IDC_STATIC_SP_COLOR: u16 = 233;
+pub(crate) const IDC_BTN_SP_PICK: u16 = 234;
+pub(crate) const IDC_STATIC_SP_LIVE: u16 = 235;
 pub(crate) const IDC_COMBO_BURST_KEY: u16 = 211;
 pub(crate) const IDC_EDIT_BURST_RATE: u16 = 212;
 

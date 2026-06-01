@@ -45,6 +45,22 @@ pub struct AppConfig {
     pub hp_monitor_window_class: String,
     #[serde(default)]
     pub hp_monitor_window_title: String,
+    #[serde(default)]
+    pub mp_monitor_enabled: bool,
+    #[serde(default)]
+    pub mp_monitor_x: i32,
+    #[serde(default)]
+    pub mp_monitor_y: i32,
+    #[serde(default)]
+    pub mp_monitor_color: u32,
+    #[serde(default)]
+    pub sp_monitor_enabled: bool,
+    #[serde(default)]
+    pub sp_monitor_x: i32,
+    #[serde(default)]
+    pub sp_monitor_y: i32,
+    #[serde(default)]
+    pub sp_monitor_color: u32,
     #[serde(default = "default_burst_rate_hz")]
     pub burst_rate_hz: u32,
     #[serde(default = "default_burst_vk")]
@@ -79,6 +95,14 @@ impl Default for AppConfig {
             hp_monitor_color: 0,
             hp_monitor_window_class: String::new(),
             hp_monitor_window_title: String::new(),
+            mp_monitor_enabled: false,
+            mp_monitor_x: 0,
+            mp_monitor_y: 0,
+            mp_monitor_color: 0,
+            sp_monitor_enabled: false,
+            sp_monitor_x: 0,
+            sp_monitor_y: 0,
+            sp_monitor_color: 0,
             burst_rate_hz: default_burst_rate_hz(),
             burst_vk: default_burst_vk(),
         }
