@@ -22,6 +22,15 @@ use winapi::um::winuser::*;
 pub const WM_APP_BURST_STOPPED: u32 = WM_APP + 2;
 
 fn main() {
+    // Raise the OS timer resolution to ~1ms for the whole process so the
+    // playback/monitor/burst pacing can sleep accurately instead of busy
+    // spin-waiting. Critical in VMs: a spin loop pins the guest vCPU and
+    // starves the game's render thread, lagging the game while a sequence
+    // plays. Released with timeEndPeriod(1) at shutdown.
+    unsafe {
+        winapi::um::timeapi::timeBeginPeriod(1);
+    }
+
     // Belt-and-suspenders DPI awareness. The manifest already declares
     // PerMonitorV2, but if it didn't embed (broken build env) the process
     // would fall back to DPI-unaware and HP-monitor pixel coords would
@@ -241,4 +250,8 @@ fn main() {
     pet_cycle::stop();
     network::stop_listener();
     hotkeys::uninstall_hook();
+
+    unsafe {
+        winapi::um::timeapi::timeEndPeriod(1);
+    }
 }
