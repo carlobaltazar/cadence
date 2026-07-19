@@ -8,6 +8,7 @@ mod monitor;
 mod network;
 mod pet_cycle;
 mod player;
+mod proximity;
 mod recorder;
 mod sequence;
 mod storage;
@@ -110,6 +111,9 @@ fn main() {
     let main_tid = unsafe { winapi::um::processthreadsapi::GetCurrentThreadId() };
     burst::set_notify(main_tid, WM_APP_BURST_STOPPED);
 
+    // Let proximity notify the toolbar to uncheck "Det" when a detection fires (one-shot).
+    proximity::set_notify(hwnd as isize, gui::WM_APP_PROXIMITY_HIT);
+
     // Auto-start receiver if configured
     if cfg.remote_auto_listen && cfg.remote_port > 0 {
         let password = if cfg.remote_password.is_empty() {
@@ -159,6 +163,21 @@ fn main() {
         );
     }
 
+    // Load the proximity ignore list into the live detector unconditionally, so it mirrors
+    // config even when detection starts disabled (keeps the Settings save from wiping it).
+    proximity::set_ignored(cfg.proximity_ignore.clone());
+    proximity::set_reaction(cfg.proximity_sequence.clone());
+
+    // Auto-start proximity alert if configured
+    if cfg.proximity_enabled {
+        proximity::start(
+            cfg.proximity_vk,
+            cfg.proximity_iface.clone(),
+            cfg.proximity_server_ip.clone(),
+            cfg.proximity_cooldown_ms,
+        );
+    }
+
     // Load default sequence (or fall back to last saved) into LAST_EVENTS
     let load_name = cfg.default_sequence.clone()
         .or_else(|| storage::list_sequences().ok().and_then(|n| n.last().cloned()));
@@ -198,7 +217,7 @@ fn main() {
                 hotkeys::HOTKEY_PLAY_STOP => gui::handle_play_toggle(),
                 hotkeys::HOTKEY_PLAY_QUEUE => gui::handle_play_queue_hotkey(),
                 hotkeys::HOTKEY_BURST_TOGGLE => {
-                    let cfg = config::load_config();
+                    let cfg = config::cached_config();
                     burst::toggle(
                         cfg.burst_rate_hz,
                         cfg.hp_monitor_window_class.clone(),
@@ -212,7 +231,7 @@ fn main() {
                 hotkeys::HOTKEY_REMOTE_SEND => {
                     let index = msg.lParam as usize;
                     if let Some(seq_name) = hotkeys::remote_binding_at(index) {
-                        let cfg = config::load_config();
+                        let cfg = config::cached_config();
                         if !cfg.remote_hosts.is_empty() {
                             let port = cfg.remote_port;
                             let pw = if cfg.remote_password.is_empty() {
@@ -245,6 +264,7 @@ fn main() {
     }
 
     // Cleanup
+    proximity::stop();
     burst::stop();
     monitor::stop_all();
     pet_cycle::stop();

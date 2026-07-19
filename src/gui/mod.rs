@@ -7,6 +7,7 @@ mod rename_dialog;
 mod set_group_dialog;
 mod remote;
 mod add_binding;
+mod players;
 
 pub use toolbar::create_toolbar_window;
 
@@ -49,6 +50,10 @@ pub(crate) const IDC_CHK_HP: u16 = 110;
 pub(crate) const IDC_BTN_BURST: u16 = 111;
 pub(crate) const IDC_CHK_MP: u16 = 113;
 pub(crate) const IDC_CHK_SP: u16 = 114;
+pub(crate) const IDC_CHK_DET: u16 = 115;
+
+/// Posted to the toolbar window when proximity detection fires, so it can uncheck "Det" (one-shot).
+pub(crate) const WM_APP_PROXIMITY_HIT: u32 = winapi::um::winuser::WM_APP + 3;
 
 // Settings dialog controls
 pub(crate) const IDC_COMBO_RECORD_KEY: u16 = 201;
@@ -75,6 +80,18 @@ pub(crate) const IDC_BTN_SP_PICK: u16 = 234;
 pub(crate) const IDC_STATIC_SP_LIVE: u16 = 235;
 pub(crate) const IDC_COMBO_BURST_KEY: u16 = 211;
 pub(crate) const IDC_EDIT_BURST_RATE: u16 = 212;
+pub(crate) const IDC_CHK_PROX: u16 = 240;
+pub(crate) const IDC_COMBO_PROX_KEY: u16 = 241;
+pub(crate) const IDC_COMBO_PROX_IFACE: u16 = 242;
+pub(crate) const IDC_EDIT_PROX_IP: u16 = 243;
+pub(crate) const IDC_BTN_PROX_PLAYERS: u16 = 245;
+pub(crate) const IDC_COMBO_PROX_ACTION: u16 = 246;
+
+// Players (detected/ignore) dialog controls
+pub(crate) const IDC_LIST_PLAYERS: u16 = 901;
+pub(crate) const IDC_BTN_PLAYER_TOGGLE: u16 = 902;
+pub(crate) const IDC_BTN_PLAYER_CLEAR: u16 = 903;
+pub(crate) const IDC_BTN_PLAYER_CLOSE: u16 = 904;
 
 // Save dialog controls
 pub(crate) const IDC_EDIT_SEQ_NAME: u16 = 301;
@@ -140,6 +157,7 @@ pub(crate) const IDC_BTN_BIND_ADD_CANCEL: u16 = 857;
 pub(crate) const TIMER_STATUS: usize = 1;
 pub(crate) const TIMER_REMOTE: usize = 2;
 pub(crate) const TIMER_HP_PICK: usize = 3;
+pub(crate) const TIMER_PLAYERS: usize = 4;
 
 pub fn handle_record_toggle() {
     if recorder::is_recording() {

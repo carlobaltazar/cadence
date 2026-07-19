@@ -1,11 +1,10 @@
-use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, vk_name};
+use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, vk_name};
 use std::collections::BTreeMap;
 use crate::{config, hotkeys, player, recorder, storage};
 use super::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
-use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
 static SEQUENCES_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -58,7 +57,7 @@ unsafe extern "system" fn sequences_wnd_proc(
     match msg {
         WM_CREATE => {
             let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32) as HFONT;
+            let font = scaled_font(dpi_for_window(hwnd));
 
             // -- Left panel: Saved Sequences --
             create_control(

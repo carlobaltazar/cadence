@@ -9,7 +9,7 @@ use winapi::shared::windef::HHOOK;
 use winapi::um::winuser::*;
 
 fn is_filtered_vk(vk: u32) -> bool {
-    hotkeys::all_hotkey_vks().contains(&(vk as u16))
+    hotkeys::is_hotkey_vk(vk as u16)
 }
 
 struct RecordingState {

@@ -1,7 +1,9 @@
 use crate::sequence::RemoteBinding;
+use crate::win32_helpers::lock_or_recover;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 pub const DEFAULT_RECORD_VK: u16 = 0x77; // F8
 pub const DEFAULT_STOP_VK: u16 = 0x7A;   // F11
@@ -65,12 +67,30 @@ pub struct AppConfig {
     pub burst_rate_hz: u32,
     #[serde(default = "default_burst_vk")]
     pub burst_vk: u16,
+    #[serde(default)]
+    pub proximity_enabled: bool,
+    #[serde(default = "default_proximity_vk")]
+    pub proximity_vk: u16,
+    #[serde(default)]
+    pub proximity_iface: String,
+    #[serde(default = "default_proximity_server_ip")]
+    pub proximity_server_ip: String,
+    #[serde(default = "default_proximity_cooldown")]
+    pub proximity_cooldown_ms: u64,
+    #[serde(default)]
+    pub proximity_ignore: Vec<String>,
+    /// Reaction sequence to play on detection. Empty = press the proximity key instead.
+    #[serde(default)]
+    pub proximity_sequence: String,
 }
 
 fn default_remote_port() -> u16 { 9847 }
 fn default_pet_cycle_interval() -> u64 { 120 }
 fn default_burst_rate_hz() -> u32 { 100 }
 fn default_burst_vk() -> u16 { 0x14 } // Caps Lock
+fn default_proximity_vk() -> u16 { 0x45 } // 'E'
+fn default_proximity_server_ip() -> String { "143.14.88.19".to_string() }
+fn default_proximity_cooldown() -> u64 { 500 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -105,6 +125,13 @@ impl Default for AppConfig {
             sp_monitor_color: 0,
             burst_rate_hz: default_burst_rate_hz(),
             burst_vk: default_burst_vk(),
+            proximity_enabled: false,
+            proximity_vk: default_proximity_vk(),
+            proximity_iface: String::new(),
+            proximity_server_ip: default_proximity_server_ip(),
+            proximity_cooldown_ms: default_proximity_cooldown(),
+            proximity_ignore: Vec::new(),
+            proximity_sequence: String::new(),
         }
     }
 }
@@ -127,9 +154,27 @@ pub fn load_config() -> AppConfig {
     }
 }
 
+// Process-global config cache. Hotkey handlers in the message loop (burst
+// toggle, remote send) read config on every keypress; without this each read
+// was a file open + full JSON parse. Populated lazily on first `cached_config`
+// call and kept fresh by `save_config`, which is the sole write path.
+static CONFIG_CACHE: Mutex<Option<AppConfig>> = Mutex::new(None);
+
+/// Config snapshot backed by the in-memory cache, avoiding a disk read + parse
+/// on hot paths. Returns identical values to `load_config`; use this anywhere a
+/// fresh-from-disk read isn't required.
+pub fn cached_config() -> AppConfig {
+    lock_or_recover(&CONFIG_CACHE)
+        .get_or_insert_with(load_config)
+        .clone()
+}
+
 pub fn save_config(config: &AppConfig) -> std::io::Result<()> {
     let path = config_path();
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    fs::write(path, json)
+    fs::write(path, json)?;
+    // Keep the cache in sync so hotkey handlers see saved changes immediately.
+    *lock_or_recover(&CONFIG_CACHE) = Some(config.clone());
+    Ok(())
 }

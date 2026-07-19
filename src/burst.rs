@@ -50,7 +50,7 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
         println!("[Cadence] Burst Q started ({} Hz)", rate);
 
         let vk: u16 = 0x51; // Q
-        let scan_code = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+        let scan_code = player::scan_code(vk);
         let interval_micros: i64 = (1_000_000 / rate) as i64;
         let timer = PrecisionTimer::new();
 

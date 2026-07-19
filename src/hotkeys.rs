@@ -30,38 +30,41 @@ struct HotkeySet {
     remote_bindings: Vec<(u32, u16, String)>, // (modifiers, vk_code, sequence_name)
 }
 
-static CURRENT_HOTKEYS: Mutex<Option<HotkeySet>> = Mutex::new(None);
-static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-static HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
-
-fn ensure_hotkeys() {
-    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-    if hk.is_none() {
-        *hk = Some(HotkeySet {
-            record_vk: config::DEFAULT_RECORD_VK,
-            stop_vk: config::DEFAULT_STOP_VK,
-            queue_vk: None,
-            burst_vk: None,
-            sequence_bindings: Vec::new(),
-            remote_bindings: Vec::new(),
-        });
-    }
-}
-
-/// Install a persistent low-level keyboard hook to detect hotkeys globally.
-/// This works even when fullscreen games have focus (unlike RegisterHotKey).
-pub fn install_hook(record_vk: u16, stop_vk: u16) -> bool {
-    {
-        let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-        *hk = Some(HotkeySet {
+impl HotkeySet {
+    fn new(record_vk: u16, stop_vk: u16) -> Self {
+        HotkeySet {
             record_vk,
             stop_vk,
             queue_vk: None,
             burst_vk: None,
             sequence_bindings: Vec::new(),
             remote_bindings: Vec::new(),
-        });
+        }
     }
+}
+
+impl Default for HotkeySet {
+    fn default() -> Self {
+        HotkeySet::new(config::DEFAULT_RECORD_VK, config::DEFAULT_STOP_VK)
+    }
+}
+
+static CURRENT_HOTKEYS: Mutex<Option<HotkeySet>> = Mutex::new(None);
+static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+/// Lock the shared hotkey set (lazily creating the default set on first use) and
+/// run `f` against it. Centralizes the ensure + lock + access boilerplate.
+fn with_set<R>(f: impl FnOnce(&mut HotkeySet) -> R) -> R {
+    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
+    let set = hk.get_or_insert_with(HotkeySet::default);
+    f(set)
+}
+
+/// Install a persistent low-level keyboard hook to detect hotkeys globally.
+/// This works even when fullscreen games have focus (unlike RegisterHotKey).
+pub fn install_hook(record_vk: u16, stop_vk: u16) -> bool {
+    *lock_or_recover(&CURRENT_HOTKEYS) = Some(HotkeySet::new(record_vk, stop_vk));
 
     // Store the calling thread's ID so the hook callback can post messages to it
     MAIN_THREAD_ID.store(
@@ -90,113 +93,74 @@ pub fn uninstall_hook() {
 }
 
 pub fn reregister_hotkeys(record_vk: u16, stop_vk: u16) -> bool {
-    ensure_hotkeys();
-    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-    if let Some(ref mut set) = *hk {
+    with_set(|set| {
         set.record_vk = record_vk;
         set.stop_vk = stop_vk;
-    }
+    });
     true
 }
 
 pub fn current_hotkeys() -> (u16, u16) {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    (set.record_vk, set.stop_vk)
+    with_set(|set| (set.record_vk, set.stop_vk))
 }
 
 pub fn set_queue_vk(vk: Option<u16>) {
-    ensure_hotkeys();
-    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-    if let Some(ref mut set) = *hk {
-        set.queue_vk = vk;
-    }
+    with_set(|set| set.queue_vk = vk);
 }
 
 pub fn current_queue_vk() -> Option<u16> {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    set.queue_vk
+    with_set(|set| set.queue_vk)
 }
 
 pub fn set_burst_vk(vk: Option<u16>) {
-    ensure_hotkeys();
-    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-    if let Some(ref mut set) = *hk {
-        set.burst_vk = vk;
-    }
+    with_set(|set| set.burst_vk = vk);
 }
 
 pub fn current_burst_vk() -> Option<u16> {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    set.burst_vk
+    with_set(|set| set.burst_vk)
 }
 
 /// Rebuild sequence bindings from loaded sequences.
 pub fn set_sequence_bindings(bindings: Vec<(u16, String)>) {
-    ensure_hotkeys();
-    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-    if let Some(ref mut set) = *hk {
-        set.sequence_bindings = bindings;
-    }
+    with_set(|set| set.sequence_bindings = bindings);
 }
 
 /// Set remote hotkey bindings (modifier+key → sequence name).
 pub fn set_remote_bindings(bindings: Vec<(u32, u16, String)>) {
-    ensure_hotkeys();
-    let mut hk = lock_or_recover(&CURRENT_HOTKEYS);
-    if let Some(ref mut set) = *hk {
-        set.remote_bindings = bindings;
-    }
+    with_set(|set| set.remote_bindings = bindings);
 }
 
 /// Get the sequence name for a remote binding by index.
 pub fn remote_binding_at(index: usize) -> Option<String> {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    set.remote_bindings.get(index).map(|(_, _, name)| name.clone())
+    with_set(|set| set.remote_bindings.get(index).map(|(_, _, name)| name.clone()))
 }
 
 /// Get the sequence name bound to a given VK, if any.
 pub fn sequence_for_vk(vk: u16) -> Option<String> {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    set.sequence_bindings
-        .iter()
-        .find(|(v, _)| *v == vk)
-        .map(|(_, name)| name.clone())
+    with_set(|set| {
+        set.sequence_bindings
+            .iter()
+            .find(|(v, _)| *v == vk)
+            .map(|(_, name)| name.clone())
+    })
 }
 
-/// Get all bound VKs (for filtering during recording).
-pub fn all_hotkey_vks() -> Vec<u16> {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    let mut vks = vec![set.record_vk, set.stop_vk];
-    if let Some(qvk) = set.queue_vk {
-        vks.push(qvk);
-    }
-    if let Some(bvk) = set.burst_vk {
-        vks.push(bvk);
-    }
-    for (vk, _) in &set.sequence_bindings {
-        vks.push(*vk);
-    }
-    vks
+/// True if `vk` is bound to any local hotkey (record/stop/queue/burst/sequence).
+/// Used to filter our own hotkeys out of recordings without allocating a Vec on
+/// every keystroke.
+pub fn is_hotkey_vk(vk: u16) -> bool {
+    with_set(|set| {
+        vk == set.record_vk
+            || vk == set.stop_vk
+            || set.queue_vk == Some(vk)
+            || set.burst_vk == Some(vk)
+            || set.sequence_bindings.iter().any(|(v, _)| *v == vk)
+    })
 }
 
 /// Get current sequence bindings for UI display.
 pub fn current_sequence_bindings() -> Vec<(u16, String)> {
-    ensure_hotkeys();
-    let hk = lock_or_recover(&CURRENT_HOTKEYS);
-    let set = hk.as_ref().unwrap();
-    set.sequence_bindings.clone()
+    with_set(|set| set.sequence_bindings.clone())
 }
 
 /// Get current modifier state using GetAsyncKeyState.

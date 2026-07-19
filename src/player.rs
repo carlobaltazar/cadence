@@ -40,34 +40,96 @@ pub fn is_shuffle_mode() -> bool {
     SHUFFLE_MODE.load(Ordering::Acquire)
 }
 
-pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
-    if sequences.is_empty() {
-        println!("[Cadence] Empty queue.");
-        return;
+/// Virtual-screen origin and span, used to normalize absolute mouse coords.
+fn vscreen() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
     }
+}
 
-    if PLAYING.load(Ordering::Acquire) {
-        println!("[Cadence] Already playing.");
-        return;
+/// Normalize a virtual-desktop pixel coordinate to the 0..65535 range SendInput
+/// expects for MOUSEEVENTF_ABSOLUTE moves.
+fn to_abs(coord: i32, origin: i32, span: i32) -> i32 {
+    ((coord - origin) as f64 / span as f64 * 65535.0) as i32
+}
+
+/// Map a mouse button + press state to its SendInput (flags, mouse_data) pair.
+fn mouse_button_flags(button: &MouseButton, pressed: bool) -> (u32, i32) {
+    let flags = match (button, pressed) {
+        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+        (MouseButton::X1, true) | (MouseButton::X2, true) => MOUSEEVENTF_XDOWN,
+        (MouseButton::X1, false) | (MouseButton::X2, false) => MOUSEEVENTF_XUP,
+    };
+    let mouse_data = match button {
+        MouseButton::X1 => XBUTTON1 as i32,
+        MouseButton::X2 => XBUTTON2 as i32,
+        _ => 0,
+    };
+    (flags, mouse_data)
+}
+
+/// Synthesize a single recorded event to the OS. `vs` is the virtual-screen
+/// tuple from `vscreen()`, reused across all events in a playback run.
+fn perform_event(event_type: &InputEventType, vs: (i32, i32, i32, i32)) {
+    let (vx, vy, vw, vh) = vs;
+    match event_type {
+        InputEventType::MouseMove { x, y } => {
+            send_mouse_input(
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                to_abs(*x, vx, vw),
+                to_abs(*y, vy, vh),
+                0,
+            );
+        }
+        InputEventType::MouseButton { button, pressed } => {
+            let (flags, mouse_data) = mouse_button_flags(button, *pressed);
+            send_mouse_input(flags, 0, 0, mouse_data);
+        }
+        InputEventType::MouseWheel { delta } => {
+            send_mouse_input(MOUSEEVENTF_WHEEL, 0, 0, *delta);
+        }
+        InputEventType::KeyPress {
+            vk_code,
+            scan_code,
+            pressed,
+            extended,
+        } => {
+            let mut flags = KEYEVENTF_SCANCODE;
+            if !pressed {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            if *extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            send_key_input(*vk_code, *scan_code, flags);
+        }
     }
+}
 
+/// Shared playback runner for both single-sequence and queue playback. A single
+/// sequence is just a queue of one, so both entry points funnel through here.
+/// Honors CANCEL, LOOP_MODE, and SHUFFLE_MODE, and zeroes the leading delay
+/// between consecutive sequences so queued playlists don't stall between items.
+fn run_playback_opts(sequences: Vec<Vec<InputEvent>>, force_once: bool) {
     PLAYING.store(true, Ordering::Release);
     CANCEL.store(false, Ordering::Release);
 
     std::thread::spawn(move || {
         let timer = PrecisionTimer::new();
-
-        let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = unsafe {
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            )
-        };
+        let vs = vscreen();
 
         let total_sequences = sequences.len();
-        println!("[Cadence] Playing queue of {} sequences...", total_sequences);
+        println!("[Cadence] Playing {} sequence(s)...", total_sequences);
 
         let mut order: Vec<usize> = (0..total_sequences).collect();
         let mut cancelled = false;
@@ -79,194 +141,40 @@ pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
                 order.shuffle(&mut rand::thread_rng());
             }
 
+            // Schedule against an absolute timeline anchored at the start of this
+            // pass: each event waits until `anchor + sum(delays so far)` rather
+            // than sleeping each gap independently. This keeps per-event sleep
+            // overshoot from accumulating, so cooldown-timed presses stay aligned
+            // over long/looped sequences instead of drifting late.
+            let mut anchor = timer.now_ticks();
+            let mut acc_micros: i64 = 0;
+
             for (seq_idx, &idx) in order.iter().enumerate() {
                 for (j, event) in sequences[idx].iter().enumerate() {
                     if CANCEL.load(Ordering::Acquire) {
-                        println!("[Cadence] Queue playback cancelled.");
+                        println!("[Cadence] Playback cancelled.");
                         cancelled = true;
                         break;
                     }
 
-                    // Zero out the initial delay between sequences
                     if seq_idx > 0 && j == 0 {
-                        // skip delay for first event of non-first sequence
+                        // Zero out the initial delay between queued sequences and
+                        // re-anchor the timeline so the next item starts "now".
+                        anchor = timer.now_ticks();
+                        acc_micros = 0;
                     } else {
-                        timer.precise_wait_micros(event.delay_micros);
+                        acc_micros += event.delay_micros;
+                        timer.wait_until_ticks(anchor + timer.micros_to_ticks(acc_micros));
                     }
 
-                    match &event.event_type {
-                        InputEventType::MouseMove { x, y } => {
-                            let abs_x =
-                                ((*x - vscreen_x) as f64 / vscreen_w as f64 * 65535.0) as i32;
-                            let abs_y =
-                                ((*y - vscreen_y) as f64 / vscreen_h as f64 * 65535.0) as i32;
-                            send_mouse_input(
-                                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                                abs_x,
-                                abs_y,
-                                0,
-                            );
-                        }
-                        InputEventType::MouseButton { button, pressed } => {
-                            let flags = match (button, pressed) {
-                                (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
-                                (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
-                                (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
-                                (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
-                                (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
-                                (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
-                                (MouseButton::X1, true) | (MouseButton::X2, true) => {
-                                    MOUSEEVENTF_XDOWN
-                                }
-                                (MouseButton::X1, false) | (MouseButton::X2, false) => {
-                                    MOUSEEVENTF_XUP
-                                }
-                            };
-                            let mouse_data = match button {
-                                MouseButton::X1 => XBUTTON1,
-                                MouseButton::X2 => XBUTTON2,
-                                _ => 0,
-                            };
-                            send_mouse_input(flags, 0, 0, mouse_data as i32);
-                        }
-                        InputEventType::MouseWheel { delta } => {
-                            send_mouse_input(MOUSEEVENTF_WHEEL, 0, 0, *delta);
-                        }
-                        InputEventType::KeyPress {
-                            vk_code,
-                            scan_code,
-                            pressed,
-                            extended,
-                        } => {
-                            let mut flags = KEYEVENTF_SCANCODE;
-                            if !pressed {
-                                flags |= KEYEVENTF_KEYUP;
-                            }
-                            if *extended {
-                                flags |= KEYEVENTF_EXTENDEDKEY;
-                            }
-                            send_key_input(*vk_code, *scan_code, flags);
-                        }
-                    }
+                    perform_event(&event.event_type, vs);
                 }
                 if cancelled {
                     break;
                 }
             }
 
-            if cancelled || !LOOP_MODE.load(Ordering::Acquire) {
-                break;
-            }
-        }
-
-        println!("[Cadence] Queue playback finished.");
-        PLAYING.store(false, Ordering::Release);
-    });
-}
-
-pub fn play_sequence(events: Vec<InputEvent>) {
-    if events.is_empty() {
-        println!("[Cadence] No events to play.");
-        return;
-    }
-
-    if PLAYING.load(Ordering::Acquire) {
-        println!("[Cadence] Already playing.");
-        return;
-    }
-
-    PLAYING.store(true, Ordering::Release);
-    CANCEL.store(false, Ordering::Release);
-
-    std::thread::spawn(move || {
-        let timer = PrecisionTimer::new();
-
-        // Get virtual screen dimensions for absolute coordinate normalization
-        let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = unsafe {
-            (
-                GetSystemMetrics(SM_XVIRTUALSCREEN),
-                GetSystemMetrics(SM_YVIRTUALSCREEN),
-                GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            )
-        };
-
-        let event_count = events.len();
-        println!("[Cadence] Playing {} events...", event_count);
-
-        let mut cancelled = false;
-        loop {
-            for (i, event) in events.iter().enumerate() {
-                if CANCEL.load(Ordering::Acquire) {
-                    println!(
-                        "[Cadence] Playback cancelled at event {}/{}",
-                        i, event_count
-                    );
-                    cancelled = true;
-                    break;
-                }
-
-                // Wait the precise delay
-                timer.precise_wait_micros(event.delay_micros);
-
-                // Send the input event
-                match &event.event_type {
-                    InputEventType::MouseMove { x, y } => {
-                        let abs_x =
-                            ((*x - vscreen_x) as f64 / vscreen_w as f64 * 65535.0) as i32;
-                        let abs_y =
-                            ((*y - vscreen_y) as f64 / vscreen_h as f64 * 65535.0) as i32;
-                        send_mouse_input(
-                            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                            abs_x,
-                            abs_y,
-                            0,
-                        );
-                    }
-                    InputEventType::MouseButton { button, pressed } => {
-                        let flags = match (button, pressed) {
-                            (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
-                            (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
-                            (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
-                            (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
-                            (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
-                            (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
-                            (MouseButton::X1, true) | (MouseButton::X2, true) => {
-                                MOUSEEVENTF_XDOWN
-                            }
-                            (MouseButton::X1, false) | (MouseButton::X2, false) => {
-                                MOUSEEVENTF_XUP
-                            }
-                        };
-                        let mouse_data = match button {
-                            MouseButton::X1 => XBUTTON1,
-                            MouseButton::X2 => XBUTTON2,
-                            _ => 0,
-                        };
-                        send_mouse_input(flags, 0, 0, mouse_data as i32);
-                    }
-                    InputEventType::MouseWheel { delta } => {
-                        send_mouse_input(MOUSEEVENTF_WHEEL, 0, 0, *delta);
-                    }
-                    InputEventType::KeyPress {
-                        vk_code,
-                        scan_code,
-                        pressed,
-                        extended,
-                    } => {
-                        let mut flags = KEYEVENTF_SCANCODE;
-                        if !pressed {
-                            flags |= KEYEVENTF_KEYUP;
-                        }
-                        if *extended {
-                            flags |= KEYEVENTF_EXTENDEDKEY;
-                        }
-                        send_key_input(*vk_code, *scan_code, flags);
-                    }
-                }
-            }
-
-            if cancelled || !LOOP_MODE.load(Ordering::Acquire) {
+            if cancelled || force_once || !LOOP_MODE.load(Ordering::Acquire) {
                 break;
             }
         }
@@ -274,6 +182,43 @@ pub fn play_sequence(events: Vec<InputEvent>) {
         println!("[Cadence] Playback finished.");
         PLAYING.store(false, Ordering::Release);
     });
+}
+
+fn run_playback(sequences: Vec<Vec<InputEvent>>) {
+    run_playback_opts(sequences, false);
+}
+
+pub fn play_queue(sequences: Vec<Vec<InputEvent>>) {
+    if sequences.is_empty() {
+        println!("[Cadence] Empty queue.");
+        return;
+    }
+    if PLAYING.load(Ordering::Acquire) {
+        println!("[Cadence] Already playing.");
+        return;
+    }
+    run_playback(sequences);
+}
+
+pub fn play_sequence(events: Vec<InputEvent>) {
+    if events.is_empty() {
+        println!("[Cadence] No events to play.");
+        return;
+    }
+    if PLAYING.load(Ordering::Acquire) {
+        println!("[Cadence] Already playing.");
+        return;
+    }
+    run_playback(vec![events]);
+}
+
+/// Play a sequence exactly once, ignoring the global Loop toggle. For one-shot reactions
+/// (e.g. proximity "go to market") that must not loop even when Loop is checked.
+pub fn play_sequence_once(events: Vec<InputEvent>) {
+    if events.is_empty() || PLAYING.load(Ordering::Acquire) {
+        return;
+    }
+    run_playback_opts(vec![events], true);
 }
 
 fn make_kbd(vk: u16, scan_code: u16, flags: u32) -> INPUT {
@@ -336,4 +281,10 @@ pub fn send_key_press(vk: u16, scan_code: u16) {
         make_kbd(vk, scan_code, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP),
     ];
     dispatch(&mut events);
+}
+
+/// Resolve the hardware scan code for a virtual-key code (MAPVK_VK_TO_VSC).
+/// Synthesized presses ship scan codes so games reading raw input see them.
+pub fn scan_code(vk: u16) -> u16 {
+    unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 }
 }

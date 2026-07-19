@@ -1,10 +1,9 @@
-use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover};
+use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, scale};
 use crate::{sequence, storage};
 use super::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
-use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
 static SAVE_DIALOG_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -46,7 +45,8 @@ unsafe extern "system" fn save_dialog_wnd_proc(
     match msg {
         WM_CREATE => {
             let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32) as HFONT;
+            let dpi = dpi_for_window(hwnd);
+            let font = scaled_font(dpi);
 
             // "Name:" label
             create_control(
@@ -65,7 +65,7 @@ unsafe extern "system" fn save_dialog_wnd_proc(
                 wide("EDIT").as_ptr(),
                 wname.as_ptr(),
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-                56, 10, 244, 24,
+                scale(56, dpi), scale(10, dpi), scale(244, dpi), scale(24, dpi),
                 hwnd,
                 IDC_EDIT_SEQ_NAME as u16 as usize as HMENU,
                 hinstance,

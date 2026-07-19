@@ -24,6 +24,10 @@ features = [
     "errhandlingapi",
     "wingdi",
     "commctrl",
+    "sysinfoapi",
+    "consoleapi",
+    "processenv",
+    "wincon",
 ]
 
 [build-dependencies]

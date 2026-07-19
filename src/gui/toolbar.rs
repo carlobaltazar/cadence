@@ -1,9 +1,8 @@
-use crate::win32_helpers::{wide, create_control};
-use crate::{burst, config, monitor, network, pet_cycle, player, recorder};
+use crate::win32_helpers::{wide, create_control, dpi_for_window, scaled_font, scale};
+use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder};
 use super::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
-use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
 pub(crate) struct ToolbarControls {
@@ -16,6 +15,7 @@ pub(crate) struct ToolbarControls {
     pub hwnd_chk_hp: HWND,
     pub hwnd_chk_mp: HWND,
     pub hwnd_chk_sp: HWND,
+    pub hwnd_chk_det: HWND,
     pub hwnd_btn_burst: HWND,
     pub hwnd_status: HWND,
     pub config: config::AppConfig,
@@ -42,17 +42,6 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
         };
         RegisterClassExW(&wc);
 
-        // Calculate position: top-right of screen
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let win_w = 756;
-        let win_h = 52;
-
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: win_w,
-            bottom: win_h,
-        };
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let ex_style = WS_EX_TOOLWINDOW
             | if cfg.always_on_top {
@@ -60,28 +49,41 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
             } else {
                 0
             };
-        AdjustWindowRectEx(&mut rect, style, FALSE, ex_style as u32);
 
-        let actual_w = rect.right - rect.left;
-        let actual_h = rect.bottom - rect.top;
-        let x = screen_w - actual_w - 10;
-        let y = 10;
-
+        // Create hidden first so we can query the window's actual monitor DPI,
+        // then scale the layout and position it top-right. Per-Monitor-V2
+        // awareness means the OS won't scale us — we size against the real DPI.
         let title = wide("Cadence");
         let hwnd = CreateWindowExW(
             ex_style as u32,
             class_name.as_ptr(),
             title.as_ptr(),
-            style | WS_VISIBLE,
-            x,
-            y,
-            actual_w,
-            actual_h,
+            style,
+            0,
+            0,
+            100,
+            100,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
             std::ptr::null_mut(),
         );
+
+        let dpi = dpi_for_window(hwnd);
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: scale(804, dpi),
+            bottom: scale(52, dpi),
+        };
+        AdjustWindowRectEx(&mut rect, style, FALSE, ex_style as u32);
+        let actual_w = rect.right - rect.left;
+        let actual_h = rect.bottom - rect.top;
+        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+        let x = screen_w - actual_w - scale(10, dpi);
+        let y = scale(10, dpi);
+        let z_order = if cfg.always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        SetWindowPos(hwnd, z_order, x, y, actual_w, actual_h, SWP_SHOWWINDOW);
 
         // Store config in controls struct
         let controls = Box::new(ToolbarControls {
@@ -94,6 +96,7 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
             hwnd_chk_hp: std::ptr::null_mut(),
             hwnd_chk_mp: std::ptr::null_mut(),
             hwnd_chk_sp: std::ptr::null_mut(),
+            hwnd_chk_det: std::ptr::null_mut(),
             hwnd_btn_burst: std::ptr::null_mut(),
             hwnd_status: std::ptr::null_mut(),
             config: cfg.clone(),
@@ -111,7 +114,7 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
 }
 
 unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppConfig) {
-    let font = GetStockObject(DEFAULT_GUI_FONT as i32) as HFONT;
+    let font = scaled_font(dpi_for_window(hwnd));
 
     let y = 6;
     let h = 26;
@@ -184,38 +187,48 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
         SendMessageW(chk_sp, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
     }
 
+    // Det — arm proximity detection. One-shot: it unchecks itself when a player is detected.
+    let chk_det = create_control(
+        hwnd, hinstance, font, "BUTTON", "Det",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+        390, y, 42, h, IDC_CHK_DET,
+    );
+    if cfg.proximity_enabled {
+        SendMessageW(chk_det, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+    }
+
     // Burst Q button — toggles rapid Q-press mode. Owner-drawn-ish:
     // updates label/state in WM_TIMER once burst::is_active changes.
     let btn_burst = create_control(
         hwnd, hinstance, font, "BUTTON", "Burst Q",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        390, y, 62, h, IDC_BTN_BURST,
+        438, y, 62, h, IDC_BTN_BURST,
     );
 
     // -- Group 3: Navigation (gap before) --
     create_control(
         hwnd, hinstance, font, "BUTTON", "\u{2699}",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        456, y, 26, h, IDC_BTN_SETTINGS,
+        504, y, 26, h, IDC_BTN_SETTINGS,
     );
 
     create_control(
         hwnd, hinstance, font, "BUTTON", "Sequences",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        486, y, 74, h, IDC_BTN_SEQUENCES,
+        534, y, 74, h, IDC_BTN_SEQUENCES,
     );
 
     create_control(
         hwnd, hinstance, font, "BUTTON", "Remote",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-        566, y, 66, h, IDC_BTN_REMOTE,
+        614, y, 66, h, IDC_BTN_REMOTE,
     );
 
     // -- Status label --
     let status = create_control(
         hwnd, hinstance, font, "STATIC", "Idle",
         WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-        640, y + 2, 110, h, IDC_STATUS,
+        688, y + 2, 110, h, IDC_STATUS,
     );
 
     // Update stored controls
@@ -229,6 +242,7 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
         (*ptr).hwnd_chk_hp = chk_hp;
         (*ptr).hwnd_chk_mp = chk_mp;
         (*ptr).hwnd_chk_sp = chk_sp;
+        (*ptr).hwnd_chk_det = chk_det;
         (*ptr).hwnd_btn_burst = btn_burst;
         (*ptr).hwnd_status = status;
     }
@@ -390,6 +404,30 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         }
                     }
                 }
+                x if x == IDC_CHK_DET => {
+                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolbarControls;
+                    if !ptr.is_null() {
+                        let checked = SendMessageW((*ptr).hwnd_chk_det, BM_GETCHECK, 0, 0)
+                            == BST_CHECKED as isize;
+                        if checked {
+                            let cfg = &(*ptr).config;
+                            proximity::set_ignored(cfg.proximity_ignore.clone());
+                            proximity::set_reaction(cfg.proximity_sequence.clone());
+                            proximity::start(
+                                cfg.proximity_vk,
+                                cfg.proximity_iface.clone(),
+                                cfg.proximity_server_ip.clone(),
+                                cfg.proximity_cooldown_ms,
+                            );
+                        } else {
+                            proximity::stop();
+                        }
+                        (*ptr).config.proximity_enabled = checked;
+                        if let Err(e) = config::save_config(&(*ptr).config) {
+                            eprintln!("[Cadence] Config save failed: {}", e);
+                        }
+                    }
+                }
                 x if x == IDC_BTN_BURST => {
                     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolbarControls;
                     if !ptr.is_null() {
@@ -411,6 +449,18 @@ unsafe extern "system" fn toolbar_wnd_proc(
                     remote::show_remote_dialog(hwnd);
                 }
                 _ => {}
+            }
+            0
+        }
+        WM_APP_PROXIMITY_HIT => {
+            // Proximity fired and disarmed itself (one-shot): reflect it by unchecking "Det".
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolbarControls;
+            if !ptr.is_null() {
+                SendMessageW((*ptr).hwnd_chk_det, BM_SETCHECK, BST_UNCHECKED as WPARAM, 0);
+                (*ptr).config.proximity_enabled = false;
+                if let Err(e) = config::save_config(&(*ptr).config) {
+                    eprintln!("[Cadence] Config save failed: {}", e);
+                }
             }
             0
         }

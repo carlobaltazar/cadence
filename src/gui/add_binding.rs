@@ -1,4 +1,4 @@
-use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, REMOTE_KEY_OPTIONS};
+use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, dpi_for_window, scaled_font, REMOTE_KEY_OPTIONS};
 use crate::{config, hotkeys};
 use crate::sequence::RemoteBinding;
 use super::*;
@@ -6,7 +6,6 @@ use super::toolbar::ToolbarControls;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
-use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
 static ADD_BINDING_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -46,7 +45,7 @@ unsafe extern "system" fn add_binding_wnd_proc(
     match msg {
         WM_CREATE => {
             let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32) as HFONT;
+            let font = scaled_font(dpi_for_window(hwnd));
 
             // Modifiers label
             create_control(

@@ -135,7 +135,7 @@ fn ensure_running() {
         let scans: [u16; BAR_COUNT] = {
             let mut s = [0u16; BAR_COUNT];
             for i in 0..BAR_COUNT {
-                s[i] = unsafe { MapVirtualKeyW(BAR_VK[i] as u32, MAPVK_VK_TO_VSC) } as u16;
+                s[i] = player::scan_code(BAR_VK[i]);
             }
             s
         };

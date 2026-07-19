@@ -1,10 +1,9 @@
-use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, KEY_OPTIONS};
+use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, KEY_OPTIONS};
 use crate::{hotkeys, storage};
 use super::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
-use winapi::um::wingdi::*;
 use winapi::um::winuser::*;
 
 static BIND_KEY_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -44,7 +43,7 @@ unsafe extern "system" fn bind_key_wnd_proc(
     match msg {
         WM_CREATE => {
             let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32) as HFONT;
+            let font = scaled_font(dpi_for_window(hwnd));
 
             // "Key:" label
             create_control(

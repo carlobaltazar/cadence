@@ -2,7 +2,6 @@ use crate::player;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use winapi::um::winuser::*;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
@@ -24,7 +23,7 @@ pub fn start(interval_secs: u64) {
 
         // Get scan code for 'A' key (VK 0x41)
         let vk: u16 = 0x41;
-        let scan_code = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
+        let scan_code = player::scan_code(vk);
 
         loop {
             // Sleep in 1-second chunks so we can respond to cancel quickly

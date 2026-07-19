@@ -1,5 +1,5 @@
-use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, lock_or_recover, BURST_KEY_OPTIONS, KEY_OPTIONS};
-use crate::{burst, config, hotkeys};
+use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, lock_or_recover, dpi_for_window, scaled_font, BURST_KEY_OPTIONS, KEY_OPTIONS, REMOTE_KEY_OPTIONS};
+use crate::{burst, config, hotkeys, proximity};
 use super::*;
 use super::toolbar::ToolbarControls;
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
@@ -20,6 +20,8 @@ static SAMPLED_TITLE: Mutex<String> = Mutex::new(String::new());
 static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Which bar the live picker is currently capturing for (0=HP,1=MP,2=SP).
 static PICK_TARGET: AtomicU8 = AtomicU8::new(0);
+// Capture device names, index-aligned to the proximity interface combo (after "(Auto-select)").
+static PROX_DEVICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Map a bar target (0=HP,1=MP,2=SP) to its dialog control IDs:
 /// (edit_x, edit_y, color_label, pick_button, live_label).
@@ -137,7 +139,7 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
         settings_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 300, 630,
+        sx, sy, 300, 830,
         parent, hinstance,
     );
     SETTINGS_HWND.store(hwnd as isize, Ordering::Release);
@@ -152,7 +154,7 @@ unsafe extern "system" fn settings_wnd_proc(
     match msg {
         WM_CREATE => {
             let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32) as HFONT;
+            let font = scaled_font(dpi_for_window(hwnd));
 
             // "Record Key:" label
             create_control(
@@ -382,11 +384,108 @@ unsafe extern "system" fn settings_wnd_proc(
 
             let _ = parent2_ptr;
 
-            // OK button (below the SP monitor section)
+            // -- Proximity Alert section --
+            let pcfg = config::cached_config();
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "— Proximity Alert —",
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0,
+                12, 588, 272, 18, 0,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Enable (press key when a player appears)",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+                12, 610, 272, 22, IDC_CHK_PROX,
+            );
+            if pcfg.proximity_enabled {
+                SendMessageW(GetDlgItem(hwnd, IDC_CHK_PROX as i32), BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+            }
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Key:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 642, 28, 20, 0,
+            );
+            create_control(
+                hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                42, 638, 84, 200, IDC_COMBO_PROX_KEY,
+            );
+            populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), REMOTE_KEY_OPTIONS, Some(pcfg.proximity_vk));
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Server IP:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                134, 642, 58, 20, 0,
+            );
+            create_control(
+                hwnd, hinstance, font, "EDIT", &pcfg.proximity_server_ip,
+                WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
+                194, 638, 90, 22, IDC_EDIT_PROX_IP,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Interface:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 672, 58, 20, 0,
+            );
+            create_control(
+                hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                72, 668, 212, 240, IDC_COMBO_PROX_IFACE,
+            );
+            let h_iface = GetDlgItem(hwnd, IDC_COMBO_PROX_IFACE as i32);
+            SendMessageW(h_iface, CB_ADDSTRING, 0, wide("(Auto-select)").as_ptr() as LPARAM);
+            let devices = proximity::list_devices();
+            let mut dev_names: Vec<String> = Vec::new();
+            let mut sel_iface: usize = 0;
+            for (i, (name, desc)) in devices.iter().enumerate() {
+                let label = if desc.is_empty() { name.clone() } else { desc.clone() };
+                SendMessageW(h_iface, CB_ADDSTRING, 0, wide(&label).as_ptr() as LPARAM);
+                if *name == pcfg.proximity_iface {
+                    sel_iface = i + 1;
+                }
+                dev_names.push(name.clone());
+            }
+            SendMessageW(h_iface, CB_SETCURSEL, sel_iface as WPARAM, 0);
+            *lock_or_recover(&PROX_DEVICES) = dev_names;
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "On detect:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 702, 62, 20, 0,
+            );
+            create_control(
+                hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                76, 698, 208, 240, IDC_COMBO_PROX_ACTION,
+            );
+            // "(Press Key)" uses the Key above; otherwise play the chosen recorded sequence.
+            let h_action = GetDlgItem(hwnd, IDC_COMBO_PROX_ACTION as i32);
+            SendMessageW(h_action, CB_ADDSTRING, 0, wide("(Press Key)").as_ptr() as LPARAM);
+            let mut sel_action: usize = 0;
+            if let Ok(names) = crate::storage::list_sequences() {
+                for (i, name) in names.iter().enumerate() {
+                    SendMessageW(h_action, CB_ADDSTRING, 0, wide(name).as_ptr() as LPARAM);
+                    if *name == pcfg.proximity_sequence {
+                        sel_action = i + 1;
+                    }
+                }
+            }
+            SendMessageW(h_action, CB_SETCURSEL, sel_action as WPARAM, 0);
+
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                12, 728, 200, 26, IDC_BTN_PROX_PLAYERS,
+            );
+
+            // OK button (below the Proximity section)
             create_control(
                 hwnd, hinstance, font, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                115, 572, 70, 28, IDC_BTN_SETTINGS_OK,
+                115, 770, 70, 28, IDC_BTN_SETTINGS_OK,
             );
 
             0
@@ -510,6 +609,9 @@ unsafe extern "system" fn settings_wnd_proc(
                     MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
                 }
                 return 0;
+            } else if control_id == IDC_BTN_PROX_PLAYERS {
+                super::players::show_players_dialog(hwnd);
+                return 0;
             } else if control_id == IDC_BTN_SETTINGS_OK {
                 // Read selections
                 let h_combo_rec = GetDlgItem(hwnd, IDC_COMBO_RECORD_KEY as i32);
@@ -620,6 +722,53 @@ unsafe extern "system" fn settings_wnd_proc(
                             (*ptr).config.sp_monitor_y = read_edit_i32(hwnd, IDC_EDIT_SP_Y);
                             (*ptr).config.sp_monitor_color = SAMPLED_COLOR[2].load(Ordering::Acquire);
 
+                            // Read Proximity settings
+                            let prox_enabled = SendMessageW(
+                                GetDlgItem(hwnd, IDC_CHK_PROX as i32), BM_GETCHECK, 0, 0,
+                            ) == BST_CHECKED as isize;
+                            let pk_idx = SendMessageW(
+                                GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), CB_GETCURSEL, 0, 0,
+                            ) as usize;
+                            let prox_vk = if pk_idx < REMOTE_KEY_OPTIONS.len() { REMOTE_KEY_OPTIONS[pk_idx].0 } else { 0x45 };
+                            let if_idx = SendMessageW(
+                                GetDlgItem(hwnd, IDC_COMBO_PROX_IFACE as i32), CB_GETCURSEL, 0, 0,
+                            );
+                            let prox_iface = if if_idx <= 0 {
+                                String::new()
+                            } else {
+                                lock_or_recover(&PROX_DEVICES)
+                                    .get(if_idx as usize - 1).cloned().unwrap_or_default()
+                            };
+                            let mut ipbuf = [0u16; 64];
+                            GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PROX_IP as i32), ipbuf.as_mut_ptr(), 64);
+                            let ip_len = ipbuf.iter().position(|&c| c == 0).unwrap_or(ipbuf.len());
+                            let prox_ip = String::from_utf16_lossy(&ipbuf[..ip_len]);
+                            // On-detect action: "(Press Key)" (index 0) = empty; else the sequence name.
+                            let act_combo = GetDlgItem(hwnd, IDC_COMBO_PROX_ACTION as i32);
+                            let act_idx = SendMessageW(act_combo, CB_GETCURSEL, 0, 0);
+                            let prox_sequence = if act_idx <= 0 {
+                                String::new()
+                            } else {
+                                let len = SendMessageW(act_combo, CB_GETLBTEXTLEN, act_idx as WPARAM, 0);
+                                if len > 0 {
+                                    let mut buf = vec![0u16; (len as usize) + 1];
+                                    SendMessageW(act_combo, CB_GETLBTEXT, act_idx as WPARAM, buf.as_mut_ptr() as LPARAM);
+                                    String::from_utf16_lossy(&buf[..len as usize])
+                                } else {
+                                    String::new()
+                                }
+                            };
+                            let prox_cooldown = (*ptr).config.proximity_cooldown_ms; // vestigial (one-shot)
+
+                            (*ptr).config.proximity_enabled = prox_enabled;
+                            (*ptr).config.proximity_vk = prox_vk;
+                            (*ptr).config.proximity_iface = prox_iface.clone();
+                            (*ptr).config.proximity_server_ip = prox_ip.clone();
+                            (*ptr).config.proximity_sequence = prox_sequence.clone();
+                            // The ignore list is edited in the Players window (live + config cache),
+                            // so pull the current value in rather than clobbering it with our stale copy.
+                            (*ptr).config.proximity_ignore = proximity::ignored_players();
+
                             if let Err(e) = config::save_config(&(*ptr).config) {
                                 eprintln!("[Cadence] Config save failed: {}", e);
                             }
@@ -649,6 +798,15 @@ unsafe extern "system" fn settings_wnd_proc(
                                     cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
                             } else {
                                 monitor::disable_bar(Bar::Sp);
+                            }
+
+                            // Apply Proximity changes immediately. start() itself waits for any
+                            // running capture to stop, so this reliably restarts detection.
+                            proximity::set_reaction((*ptr).config.proximity_sequence.clone());
+                            if prox_enabled {
+                                proximity::start(prox_vk, prox_iface, prox_ip, prox_cooldown);
+                            } else {
+                                proximity::stop();
                             }
                         }
                         // If burst was running and the user changed the rate,
