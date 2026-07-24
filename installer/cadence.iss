@@ -1,7 +1,7 @@
 ; Cadence Inno Setup Installer Script
 
 #define MyAppName "Cadence"
-#define MyAppVersion "3.0.1"
+#define MyAppVersion "3.2.0"
 #define MyAppPublisher "Cadence"
 #define MyAppExeName "cadence.exe"
 

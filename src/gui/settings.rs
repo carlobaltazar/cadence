@@ -1,4 +1,4 @@
-use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, lock_or_recover, dpi_for_window, scaled_font, BURST_KEY_OPTIONS, KEY_OPTIONS, REMOTE_KEY_OPTIONS};
+use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, lock_or_recover, dpi_for_window, scale, scaled_font, BURST_KEY_OPTIONS, KEY_OPTIONS, REMOTE_KEY_OPTIONS};
 use crate::{burst, config, hotkeys, proximity};
 use super::*;
 use super::toolbar::ToolbarControls;
@@ -118,6 +118,72 @@ unsafe fn prepopulate_section(hwnd: HWND, target: u8, x: i32, y: i32, color: u32
     }
 }
 
+/// Stretch one width-following control to the right margin, preserving its top/left/height.
+/// Comboboxes need an explicit dropdown height, so pass `combo = true` for them.
+unsafe fn stretch_to_right(hwnd: HWND, id: u16, right: i32, dpi: u32, combo: bool) {
+    let h = GetDlgItem(hwnd, id as i32);
+    if h.is_null() {
+        return;
+    }
+    let mut r: RECT = std::mem::zeroed();
+    GetWindowRect(h, &mut r);
+    let mut tl = POINT { x: r.left, y: r.top };
+    ScreenToClient(hwnd, &mut tl);
+    let new_w = (right - tl.x).max(scale(60, dpi));
+    let new_h = if combo { scale(200, dpi) } else { r.bottom - r.top };
+    MoveWindow(h, tl.x, tl.y, new_w, new_h, TRUE);
+}
+
+/// Reflow the width-following controls (key/interface/action combos, live-picker readouts,
+/// section dividers) to the current client width and re-pin OK to the bottom. Runs after
+/// creation and on every WM_SIZE.
+unsafe fn layout(hwnd: HWND) {
+    let dpi = dpi_for_window(hwnd);
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    let (cw, ch) = (rc.right, rc.bottom);
+    if cw <= 0 || ch <= 0 {
+        return;
+    }
+    let m = scale(12, dpi);
+    let right = cw - m;
+
+    // Full-width dividers + live-picker readouts.
+    for id in [
+        IDC_SETTINGS_DIV1, IDC_SETTINGS_DIV2, IDC_SETTINGS_DIV3,
+        IDC_STATIC_HP_LIVE, IDC_STATIC_MP_LIVE, IDC_STATIC_SP_LIVE,
+    ] {
+        stretch_to_right(hwnd, id, right, dpi, false);
+    }
+    // Combos that span to the right edge.
+    for id in [
+        IDC_COMBO_RECORD_KEY, IDC_COMBO_PLAY_KEY, IDC_COMBO_QUEUE_KEY,
+        IDC_COMBO_PROX_IFACE, IDC_COMBO_PROX_ACTION,
+    ] {
+        stretch_to_right(hwnd, id, right, dpi, true);
+    }
+
+    // OK floats to the bottom-centre, but never above the last content control (the Detected
+    // Players button) — so a short window can't make it overlap. Grows downward with the window.
+    let ok_w = scale(70, dpi);
+    let ok_h = scale(28, dpi);
+    let ok = GetDlgItem(hwnd, IDC_BTN_SETTINGS_OK as i32);
+    if !ok.is_null() {
+        let gap = scale(12, dpi);
+        let mut floor = m; // fallback if the Players button can't be located
+        let players = GetDlgItem(hwnd, IDC_BTN_PROX_PLAYERS as i32);
+        if !players.is_null() {
+            let mut pr: RECT = std::mem::zeroed();
+            GetWindowRect(players, &mut pr);
+            let mut pbl = POINT { x: pr.left, y: pr.bottom };
+            ScreenToClient(hwnd, &mut pbl);
+            floor = pbl.y + gap;
+        }
+        let ok_y = (ch - m - ok_h).max(floor).max(0);
+        MoveWindow(ok, (cw - ok_w) / 2, ok_y, ok_w, ok_h, TRUE);
+    }
+}
+
 pub unsafe fn show_settings_dialog(parent: HWND) {
     let existing = SETTINGS_HWND.load(Ordering::Acquire) as HWND;
     if !existing.is_null() && IsWindow(existing) != 0 {
@@ -138,8 +204,10 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
         "CadenceSettings", "Settings",
         settings_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 300, 830,
+        // Resizable: WS_THICKFRAME + WS_MAXIMIZEBOX let the user widen/maximize the dialog;
+        // WM_SIZE reflows the width-following controls and re-pins OK to the bottom.
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE,
+        sx, sy, 312, 840,
         parent, hinstance,
     );
     SETTINGS_HWND.store(hwnd as isize, Ordering::Release);
@@ -156,285 +224,104 @@ unsafe extern "system" fn settings_wnd_proc(
             let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
             let font = scaled_font(dpi_for_window(hwnd));
 
-            // "Record Key:" label
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Record Key:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 16, 80, 20, 0,
-            );
+            // Sections are built top-to-bottom in visual order. Layout literals are authored at
+            // 96 DPI and scaled by create_control; the width-following controls and the OK button
+            // are re-placed by layout() (on create and on every resize).
 
-            // Record key combobox
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
+            // -- Hotkeys --
+            create_control(hwnd, hinstance, font, "STATIC", "Record Key:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 16, 80, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                96, 12, 148, 200, IDC_COMBO_RECORD_KEY,
-            );
-
-            // "Stop Key:" label
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Stop Key:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 52, 80, 20, 0,
-            );
-
-            // Stop key combobox
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
+                96, 12, 180, 200, IDC_COMBO_RECORD_KEY);
+            create_control(hwnd, hinstance, font, "STATIC", "Stop Key:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 52, 80, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                96, 48, 148, 200, IDC_COMBO_PLAY_KEY,
-            );
+                96, 48, 180, 200, IDC_COMBO_PLAY_KEY);
+            create_control(hwnd, hinstance, font, "STATIC", "Queue Key:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 88, 80, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                96, 84, 180, 200, IDC_COMBO_QUEUE_KEY);
 
-            // Populate comboboxes
             let (current_rec, current_stop) = hotkeys::current_hotkeys();
-            let h_combo_rec = GetDlgItem(hwnd, IDC_COMBO_RECORD_KEY as i32);
-            let h_combo_play = GetDlgItem(hwnd, IDC_COMBO_PLAY_KEY as i32);
-            populate_key_combo(h_combo_rec, KEY_OPTIONS, Some(current_rec));
-            populate_key_combo(h_combo_play, KEY_OPTIONS, Some(current_stop));
+            populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_RECORD_KEY as i32), KEY_OPTIONS, Some(current_rec));
+            populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PLAY_KEY as i32), KEY_OPTIONS, Some(current_stop));
 
-            // "Queue Key:" label
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Queue Key:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 88, 80, 20, 0,
-            );
-
-            // Queue key combobox
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
-                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                96, 84, 148, 200, IDC_COMBO_QUEUE_KEY,
-            );
-
-            // Populate queue key combo with "(None)" option
+            // Queue combo leads with "(None)".
             let h_combo_queue = GetDlgItem(hwnd, IDC_COMBO_QUEUE_KEY as i32);
-            let none_text = wide("(None)");
-            SendMessageW(h_combo_queue, CB_ADDSTRING, 0, none_text.as_ptr() as LPARAM);
-
+            SendMessageW(h_combo_queue, CB_ADDSTRING, 0, wide("(None)").as_ptr() as LPARAM);
             let current_queue_vk = hotkeys::current_queue_vk();
             if current_queue_vk.is_none() {
                 SendMessageW(h_combo_queue, CB_SETCURSEL, 0, 0);
             }
             for (i, (vk, name)) in KEY_OPTIONS.iter().enumerate() {
-                let wname = wide(name);
-                SendMessageW(h_combo_queue, CB_ADDSTRING, 0, wname.as_ptr() as LPARAM);
+                SendMessageW(h_combo_queue, CB_ADDSTRING, 0, wide(name).as_ptr() as LPARAM);
                 if current_queue_vk == Some(*vk) {
                     SendMessageW(h_combo_queue, CB_SETCURSEL, (i + 1) as WPARAM, 0);
                 }
             }
 
-            // -- HP Monitor section --
-            create_control(
-                hwnd, hinstance, font, "STATIC", "— HP Monitor —",
-                WS_CHILD | WS_VISIBLE | SS_CENTER, 0,
-                12, 124, 272, 18, 0,
-            );
+            create_control(hwnd, hinstance, font, "STATIC", "",
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 116, 272, 2, IDC_SETTINGS_DIV1);
 
-            // X coordinate
-            create_control(
-                hwnd, hinstance, font, "STATIC", "X:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 150, 16, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "EDIT", "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
-                30, 148, 70, 22, IDC_EDIT_HP_X,
-            );
-
-            // Y coordinate
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Y:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                112, 150, 16, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "EDIT", "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
-                130, 148, 70, 22, IDC_EDIT_HP_Y,
-            );
-
-            // Pick button — click to enter screen pixel picker mode
-            create_control(
-                hwnd, hinstance, font, "BUTTON", "Pick",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                210, 148, 60, 22, IDC_BTN_HP_PICK,
-            );
-
-            // Sample button (manual)
-            create_control(
-                hwnd, hinstance, font, "BUTTON", "Sample",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                12, 180, 60, 24, IDC_BTN_HP_SAMPLE,
-            );
-
-            // Color preview label
-            create_control(
-                hwnd, hinstance, font, "STATIC", "(not sampled)",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                80, 183, 190, 20, IDC_STATIC_HP_COLOR,
-            );
-
-            // Live picker display — shows cursor X, Y and color while picking
-            create_control(
-                hwnd, hinstance, font, "STATIC", "",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 210, 268, 20, IDC_STATIC_HP_LIVE,
-            );
-
-            // Pre-populate HP fields from config
-            let parent = GetParent(hwnd);
-            let parent_ptr = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut ToolbarControls;
-            if !parent_ptr.is_null() {
-                let cfg = &(*parent_ptr).config;
-                if cfg.hp_monitor_x != 0 || cfg.hp_monitor_y != 0 {
-                    let x_text = wide(&cfg.hp_monitor_x.to_string());
-                    let y_text = wide(&cfg.hp_monitor_y.to_string());
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_X as i32), x_text.as_ptr());
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_HP_Y as i32), y_text.as_ptr());
-                }
-                if cfg.hp_monitor_color != 0 {
-                    SAMPLED_COLOR[0].store(cfg.hp_monitor_color, Ordering::Release);
-                    let r = cfg.hp_monitor_color & 0xFF;
-                    let g = (cfg.hp_monitor_color >> 8) & 0xFF;
-                    let b = (cfg.hp_monitor_color >> 16) & 0xFF;
-                    let color_text = wide(&format!("R:{} G:{} B:{}", r, g, b));
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_HP_COLOR as i32), color_text.as_ptr());
-                } else {
-                    SAMPLED_COLOR[0].store(0, Ordering::Release);
-                }
-                *lock_or_recover(&SAMPLED_CLASS) = cfg.hp_monitor_window_class.clone();
-                *lock_or_recover(&SAMPLED_TITLE) = cfg.hp_monitor_window_title.clone();
-            }
-
-            // -- MP Monitor section --
-            create_section_controls(hwnd, hinstance, font, "MP", 340,
+            // -- Bar monitors (HP / MP / SP), all via the shared helper so they're identical --
+            create_section_controls(hwnd, hinstance, font, "HP", 128,
+                IDC_EDIT_HP_X, IDC_EDIT_HP_Y, IDC_BTN_HP_PICK, IDC_BTN_HP_SAMPLE,
+                IDC_STATIC_HP_COLOR, IDC_STATIC_HP_LIVE);
+            create_section_controls(hwnd, hinstance, font, "MP", 240,
                 IDC_EDIT_MP_X, IDC_EDIT_MP_Y, IDC_BTN_MP_PICK, IDC_BTN_MP_SAMPLE,
                 IDC_STATIC_MP_COLOR, IDC_STATIC_MP_LIVE);
-            // -- SP Monitor section --
-            create_section_controls(hwnd, hinstance, font, "SP", 452,
+            create_section_controls(hwnd, hinstance, font, "SP", 352,
                 IDC_EDIT_SP_X, IDC_EDIT_SP_Y, IDC_BTN_SP_PICK, IDC_BTN_SP_SAMPLE,
                 IDC_STATIC_SP_COLOR, IDC_STATIC_SP_LIVE);
 
-            // Pre-populate MP/SP fields from config
-            if !parent_ptr.is_null() {
-                let cfg = &(*parent_ptr).config;
-                prepopulate_section(hwnd, 1, cfg.mp_monitor_x, cfg.mp_monitor_y, cfg.mp_monitor_color);
-                prepopulate_section(hwnd, 2, cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
-            }
+            create_control(hwnd, hinstance, font, "STATIC", "",
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 468, 272, 2, IDC_SETTINGS_DIV2);
 
-            // -- Burst Q section --
-            create_control(
-                hwnd, hinstance, font, "STATIC", "— Burst Q —",
-                WS_CHILD | WS_VISIBLE | SS_CENTER, 0,
-                12, 244, 272, 18, 0,
-            );
-
-            // Hotkey label + combobox
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Hotkey:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 272, 50, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
+            // -- Burst Q --
+            create_control(hwnd, hinstance, font, "STATIC", "\u{2014} Burst Q \u{2014}",
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, 480, 272, 18, 0);
+            create_control(hwnd, hinstance, font, "STATIC", "Hotkey:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 510, 50, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                66, 268, 130, 200, IDC_COMBO_BURST_KEY,
-            );
-
+                66, 506, 120, 200, IDC_COMBO_BURST_KEY);
             let h_combo_burst = GetDlgItem(hwnd, IDC_COMBO_BURST_KEY as i32);
-            let none_text = wide("(None)");
-            SendMessageW(h_combo_burst, CB_ADDSTRING, 0, none_text.as_ptr() as LPARAM);
+            SendMessageW(h_combo_burst, CB_ADDSTRING, 0, wide("(None)").as_ptr() as LPARAM);
             let current_burst_vk = hotkeys::current_burst_vk();
             if current_burst_vk.is_none() {
                 SendMessageW(h_combo_burst, CB_SETCURSEL, 0, 0);
             }
             for (i, (vk, name)) in BURST_KEY_OPTIONS.iter().enumerate() {
-                let wname = wide(name);
-                SendMessageW(h_combo_burst, CB_ADDSTRING, 0, wname.as_ptr() as LPARAM);
+                SendMessageW(h_combo_burst, CB_ADDSTRING, 0, wide(name).as_ptr() as LPARAM);
                 if current_burst_vk == Some(*vk) {
                     SendMessageW(h_combo_burst, CB_SETCURSEL, (i + 1) as WPARAM, 0);
                 }
             }
-
-            // Rate label + edit (Hz)
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Rate (Hz):",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 304, 60, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "EDIT", "",
+            create_control(hwnd, hinstance, font, "STATIC", "Rate (Hz):",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 540, 60, 20, 0);
+            create_control(hwnd, hinstance, font, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
-                76, 300, 60, 22, IDC_EDIT_BURST_RATE,
-            );
-            create_control(
-                hwnd, hinstance, font, "STATIC", "(50-200, default 100)",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                144, 304, 140, 20, 0,
-            );
+                76, 536, 60, 22, IDC_EDIT_BURST_RATE);
+            create_control(hwnd, hinstance, font, "STATIC", "(50-200, default 100)",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 144, 540, 140, 20, 0);
 
-            // Pre-populate burst rate from config
-            let parent2 = GetParent(hwnd);
-            let parent2_ptr = GetWindowLongPtrW(parent2, GWLP_USERDATA) as *mut ToolbarControls;
-            if !parent2_ptr.is_null() {
-                let cfg = &(*parent2_ptr).config;
-                let rate_text = wide(&cfg.burst_rate_hz.to_string());
-                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_BURST_RATE as i32), rate_text.as_ptr());
-            }
+            create_control(hwnd, hinstance, font, "STATIC", "",
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 572, 272, 2, IDC_SETTINGS_DIV3);
 
-            let _ = parent2_ptr;
-
-            // -- Proximity Alert section --
+            // -- Proximity Alert --
+            // Configuration only. Arming/disarming detection is the toolbar "Det" checkbox
+            // (one control, one source of truth). Server IP is always auto-discovered.
             let pcfg = config::cached_config();
-
-            create_control(
-                hwnd, hinstance, font, "STATIC", "— Proximity Alert —",
-                WS_CHILD | WS_VISIBLE | SS_CENTER, 0,
-                12, 588, 272, 18, 0,
-            );
-
-            create_control(
-                hwnd, hinstance, font, "BUTTON", "Enable (press key when a player appears)",
-                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
-                12, 610, 272, 22, IDC_CHK_PROX,
-            );
-            if pcfg.proximity_enabled {
-                SendMessageW(GetDlgItem(hwnd, IDC_CHK_PROX as i32), BM_SETCHECK, BST_CHECKED as WPARAM, 0);
-            }
-
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Key:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 642, 28, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
+            create_control(hwnd, hinstance, font, "STATIC", "\u{2014} Proximity Alert \u{2014}",
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, 584, 272, 18, 0);
+            create_control(hwnd, hinstance, font, "STATIC", "Interface:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 618, 58, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                42, 638, 84, 200, IDC_COMBO_PROX_KEY,
-            );
-            populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), REMOTE_KEY_OPTIONS, Some(pcfg.proximity_vk));
-
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Server IP:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                134, 642, 58, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "EDIT", &pcfg.proximity_server_ip,
-                WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
-                194, 638, 90, 22, IDC_EDIT_PROX_IP,
-            );
-
-            create_control(
-                hwnd, hinstance, font, "STATIC", "Interface:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 672, 58, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
-                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                72, 668, 212, 240, IDC_COMBO_PROX_IFACE,
-            );
+                72, 614, 212, 240, IDC_COMBO_PROX_IFACE);
             let h_iface = GetDlgItem(hwnd, IDC_COMBO_PROX_IFACE as i32);
             SendMessageW(h_iface, CB_ADDSTRING, 0, wide("(Auto-select)").as_ptr() as LPARAM);
             let devices = proximity::list_devices();
@@ -450,17 +337,17 @@ unsafe extern "system" fn settings_wnd_proc(
             }
             SendMessageW(h_iface, CB_SETCURSEL, sel_iface as WPARAM, 0);
             *lock_or_recover(&PROX_DEVICES) = dev_names;
-
-            create_control(
-                hwnd, hinstance, font, "STATIC", "On detect:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 702, 62, 20, 0,
-            );
-            create_control(
-                hwnd, hinstance, font, "COMBOBOX", "",
+            create_control(hwnd, hinstance, font, "STATIC", "Key:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 652, 28, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                76, 698, 208, 240, IDC_COMBO_PROX_ACTION,
-            );
+                42, 648, 84, 200, IDC_COMBO_PROX_KEY);
+            populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), REMOTE_KEY_OPTIONS, Some(pcfg.proximity_vk));
+            create_control(hwnd, hinstance, font, "STATIC", "On detect:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 686, 62, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                76, 682, 208, 240, IDC_COMBO_PROX_ACTION);
             // "(Press Key)" uses the Key above; otherwise play the chosen recorded sequence.
             let h_action = GetDlgItem(hwnd, IDC_COMBO_PROX_ACTION as i32);
             SendMessageW(h_action, CB_ADDSTRING, 0, wide("(Press Key)").as_ptr() as LPARAM);
@@ -474,20 +361,28 @@ unsafe extern "system" fn settings_wnd_proc(
                 }
             }
             SendMessageW(h_action, CB_SETCURSEL, sel_action as WPARAM, 0);
+            create_control(hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, 716, 200, 26, IDC_BTN_PROX_PLAYERS);
 
-            create_control(
-                hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                12, 728, 200, 26, IDC_BTN_PROX_PLAYERS,
-            );
+            // OK button (re-pinned to the window bottom by layout()).
+            create_control(hwnd, hinstance, font, "BUTTON", "OK",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 121, 756, 70, 28, IDC_BTN_SETTINGS_OK);
 
-            // OK button (below the Proximity section)
-            create_control(
-                hwnd, hinstance, font, "BUTTON", "OK",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                115, 770, 70, 28, IDC_BTN_SETTINGS_OK,
-            );
+            // Pre-fill the monitor X/Y/color fields and the burst rate from config (single fetch).
+            // HP/MP/SP share one game window, so the sampled class/title come from HP's config.
+            let parent_ptr = GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA) as *mut ToolbarControls;
+            if !parent_ptr.is_null() {
+                let cfg = &(*parent_ptr).config;
+                prepopulate_section(hwnd, 0, cfg.hp_monitor_x, cfg.hp_monitor_y, cfg.hp_monitor_color);
+                prepopulate_section(hwnd, 1, cfg.mp_monitor_x, cfg.mp_monitor_y, cfg.mp_monitor_color);
+                prepopulate_section(hwnd, 2, cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
+                *lock_or_recover(&SAMPLED_CLASS) = cfg.hp_monitor_window_class.clone();
+                *lock_or_recover(&SAMPLED_TITLE) = cfg.hp_monitor_window_title.clone();
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_BURST_RATE as i32),
+                    wide(&cfg.burst_rate_hz.to_string()).as_ptr());
+            }
 
+            layout(hwnd); // size the width-following controls + OK to the initial client area
             0
         }
         WM_COMMAND => {
@@ -610,7 +505,11 @@ unsafe extern "system" fn settings_wnd_proc(
                 }
                 return 0;
             } else if control_id == IDC_BTN_PROX_PLAYERS {
-                super::players::show_players_dialog(hwnd);
+                // Own the Players window by the main toolbar, NOT this transient Settings dialog —
+                // otherwise closing Settings destroys it (and the scan view) with it.
+                let owner = GetWindow(hwnd, GW_OWNER);
+                let owner = if owner.is_null() { hwnd } else { owner };
+                super::players::show_players_dialog(owner);
                 return 0;
             } else if control_id == IDC_BTN_SETTINGS_OK {
                 // Read selections
@@ -722,10 +621,9 @@ unsafe extern "system" fn settings_wnd_proc(
                             (*ptr).config.sp_monitor_y = read_edit_i32(hwnd, IDC_EDIT_SP_Y);
                             (*ptr).config.sp_monitor_color = SAMPLED_COLOR[2].load(Ordering::Acquire);
 
-                            // Read Proximity settings
-                            let prox_enabled = SendMessageW(
-                                GetDlgItem(hwnd, IDC_CHK_PROX as i32), BM_GETCHECK, 0, 0,
-                            ) == BST_CHECKED as isize;
+                            // Read Proximity settings. Arm/disarm is the toolbar "Det" checkbox,
+                            // so Settings only edits key/interface/on-detect (not the enabled flag),
+                            // and the server IP stays whatever's in config (empty = auto-discover).
                             let pk_idx = SendMessageW(
                                 GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), CB_GETCURSEL, 0, 0,
                             ) as usize;
@@ -739,10 +637,6 @@ unsafe extern "system" fn settings_wnd_proc(
                                 lock_or_recover(&PROX_DEVICES)
                                     .get(if_idx as usize - 1).cloned().unwrap_or_default()
                             };
-                            let mut ipbuf = [0u16; 64];
-                            GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PROX_IP as i32), ipbuf.as_mut_ptr(), 64);
-                            let ip_len = ipbuf.iter().position(|&c| c == 0).unwrap_or(ipbuf.len());
-                            let prox_ip = String::from_utf16_lossy(&ipbuf[..ip_len]);
                             // On-detect action: "(Press Key)" (index 0) = empty; else the sequence name.
                             let act_combo = GetDlgItem(hwnd, IDC_COMBO_PROX_ACTION as i32);
                             let act_idx = SendMessageW(act_combo, CB_GETCURSEL, 0, 0);
@@ -760,20 +654,14 @@ unsafe extern "system" fn settings_wnd_proc(
                             };
                             let prox_cooldown = (*ptr).config.proximity_cooldown_ms; // vestigial (one-shot)
 
-                            (*ptr).config.proximity_enabled = prox_enabled;
                             (*ptr).config.proximity_vk = prox_vk;
                             (*ptr).config.proximity_iface = prox_iface.clone();
-                            (*ptr).config.proximity_server_ip = prox_ip.clone();
                             (*ptr).config.proximity_sequence = prox_sequence.clone();
                             // The ignore list is edited in the Players window (live + config cache),
                             // so pull the current value in rather than clobbering it with our stale copy.
                             (*ptr).config.proximity_ignore = proximity::ignored_players();
 
-                            if let Err(e) = config::save_config(&(*ptr).config) {
-                                eprintln!("[Cadence] Config save failed: {}", e);
-                            }
-
-                            // Push the just-saved settings into the live monitor so a
+                            // Push the new settings into the live monitor so a
                             // re-pick / color change takes effect immediately — no
                             // checkbox toggle or app restart needed. MP/SP share HP's
                             // window anchor (same game window).
@@ -803,10 +691,21 @@ unsafe extern "system" fn settings_wnd_proc(
                             // Apply Proximity changes immediately. start() itself waits for any
                             // running capture to stop, so this reliably restarts detection.
                             proximity::set_reaction((*ptr).config.proximity_sequence.clone());
-                            if prox_enabled {
-                                proximity::start(prox_vk, prox_iface, prox_ip, prox_cooldown);
+                            // Don't disturb an active passive scan (owned by the Players window) —
+                            // closing Settings must not kill a running scan.
+                            if proximity::is_scan_only() {
+                                // leave the scan running
+                            } else if (*ptr).config.proximity_enabled {
+                                // Det is armed: restart so the new key/interface/on-detect take effect.
+                                proximity::set_scan_only(false); // reactive detection
+                                proximity::start(prox_vk, prox_iface,
+                                    (*ptr).config.proximity_server_ip.clone(), prox_cooldown);
                             } else {
                                 proximity::stop();
+                            }
+
+                            if let Err(e) = config::save_config(&(*ptr).config) {
+                                eprintln!("[Cadence] Config save failed: {}", e);
                             }
                         }
                         // If burst was running and the user changed the rate,
@@ -946,6 +845,17 @@ unsafe extern "system" fn settings_wnd_proc(
                     SetWindowTextW(GetDlgItem(hwnd, live_id as i32), text.as_ptr());
                 }
             }
+            0
+        }
+        WM_SIZE => {
+            layout(hwnd);
+            0
+        }
+        WM_GETMINMAXINFO => {
+            let dpi = dpi_for_window(hwnd);
+            let mmi = &mut *(l_param as *mut MINMAXINFO);
+            mmi.ptMinTrackSize.x = scale(312, dpi);
+            mmi.ptMinTrackSize.y = scale(840, dpi);
             0
         }
         WM_CLOSE => {

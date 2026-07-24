@@ -7,29 +7,95 @@
 //! See D:\Dev\Ran_services\ran_sniff\PROTOCOL.md for the reverse-engineered wire format.
 
 use crate::{player, storage};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use winapi::um::consoleapi::{AllocConsole, WriteConsoleW};
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryExW, LoadLibraryW};
+use winapi::um::minwinbase::SYSTEMTIME;
 use winapi::um::processenv::GetStdHandle;
-use winapi::um::sysinfoapi::GetSystemDirectoryW;
+use winapi::um::sysinfoapi::{GetLocalTime, GetSystemDirectoryW};
 use winapi::um::wincon::SetConsoleTitleW;
 use winapi::um::winbase::STD_OUTPUT_HANDLE;
 use winapi::um::winuser::{MapVirtualKeyW, PostMessageW, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
+// Scan mode: when set, the capture logs every detected player to the lists but NEVER reacts
+// (no key press, no disarm) — a passive "who's around" scan that won't trip the trigger.
+static SCAN_ONLY: AtomicBool = AtomicBool::new(false);
 
-// Players seen this session (unique, in first-seen order) and the ignore list (names that must
-// NOT trigger the key press). Shared with the "Players" UI window.
-static DETECTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// One detected player: name, last-known level, when last seen, and how many times.
+/// Serialized to disk for the persistent (all-time) list.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DetectedPlayer {
+    pub name: String,
+    #[serde(default)]
+    pub level: Option<u16>,
+    /// emClass bitflag (single bit). Mapped to a class name in the UI.
+    #[serde(default)]
+    pub class: Option<u16>,
+    /// School index: 0=Sacred Gate, 1=Mystic Peak, 2=Phoenix.
+    #[serde(default)]
+    pub school: Option<u16>,
+    /// Guild (club) name; empty if none.
+    #[serde(default)]
+    pub guild: String,
+    #[serde(default)]
+    pub hp_now: Option<u16>,
+    #[serde(default)]
+    pub hp_max: Option<u16>,
+    /// Map main id (SNATIVEID.wMainID).
+    #[serde(default)]
+    pub map: Option<u16>,
+    #[serde(default)]
+    pub pos_x: Option<i32>,
+    #[serde(default)]
+    pub pos_z: Option<i32>,
+    /// Unix seconds of the most recent sighting (used for latest-first sorting + persistence).
+    #[serde(default)]
+    pub last_unix: i64,
+    /// Local "MM-DD HH:MM" of the most recent sighting, formatted at detection time.
+    #[serde(default)]
+    pub seen_str: String,
+    #[serde(default = "one")]
+    pub count: u32,
+}
+
+fn one() -> u32 { 1 }
+
+/// Everything parsed from one DROP_PC (SDROP_CHAR) payload. Fields are Option/empty when the
+/// value failed a sanity check (short/garbled message), so a bad read never poisons the record.
+pub struct PcInfo {
+    pub name: String,
+    pub level: Option<u16>,
+    pub class: Option<u16>,
+    pub school: Option<u16>,
+    pub guild: String,
+    pub hp_now: Option<u16>,
+    pub hp_max: Option<u16>,
+    pub map: Option<u16>,
+    pub pos_x: Option<i32>,
+    pub pos_z: Option<i32>,
+}
+
+// Two detection lists, both keyed by name (deduped):
+//   SESSION   — players seen since Cadence started; cleared on demand ("Clear" in Session view).
+//   PERMANENT — an all-time log persisted to detected_players.json; cleared separately.
+// Plus the ignore list (names that must NOT trigger the key press). Shared with the Players UI.
+static SESSION: Mutex<Vec<DetectedPlayer>> = Mutex::new(Vec::new());
+static PERMANENT: Mutex<Vec<DetectedPlayer>> = Mutex::new(Vec::new());
+static PERM_DIRTY: AtomicBool = AtomicBool::new(false);
 static IGNORE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+const SESSION_CAP: usize = 500;
+const PERMANENT_CAP: usize = 3000;
 // Reaction sequence name to play on detection; empty = press the proximity key instead.
 static REACTION_SEQ: Mutex<String> = Mutex::new(String::new());
 
@@ -64,7 +130,7 @@ const NET_MSG_COMPRESS: u32 = 170; // fixed envelope opcode, not region-shifted
 // confirmed by DROP_CROW(3012, frequent) and DROP_OUT(3015) lining up. (The public 143.14.88.19
 // server used 977 -> DROP_PC=3000.) If you point Cadence at a different server, this may change.
 const NET_MSG_BASE: u32 = 988;
-const NET_MSG_GCTRL: u32 = NET_MSG_BASE + 1900;
+pub(crate) const NET_MSG_GCTRL: u32 = NET_MSG_BASE + 1900;
 const DROP_PC: u32 = NET_MSG_GCTRL + 123; // 3011 — a player entered view
 const ENVELOPE_HEADER: usize = 12; // [dwSize:u32][nType=170:u32][bCompress:u32]
 #[allow(dead_code)]
@@ -119,7 +185,7 @@ fn dlog(msg: &str) {
 }
 
 /// Parse a dotted-quad IPv4 into a big-endian u32 matching the IP header byte order.
-fn parse_ipv4(s: &str) -> u32 {
+pub(crate) fn parse_ipv4(s: &str) -> u32 {
     let mut o = [0u32; 4];
     for (i, part) in s.split('.').enumerate().take(4) {
         o[i] = part.trim().parse().unwrap_or(0);
@@ -132,17 +198,65 @@ pub fn is_active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
 
-fn record_detection(name: &str) {
-    if name.is_empty() || name == "<player>" {
-        return;
+fn now_unix() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Current local wall-clock as "MM-DD HH:MM" (formatted here so persisted rows need no tz math).
+fn now_local_str() -> String {
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!("{:02}-{:02} {:02}:{:02}", st.wMonth, st.wDay, st.wHour, st.wMinute)
     }
-    let mut d = DETECTED.lock().unwrap();
-    if !d.iter().any(|n| n == name) {
-        d.push(name.to_string());
-        if d.len() > 300 {
-            d.remove(0);
+}
+
+/// Merge freshly-parsed fields into a record; only overwrite a field when the new read is valid,
+/// so a later short/partial packet can't wipe details we already learned.
+fn merge_fields(p: &mut DetectedPlayer, info: &PcInfo) {
+    if info.level.is_some() { p.level = info.level; }
+    if info.class.is_some() { p.class = info.class; }
+    if info.school.is_some() { p.school = info.school; }
+    if !info.guild.is_empty() { p.guild = info.guild.clone(); }
+    if info.hp_max.is_some() { p.hp_now = info.hp_now; p.hp_max = info.hp_max; }
+    if info.map.is_some() { p.map = info.map; }
+    if info.pos_x.is_some() { p.pos_x = info.pos_x; p.pos_z = info.pos_z; }
+}
+
+/// Insert or update a player in one list (dedup by name; refresh fields/time/count).
+fn upsert(list: &Mutex<Vec<DetectedPlayer>>, info: &PcInfo, now: i64, stamp: &str, cap: usize) {
+    let mut d = list.lock().unwrap();
+    if let Some(p) = d.iter_mut().find(|p| p.name == info.name) {
+        p.last_unix = now;
+        p.seen_str = stamp.to_string();
+        p.count = p.count.saturating_add(1);
+        merge_fields(p, info);
+    } else {
+        let mut p = DetectedPlayer {
+            name: info.name.clone(),
+            level: None, class: None, school: None, guild: String::new(),
+            hp_now: None, hp_max: None, map: None, pos_x: None, pos_z: None,
+            last_unix: now, seen_str: stamp.to_string(), count: 1,
+        };
+        merge_fields(&mut p, info);
+        d.push(p);
+        if d.len() > cap {
+            // Drop the oldest sightings first.
+            d.sort_by(|a, b| b.last_unix.cmp(&a.last_unix));
+            d.truncate(cap);
         }
     }
+}
+
+fn record_detection(info: &PcInfo) {
+    if info.name.is_empty() || info.name == "<player>" {
+        return;
+    }
+    let now = now_unix();
+    let stamp = now_local_str();
+    upsert(&SESSION, info, now, &stamp, SESSION_CAP);
+    upsert(&PERMANENT, info, now, &stamp, PERMANENT_CAP);
+    PERM_DIRTY.store(true, Ordering::Release);
 }
 
 fn is_ignored(name: &str) -> bool {
@@ -150,8 +264,13 @@ fn is_ignored(name: &str) -> bool {
 }
 
 /// Snapshot of players detected this session (for the Players UI).
-pub fn detected_players() -> Vec<String> {
-    DETECTED.lock().unwrap().clone()
+pub fn session_players() -> Vec<DetectedPlayer> {
+    SESSION.lock().unwrap().clone()
+}
+
+/// Snapshot of the persistent all-time detection log (for the Players UI).
+pub fn permanent_players() -> Vec<DetectedPlayer> {
+    PERMANENT.lock().unwrap().clone()
 }
 
 /// Names currently on the ignore list (won't trigger the key).
@@ -176,9 +295,60 @@ pub fn toggle_ignore(name: &str) -> bool {
     }
 }
 
-/// Clear the detected-players list (ignore list is kept).
-pub fn clear_detected() {
-    DETECTED.lock().unwrap().clear();
+/// Clear the session detection list (ignore + permanent lists are kept).
+pub fn clear_session() {
+    SESSION.lock().unwrap().clear();
+}
+
+/// Clear the persistent all-time detection list and erase it on disk.
+pub fn clear_permanent() {
+    PERMANENT.lock().unwrap().clear();
+    save_permanent();
+}
+
+/// Remove one player by name from a list. `permanent` selects which list; when true the change
+/// is written to disk immediately.
+pub fn delete_player(permanent: bool, name: &str) {
+    let list = if permanent { &PERMANENT } else { &SESSION };
+    list.lock().unwrap().retain(|p| p.name != name);
+    if permanent {
+        save_permanent();
+    }
+}
+
+/// Turn passive scan mode on/off. In scan mode the capture logs players without reacting.
+pub fn set_scan_only(on: bool) {
+    SCAN_ONLY.store(on, Ordering::Release);
+}
+
+/// Whether passive scan mode is currently engaged.
+pub fn is_scan_only() -> bool {
+    SCAN_ONLY.load(Ordering::Acquire)
+}
+
+fn permanent_path() -> std::path::PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = base.join("ranify2");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("detected_players.json")
+}
+
+/// Load the persistent all-time detection list from disk (called once at startup).
+pub fn load_permanent() {
+    if let Ok(txt) = std::fs::read_to_string(permanent_path()) {
+        if let Ok(v) = serde_json::from_str::<Vec<DetectedPlayer>>(&txt) {
+            *PERMANENT.lock().unwrap() = v;
+        }
+    }
+}
+
+/// Write the persistent all-time detection list to disk.
+pub fn save_permanent() {
+    let v = PERMANENT.lock().unwrap().clone();
+    if let Ok(txt) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(permanent_path(), txt);
+    }
+    PERM_DIRTY.store(false, Ordering::Release);
 }
 
 /// Enumerate available Npcap capture devices as (name, description) for the Settings UI.
@@ -368,6 +538,11 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
         // interface / wrong server IP is obvious.
         if last_stats.elapsed() >= Duration::from_secs(2) {
             last_stats = Instant::now();
+            // Flush new detections to disk at most once per tick (keeps the all-time list
+            // durable during long scans without a disk write on every packet).
+            if PERM_DIRTY.load(Ordering::Acquire) {
+                save_permanent();
+            }
             // Discovered game server = busiest non-web service endpoint.
             let disc = conn_seen
                 .iter()
@@ -460,12 +635,18 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                 }
                 if op == DROP_PC {
                     droppc += 1;
-                    let name = read_name(&msg[8..]);
-                    record_detection(&name);
-                    if disarm {
+                    let info = parse_pc(&msg[8..]);
+                    let name = info.name.clone();
+                    record_detection(&info);
+                    let scan = SCAN_ONLY.load(Ordering::Acquire);
+                    let lvl_s = info.level.map(|l| format!(" Lv{}", l)).unwrap_or_default();
+                    if scan {
+                        // Passive scan: log only, never react or disarm.
+                        dlog(&format!("[t+{:.1}s] scan: {}{}", start.elapsed().as_secs_f32(), name, lvl_s));
+                    } else if disarm {
                         // Already flagged a detection this cycle — ignore the rest.
                     } else if is_ignored(&name) {
-                        dlog(&format!("[t+{:.1}s] player in view: {} (ignored)", start.elapsed().as_secs_f32(), name));
+                        dlog(&format!("[t+{:.1}s] player in view: {}{} (ignored)", start.elapsed().as_secs_f32(), name, lvl_s));
                     } else {
                         // First real player: flag it; the reaction runs after parsing this batch.
                         hit_name = Some(name);
@@ -500,13 +681,16 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
         ));
     }
 
+    if PERM_DIRTY.load(Ordering::Acquire) {
+        save_permanent(); // persist anything logged since the last tick
+    }
     dlog("=== Cadence Proximity stopped. ===");
     pc.close(handle);
     Ok(())
 }
 
 /// Parse Ethernet/IPv4/TCP. Returns (src_ip, dst_ip, src_port, dst_port, payload).
-fn parse_tcp(pkt: &[u8]) -> Option<(u32, u32, u16, u16, &[u8])> {
+pub(crate) fn parse_tcp(pkt: &[u8]) -> Option<(u32, u32, u16, u16, &[u8])> {
     if pkt.len() < 14 + 20 {
         return None;
     }
@@ -544,7 +728,7 @@ fn extract_server_payload(pkt: &[u8], server_ip: u32) -> Option<(u64, u16, &[u8]
     Some((((src_port as u64) << 16) | dst_port as u64, src_port, payload))
 }
 
-fn fmt_ip(ip: u32) -> String {
+pub(crate) fn fmt_ip(ip: u32) -> String {
     format!("{}.{}.{}.{}", (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff)
 }
 
@@ -571,7 +755,7 @@ fn scan_name(msg: &[u8]) -> Option<String> {
 
 /// Consume complete NET_COMPRESS envelopes from a flow buffer; retain the trailing remainder.
 /// Calls `on_msg(opcode, message)` for every inner message. Returns envelopes consumed.
-fn parse_flow(buf: &mut Vec<u8>, on_msg: &mut dyn FnMut(u32, &[u8])) -> usize {
+pub(crate) fn parse_flow(buf: &mut Vec<u8>, on_msg: &mut dyn FnMut(u32, &[u8])) -> usize {
     let mut start = 0usize;
     let mut envelopes = 0usize;
     while buf.len() - start >= ENVELOPE_HEADER {
@@ -633,6 +817,79 @@ fn read_name(payload: &[u8]) -> String {
         String::from_utf8_lossy(raw).into_owned()
     } else {
         "<player>".to_string()
+    }
+}
+
+/// Player level from a DROP_PC (SDROP_CHAR) payload. `wLevel` (WORD) sits 64 bytes past the start
+/// of the szName field, which begins at payload offset 4 in this build — so offset 68. Layout
+/// (from GLCharData.h): szName[33] + pad(3) + emTribe/emClass (int×2) + wSchool/wHair/wHairColor/
+/// wFace/wSex (WORD×5) + pad(2) + nBright(int) + dwCharID(DWORD) + wLevel. Returns None if the
+/// value is out of a sane range (guards against reading past a truncated message).
+fn read_level(payload: &[u8]) -> Option<u16> {
+    const OFF: usize = 68;
+    let b = payload.get(OFF..OFF + 2)?;
+    let lvl = u16::from_le_bytes([b[0], b[1]]);
+    if (1..=999).contains(&lvl) {
+        Some(lvl)
+    } else {
+        None
+    }
+}
+
+fn ru16(p: &[u8], o: usize) -> Option<u16> {
+    p.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+fn rf32(p: &[u8], o: usize) -> Option<f32> {
+    p.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+/// Null-terminated printable ASCII of at most `max` bytes at offset `o`; empty if the run isn't
+/// clean text (guards against reading struct padding as a name).
+fn rstr(p: &[u8], o: usize, max: usize) -> String {
+    let end = (o + max).min(p.len());
+    let mut s = String::new();
+    for i in o..end {
+        let c = p[i];
+        if c == 0 {
+            break;
+        }
+        if (0x20..0x7f).contains(&c) {
+            s.push(c as char);
+        } else {
+            return String::new();
+        }
+    }
+    s
+}
+
+/// Parse the fields we surface from a DROP_PC (SDROP_CHAR) payload. Offsets verified against a real
+/// capture (name@4, level@68, class@44, school@48, guild@80, HP@168/170, map@176, pos@184/192).
+/// See GLCharData.h `SDROP_CHAR`; every field is validated so a garbled read yields None/empty.
+fn parse_pc(payload: &[u8]) -> PcInfo {
+    // Class is a single-bit emClass flag; reject 0/multi-bit reads.
+    let class = ru16(payload, 44).filter(|c| c.count_ones() == 1);
+    let school = ru16(payload, 48).filter(|s| *s <= 2);
+    let (hp_now, hp_max) = match (ru16(payload, 168), ru16(payload, 170)) {
+        (Some(n), Some(m)) if m > 0 && n <= m => (Some(n), Some(m)),
+        _ => (None, None),
+    };
+    let map = ru16(payload, 176).filter(|m| *m != 0xFFFF);
+    let (pos_x, pos_z) = match (rf32(payload, 184), rf32(payload, 192)) {
+        (Some(x), Some(z)) if x.is_finite() && z.is_finite() && x.abs() < 1.0e6 && z.abs() < 1.0e6 => {
+            (Some(x.round() as i32), Some(z.round() as i32))
+        }
+        _ => (None, None),
+    };
+    PcInfo {
+        name: read_name(payload),
+        level: read_level(payload),
+        class,
+        school,
+        guild: rstr(payload, 80, 32),
+        hp_now,
+        hp_max,
+        map,
+        pos_x,
+        pos_z,
     }
 }
 
@@ -841,7 +1098,7 @@ struct BpfProgram {
     bf_insns: *mut c_void,
 }
 
-type PcapT = *mut c_void;
+pub(crate) type PcapT = *mut c_void;
 type FnFindAllDevs = unsafe extern "C" fn(*mut *mut PcapIf, *mut c_char) -> c_int;
 type FnFreeAllDevs = unsafe extern "C" fn(*mut PcapIf);
 type FnOpenLive =
@@ -853,7 +1110,7 @@ type FnFreeCode = unsafe extern "C" fn(*mut BpfProgram);
 type FnNextEx = unsafe extern "C" fn(PcapT, *mut *mut PcapPkthdr, *mut *const u8) -> c_int;
 type FnClose = unsafe extern "C" fn(PcapT);
 
-struct Pcap {
+pub(crate) struct Pcap {
     _lib: *mut c_void,
     findalldevs: FnFindAllDevs,
     freealldevs: FnFreeAllDevs,
@@ -872,7 +1129,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 impl Pcap {
-    fn load() -> Result<Pcap, String> {
+    pub(crate) fn load() -> Result<Pcap, String> {
         // Prefer the Npcap folder inside System32, then a WinPcap-compat install, then
         // hardcoded fallbacks and the default search path. Report each attempt so a missing
         // Npcap (e.g. inside a VM) is unambiguous.
@@ -961,7 +1218,7 @@ impl Pcap {
         devs
     }
 
-    fn first_device(&self) -> Result<String, String> {
+    pub(crate) fn first_device(&self) -> Result<String, String> {
         let devs = self.list_devices();
         // Skip pseudo/virtual adapters that never carry the game traffic.
         let bad = [
@@ -980,7 +1237,7 @@ impl Pcap {
             .ok_or_else(|| "no capture devices found".to_string())
     }
 
-    fn open_live(&self, dev: &str, to_ms: i32) -> Result<PcapT, String> {
+    pub(crate) fn open_live(&self, dev: &str, to_ms: i32) -> Result<PcapT, String> {
         let cdev = std::ffi::CString::new(dev).map_err(|_| "bad device name".to_string())?;
         let mut errbuf = [0i8; PCAP_ERRBUF_SIZE];
         // promisc=0: we only need this host's own traffic, and promiscuous mode is unreliable
@@ -992,7 +1249,7 @@ impl Pcap {
         Ok(h)
     }
 
-    fn set_filter(&self, handle: PcapT, filter: &str) -> Result<(), String> {
+    pub(crate) fn set_filter(&self, handle: PcapT, filter: &str) -> Result<(), String> {
         let cfilter = std::ffi::CString::new(filter).map_err(|_| "bad filter".to_string())?;
         let mut prog: BpfProgram = unsafe { std::mem::zeroed() };
         unsafe {
@@ -1009,7 +1266,7 @@ impl Pcap {
     }
 
     /// Returns Ok(Some(pkt)) with the captured bytes, Ok(None) on read timeout, Err on error.
-    fn next_packet(&self, handle: PcapT) -> Result<Option<&[u8]>, ()> {
+    pub(crate) fn next_packet(&self, handle: PcapT) -> Result<Option<&[u8]>, ()> {
         let mut hdr: *mut PcapPkthdr = std::ptr::null_mut();
         let mut data: *const u8 = std::ptr::null();
         let rc = unsafe { (self.next_ex)(handle, &mut hdr, &mut data) };
@@ -1027,7 +1284,7 @@ impl Pcap {
         }
     }
 
-    fn close(&self, handle: PcapT) {
+    pub(crate) fn close(&self, handle: PcapT) {
         unsafe { (self.close)(handle) };
     }
 }
@@ -1065,6 +1322,14 @@ mod tests {
             }
             if itype == 3000 {
                 got = Some(read_name(&decoded[b + 8..]));
+                // The same capture carries the full character block; assert every field offset.
+                let info = parse_pc(&decoded[b + 8..]);
+                assert_eq!(info.level, Some(16));
+                assert_eq!(info.class, Some(2)); // GLCC_SWORDSMAN_M
+                assert_eq!(info.school, Some(2)); // Phoenix
+                assert_eq!((info.hp_now, info.hp_max), (Some(199), Some(199)));
+                assert_eq!(info.map, Some(22));
+                assert_eq!((info.pos_x, info.pos_z), (Some(-53), Some(-48)));
             }
             b += isz;
         }

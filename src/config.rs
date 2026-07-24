@@ -89,7 +89,9 @@ fn default_pet_cycle_interval() -> u64 { 120 }
 fn default_burst_rate_hz() -> u32 { 100 }
 fn default_burst_vk() -> u16 { 0x14 } // Caps Lock
 fn default_proximity_vk() -> u16 { 0x45 } // 'E'
-fn default_proximity_server_ip() -> String { "143.14.88.19".to_string() }
+// Blank = auto-discover the busiest non-web game endpoint (works when the server remaps ports,
+// e.g. RAN Portal on 51.79.253.42:8104). Set an explicit IP in Settings only to override.
+fn default_proximity_server_ip() -> String { String::new() }
 fn default_proximity_cooldown() -> u64 { 500 }
 
 impl Default for AppConfig {

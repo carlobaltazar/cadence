@@ -14,6 +14,7 @@ mod sequence;
 mod storage;
 mod timing;
 mod win32_helpers;
+mod xlsx;
 
 use winapi::shared::minwindef::TRUE;
 use winapi::um::winuser::*;
@@ -167,6 +168,7 @@ fn main() {
     // config even when detection starts disabled (keeps the Settings save from wiping it).
     proximity::set_ignored(cfg.proximity_ignore.clone());
     proximity::set_reaction(cfg.proximity_sequence.clone());
+    proximity::load_permanent(); // restore the all-time detected-players log
 
     // Auto-start proximity alert if configured
     if cfg.proximity_enabled {

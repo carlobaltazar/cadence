@@ -73,7 +73,7 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: scale(804, dpi),
+            right: scale(890, dpi),
             bottom: scale(52, dpi),
         };
         AdjustWindowRectEx(&mut rect, style, FALSE, ex_style as u32);
@@ -224,11 +224,11 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
         614, y, 66, h, IDC_BTN_REMOTE,
     );
 
-    // -- Status label --
+    // -- Status label -- (reclaims the space the removed Wx checkbox used to occupy)
     let status = create_control(
         hwnd, hinstance, font, "STATIC", "Idle",
         WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-        688, y + 2, 110, h, IDC_STATUS,
+        684, y + 2, 200, h, IDC_STATUS,
     );
 
     // Update stored controls
@@ -413,6 +413,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                             let cfg = &(*ptr).config;
                             proximity::set_ignored(cfg.proximity_ignore.clone());
                             proximity::set_reaction(cfg.proximity_sequence.clone());
+                            proximity::set_scan_only(false); // Det always reacts (one-shot)
                             proximity::start(
                                 cfg.proximity_vk,
                                 cfg.proximity_iface.clone(),

@@ -80,18 +80,31 @@ pub(crate) const IDC_BTN_SP_PICK: u16 = 234;
 pub(crate) const IDC_STATIC_SP_LIVE: u16 = 235;
 pub(crate) const IDC_COMBO_BURST_KEY: u16 = 211;
 pub(crate) const IDC_EDIT_BURST_RATE: u16 = 212;
-pub(crate) const IDC_CHK_PROX: u16 = 240;
 pub(crate) const IDC_COMBO_PROX_KEY: u16 = 241;
 pub(crate) const IDC_COMBO_PROX_IFACE: u16 = 242;
-pub(crate) const IDC_EDIT_PROX_IP: u16 = 243;
 pub(crate) const IDC_BTN_PROX_PLAYERS: u16 = 245;
 pub(crate) const IDC_COMBO_PROX_ACTION: u16 = 246;
+// Section dividers (given IDs so the resize reflow can stretch them to the window width).
+pub(crate) const IDC_SETTINGS_DIV1: u16 = 250;
+pub(crate) const IDC_SETTINGS_DIV2: u16 = 251;
+pub(crate) const IDC_SETTINGS_DIV3: u16 = 252;
 
 // Players (detected/ignore) dialog controls
 pub(crate) const IDC_LIST_PLAYERS: u16 = 901;
 pub(crate) const IDC_BTN_PLAYER_TOGGLE: u16 = 902;
 pub(crate) const IDC_BTN_PLAYER_CLEAR: u16 = 903;
 pub(crate) const IDC_BTN_PLAYER_CLOSE: u16 = 904;
+pub(crate) const IDC_BTN_PLAYER_DELETE: u16 = 905;
+pub(crate) const IDC_CHK_PLAYER_SCAN: u16 = 907;   // passive scan on/off
+pub(crate) const IDC_RADIO_SESSION: u16 = 908;     // view: this session
+pub(crate) const IDC_RADIO_ALLTIME: u16 = 909;     // view: all-time (persistent)
+pub(crate) const IDC_EDIT_PLAYER_SEARCH: u16 = 910; // filter box
+pub(crate) const IDC_HDR_PLAYERS: u16 = 911;       // monospace column header (id so it can reflow)
+pub(crate) const IDC_CMB_PLAYER_CLASS: u16 = 912;  // filter: class
+pub(crate) const IDC_CMB_PLAYER_SCHOOL: u16 = 913; // filter: school
+pub(crate) const IDC_CMB_PLAYER_MAP: u16 = 914;    // filter: map (populated from data)
+pub(crate) const IDC_CMB_PLAYER_GUILD: u16 = 915;  // filter: guild (populated from data)
+pub(crate) const IDC_BTN_PLAYER_EXPORT: u16 = 906; // export current view to .xlsx
 
 // Save dialog controls
 pub(crate) const IDC_EDIT_SEQ_NAME: u16 = 301;

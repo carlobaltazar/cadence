@@ -1,6 +1,6 @@
 [package]
 name = "cadence"
-version = "3.0.1"
+version = "3.2.0"
 edition = "2021"
 
 [dependencies]
@@ -13,8 +13,10 @@ rand = "0.8"
 version = "0.3"
 features = [
     "winuser",
+    "commdlg",
     "windef",
     "minwindef",
+    "minwinbase",
     "libloaderapi",
     "processthreadsapi",
     "profileapi",
@@ -28,6 +30,10 @@ features = [
     "consoleapi",
     "processenv",
     "wincon",
+    "memoryapi",
+    "handleapi",
+    "tlhelp32",
+    "winnt",
 ]
 
 [build-dependencies]
