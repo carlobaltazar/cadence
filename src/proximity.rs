@@ -47,6 +47,13 @@ pub struct DetectedPlayer {
     /// Guild (club) name; empty if none.
     #[serde(default)]
     pub guild: String,
+    /// Activity-system badge (`szBadge`) — the client draws it above the name as `<Badge>`.
+    /// RAN Portal's staff character shows `<Administrator>`, so this is the GM giveaway.
+    #[serde(default)]
+    pub badge: String,
+    /// Account type from the char block (EMUSERTYPE): 0 normal, 19..22 = GM4..GM1, 30 = master.
+    #[serde(default)]
+    pub user_level: Option<u32>,
     #[serde(default)]
     pub hp_now: Option<u16>,
     #[serde(default)]
@@ -78,6 +85,15 @@ pub struct PcInfo {
     pub class: Option<u16>,
     pub school: Option<u16>,
     pub guild: String,
+    /// `szNick` — the second name line some servers give staff accounts.
+    pub nick: String,
+    /// `szBadge` — rendered by the client as `<Badge>` in front of the name.
+    pub badge: String,
+    /// `dwUserLevel` (EMUSERTYPE). >= USER_GM_MIN means the account is staff.
+    pub user_level: Option<u32>,
+    /// Any other printable string left in the tail of the char block. A safety net so a server
+    /// that shifts the badge offset still lets a name/title watch pattern match.
+    pub tags: Vec<String>,
     pub hp_now: Option<u16>,
     pub hp_max: Option<u16>,
     pub map: Option<u16>,
@@ -93,6 +109,21 @@ static SESSION: Mutex<Vec<DetectedPlayer>> = Mutex::new(Vec::new());
 static PERMANENT: Mutex<Vec<DetectedPlayer>> = Mutex::new(Vec::new());
 static PERM_DIRTY: AtomicBool = AtomicBool::new(false);
 static IGNORE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// Watch-list trigger. With TRIGGER_WATCH set, a player entering view only fires the reaction when
+// they look like staff — either the char block says the account is a GM, or one of the WATCH
+// patterns matches their name/badge/nick/guild. Off = the original "any player" behaviour.
+static TRIGGER_WATCH: AtomicBool = AtomicBool::new(false);
+static WATCH_GM_FLAG: AtomicBool = AtomicBool::new(true);
+static WATCH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Seed watch patterns. Matching is case-insensitive and whole-token (see `pattern_hit`), so
+/// "gm" catches `[GM]Rico` and `GM-Kim` without catching `Sigmund`. "portal" is here because RAN
+/// Portal's staff character is `<Administrator>(RAN PORTAl)`.
+pub const DEFAULT_WATCH: &[&str] = &[
+    "administrator", "admin", "gm", "gamemaster", "game master",
+    "moderator", "staff", "support", "portal",
+];
 
 const SESSION_CAP: usize = 500;
 const PERMANENT_CAP: usize = 3000;
@@ -133,6 +164,24 @@ const NET_MSG_BASE: u32 = 988;
 pub(crate) const NET_MSG_GCTRL: u32 = NET_MSG_BASE + 1900;
 const DROP_PC: u32 = NET_MSG_GCTRL + 123; // 3011 — a player entered view
 const ENVELOPE_HEADER: usize = 12; // [dwSize:u32][nType=170:u32][bCompress:u32]
+
+// --- DROP_PC tail fields (staff detection) ----------------------------------------------------
+// SDROP_CHAR keeps the staff markers at the very end of the block, past ~1.3KB of skill/item/buff
+// arrays, so the offsets below were pinned empirically instead of by summing the header structs.
+// The anchor is `m_fScaleRange`, which is exactly 1.0f in all 125 DROP_PC packets of the reference
+// capture; the source order after it (GLCharData.h) is
+//     float m_fScaleRange; bool m_bBoosterStart; char szBadge[33]; DWORD dwUserID, dwUserLevel;
+// which lands szBadge on 1504 and dwUserLevel on 1544 — both all-zero for every ordinary player in
+// the capture, as expected. Reads are gated on the exact payload length so a server with a
+// different build can't have its buff arrays mistaken for a badge.
+const PC_PAYLOAD_LEN: usize = 1656; // 1664-byte DROP_PC message minus the 8-byte header
+const OFF_BADGE: usize = 1504;
+const OFF_USER_LEVEL: usize = 1544;
+const OFF_NICK: usize = 124;
+/// Lowest EMUSERTYPE (s_NetGlobal.h) that means staff: USER_GM4=19, GM3/2/1=20/21/22, MASTER=30.
+const USER_GM_MIN: u32 = 19;
+/// Where the tag safety-net scan starts — past every string field, inside the tail.
+const TAIL_SCAN_FROM: usize = 1400;
 #[allow(dead_code)]
 const GAME_PORT: u16 = 7112;
 const MAX_ENVELOPE: u32 = 0x20000;
@@ -218,6 +267,8 @@ fn merge_fields(p: &mut DetectedPlayer, info: &PcInfo) {
     if info.class.is_some() { p.class = info.class; }
     if info.school.is_some() { p.school = info.school; }
     if !info.guild.is_empty() { p.guild = info.guild.clone(); }
+    if !info.badge.is_empty() { p.badge = info.badge.clone(); }
+    if info.user_level.is_some() { p.user_level = info.user_level; }
     if info.hp_max.is_some() { p.hp_now = info.hp_now; p.hp_max = info.hp_max; }
     if info.map.is_some() { p.map = info.map; }
     if info.pos_x.is_some() { p.pos_x = info.pos_x; p.pos_z = info.pos_z; }
@@ -235,6 +286,7 @@ fn upsert(list: &Mutex<Vec<DetectedPlayer>>, info: &PcInfo, now: i64, stamp: &st
         let mut p = DetectedPlayer {
             name: info.name.clone(),
             level: None, class: None, school: None, guild: String::new(),
+            badge: String::new(), user_level: None,
             hp_now: None, hp_max: None, map: None, pos_x: None, pos_z: None,
             last_unix: now, seen_str: stamp.to_string(), count: 1,
         };
@@ -261,6 +313,132 @@ fn record_detection(info: &PcInfo) {
 
 fn is_ignored(name: &str) -> bool {
     IGNORE.lock().unwrap().iter().any(|n| n == name)
+}
+
+/// Select the trigger: `false` = react to any player (minus the ignore list), `true` = react only
+/// to players matching the GM/watch rules.
+pub fn set_trigger_watch(on: bool) {
+    TRIGGER_WATCH.store(on, Ordering::Release);
+}
+
+#[allow(dead_code)] // status accessor, parity with is_active/is_scan_only
+pub fn is_trigger_watch() -> bool {
+    TRIGGER_WATCH.load(Ordering::Acquire)
+}
+
+/// Also treat a staff account level in the char block as a match, regardless of the name patterns.
+pub fn set_watch_gm_flag(on: bool) {
+    WATCH_GM_FLAG.store(on, Ordering::Release);
+}
+
+/// Replace the watch patterns (from config / Settings). Blank entries are dropped.
+pub fn set_watch_list(patterns: Vec<String>) {
+    *WATCH.lock().unwrap() =
+        patterns.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+}
+
+pub fn watch_list() -> Vec<String> {
+    WATCH.lock().unwrap().clone()
+}
+
+/// Glob with `*` (any run) and `?` (one char); both sides already lower-cased.
+fn glob_match(pat: &str, s: &str) -> bool {
+    let (p, t) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while si < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = pi;
+            pi += 1;
+            mark = si;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Does one watch pattern match one field? Case-insensitive. A pattern containing `*` or `?` is a
+/// glob over the whole field; otherwise it must appear as a whole token — bounded by a
+/// non-alphanumeric character (or the ends) on both sides. That is what keeps a short pattern like
+/// "gm" useful: it matches `[GM]Rico`, `GM-Kim` and `<GM>` but not `Sigmund` or `Magma`.
+fn pattern_hit(pat: &str, field: &str) -> bool {
+    if pat.is_empty() || field.is_empty() {
+        return false;
+    }
+    let p = pat.to_ascii_lowercase();
+    let f = field.to_ascii_lowercase();
+    if p.contains('*') || p.contains('?') {
+        return glob_match(&p, &f);
+    }
+    let (pb, fb) = (p.as_bytes(), f.as_bytes());
+    if pb.len() > fb.len() {
+        return false;
+    }
+    for i in 0..=(fb.len() - pb.len()) {
+        if &fb[i..i + pb.len()] != pb {
+            continue;
+        }
+        let j = i + pb.len();
+        let before = i == 0 || !fb[i - 1].is_ascii_alphanumeric();
+        let after = j == fb.len() || !fb[j].is_ascii_alphanumeric();
+        if before && after {
+            return true;
+        }
+    }
+    false
+}
+
+/// Why this player should trip the alert in watch mode, or None to let them walk past.
+fn watch_reason(info: &PcInfo) -> Option<String> {
+    if WATCH_GM_FLAG.load(Ordering::Acquire) {
+        if let Some(lvl) = info.user_level {
+            if lvl >= USER_GM_MIN {
+                return Some(format!("account level {} = game master", lvl));
+            }
+        }
+    }
+    let patterns = WATCH.lock().unwrap();
+    for pat in patterns.iter() {
+        for (what, field) in [
+            ("name", &info.name),
+            ("badge", &info.badge),
+            ("nick", &info.nick),
+            ("guild", &info.guild),
+        ] {
+            if pattern_hit(pat, field) {
+                return Some(format!("{} \"{}\" matches \"{}\"", what, field, pat));
+            }
+        }
+        for tag in &info.tags {
+            if pattern_hit(pat, tag) {
+                return Some(format!("tag \"{}\" matches \"{}\"", tag, pat));
+            }
+        }
+    }
+    None
+}
+
+/// The staff markers worth showing in a log line / the Players table ("<Administrator> GM22").
+fn staff_marks(info: &PcInfo) -> String {
+    let mut s = String::new();
+    if !info.badge.is_empty() {
+        s.push_str(&format!(" <{}>", info.badge));
+    }
+    if let Some(l) = info.user_level.filter(|l| *l > 0) {
+        s.push_str(&format!(" [acct {}]", l));
+    }
+    s
 }
 
 /// Snapshot of players detected this session (for the Players UI).
@@ -508,14 +686,23 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
         "No Server IP set — auto-discovering the RAN server. Log into the game and move around...".to_string()
     };
     dlog(&intro);
+    if TRIGGER_WATCH.load(Ordering::Acquire) {
+        dlog(&format!(
+            "Trigger: GM / watch list only \u{2014} patterns [{}]{}. Other players are logged but ignored.",
+            watch_list().join(", "),
+            if WATCH_GM_FLAG.load(Ordering::Acquire) { " + staff account level" } else { "" }
+        ));
+    } else {
+        dlog("Trigger: any player (minus the ignore list).");
+    }
 
     let mut flows: HashMap<u64, Vec<u8>> = HashMap::new();
     // One-shot: on the first non-ignored detection we react and disarm (the toolbar unchecks
     // "Det"; the user re-arms manually). cooldown_ms is unused in one-shot mode.
     let _ = cooldown_ms;
     let mut disarm = false;
-    let mut hit_name: Option<String> = None;
-    let mut fired: Option<(String, bool)> = None; // (player name, was a sequence stopped)
+    let mut hit_name: Option<(String, String)> = None; // (player name, why it matched)
+    let mut fired: Option<(String, String, bool)> = None; // (name, reason, sequence stopped?)
 
     let start = Instant::now();
     let mut last_stats = Instant::now();
@@ -640,17 +827,34 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                     record_detection(&info);
                     let scan = SCAN_ONLY.load(Ordering::Acquire);
                     let lvl_s = info.level.map(|l| format!(" Lv{}", l)).unwrap_or_default();
+                    // Badge / account level go in every line so unknown staff names are easy to
+                    // spot in the log and add to the watch list.
+                    let marks = staff_marks(&info);
                     if scan {
                         // Passive scan: log only, never react or disarm.
-                        dlog(&format!("[t+{:.1}s] scan: {}{}", start.elapsed().as_secs_f32(), name, lvl_s));
+                        dlog(&format!("[t+{:.1}s] scan: {}{}{}", start.elapsed().as_secs_f32(), name, lvl_s, marks));
                     } else if disarm {
                         // Already flagged a detection this cycle — ignore the rest.
                     } else if is_ignored(&name) {
-                        dlog(&format!("[t+{:.1}s] player in view: {}{} (ignored)", start.elapsed().as_secs_f32(), name, lvl_s));
+                        dlog(&format!("[t+{:.1}s] player in view: {}{}{} (ignored)", start.elapsed().as_secs_f32(), name, lvl_s, marks));
                     } else {
-                        // First real player: flag it; the reaction runs after parsing this batch.
-                        hit_name = Some(name);
-                        disarm = true;
+                        // In watch mode only a GM/watch-list match counts; otherwise any player does.
+                        let reason = if TRIGGER_WATCH.load(Ordering::Acquire) {
+                            watch_reason(&info)
+                        } else {
+                            Some("any player".to_string())
+                        };
+                        match reason {
+                            // Flag it; the reaction runs after parsing this batch.
+                            Some(r) => {
+                                hit_name = Some((name, r));
+                                disarm = true;
+                            }
+                            None => dlog(&format!(
+                                "[t+{:.1}s] player in view: {}{}{} (not on the GM/watch list)",
+                                start.elapsed().as_secs_f32(), name, lvl_s, marks
+                            )),
+                        }
                     }
                 }
             });
@@ -659,10 +863,10 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
             if disarm {
                 // Order: stop current sequence -> disarm (uncheck "Det" + stop capturing) -> react.
                 // The reaction runs after the loop breaks, so moving into a crowd can't re-trigger.
-                let name = hit_name.take().unwrap_or_default();
+                let (name, reason) = hit_name.take().unwrap_or_default();
                 let stopped = stop_current_playback();
                 notify_hit(); // uncheck "Det"
-                fired = Some((name, stopped));
+                fired = Some((name, reason, stopped));
                 break; // stop capturing BEFORE the reaction runs
             }
         }
@@ -670,12 +874,13 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
 
     // Capture has stopped. NOW run the reaction (key or sequence) — detection is already disarmed,
     // so a reaction that moves you into a crowd cannot re-trigger it.
-    if let Some((name, stopped)) = fired {
+    if let Some((name, reason, stopped)) = fired {
         let action = react_action(vk);
         dlog(&format!(
-            "[t+{:.1}s] *** PLAYER DETECTED: {} *** \u{2014} disarmed; {}{} (re-check 'Det' to re-arm)",
+            "[t+{:.1}s] *** PLAYER DETECTED: {} ({}) *** \u{2014} disarmed; {}{} (re-check 'Det' to re-arm)",
             start.elapsed().as_secs_f32(),
             name,
+            reason,
             if stopped { "stopped running sequence; " } else { "" },
             action
         ));
@@ -879,17 +1084,62 @@ fn parse_pc(payload: &[u8]) -> PcInfo {
         }
         _ => (None, None),
     };
+    // Staff markers only when the block is exactly the build we mapped (see OFF_BADGE).
+    let exact = payload.len() == PC_PAYLOAD_LEN;
+    let badge = if exact { rstr(payload, OFF_BADGE, 32) } else { String::new() };
+    let user_level = if exact {
+        payload
+            .get(OFF_USER_LEVEL..OFF_USER_LEVEL + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .filter(|l| *l <= 64) // EMUSERTYPE tops out at 30; anything else is a bad read
+    } else {
+        None
+    };
     PcInfo {
         name: read_name(payload),
         level: read_level(payload),
         class,
         school,
         guild: rstr(payload, 80, 32),
+        nick: rstr(payload, OFF_NICK, 32),
+        badge,
+        user_level,
+        tags: tail_tags(payload),
         hp_now,
         hp_max,
         map,
         pos_x,
         pos_z,
+    }
+}
+
+/// Printable strings left in the tail of the char block. This is a safety net for a server build
+/// whose badge sits somewhere other than OFF_BADGE: watch patterns are matched against these too.
+/// Long pure-hex runs are dropped — every DROP_PC carries a 64-char session hash down here.
+fn tail_tags(payload: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if payload.len() <= TAIL_SCAN_FROM {
+        return out;
+    }
+    let mut run = String::new();
+    for &c in &payload[TAIL_SCAN_FROM..] {
+        if (0x20..0x7f).contains(&c) {
+            run.push(c as char);
+            continue;
+        }
+        push_tag(&mut out, std::mem::take(&mut run));
+        if out.len() >= 8 {
+            return out;
+        }
+    }
+    push_tag(&mut out, run);
+    out
+}
+
+fn push_tag(out: &mut Vec<String>, run: String) {
+    let hexish = run.len() >= 16 && run.chars().all(|c| c.is_ascii_hexdigit());
+    if run.len() >= 3 && !hexish && run.chars().any(|c| c.is_ascii_alphabetic()) {
+        out.push(run);
     }
 }
 
@@ -1330,6 +1580,11 @@ mod tests {
                 assert_eq!((info.hp_now, info.hp_max), (Some(199), Some(199)));
                 assert_eq!(info.map, Some(22));
                 assert_eq!((info.pos_x, info.pos_z), (Some(-53), Some(-48)));
+                // Staff fields: this is an ordinary player, so the badge is empty and the
+                // account level reads 0 (USER_COMMON) — proof the tail offsets land in the
+                // right place rather than in the buff arrays.
+                assert_eq!(info.badge, "");
+                assert_eq!(info.user_level, Some(0));
             }
             b += isz;
         }
@@ -1355,6 +1610,47 @@ mod tests {
         buf.extend_from_slice(&env[10..]); // deliver the rest
         parse_flow(&mut buf, &mut |op, msg| if op == 3000 { hits.push(read_name(&msg[8..])) });
         assert_eq!(hits, vec![TEST_EXPECTED_NAME.to_string()]);
+    }
+
+    /// The whole point of the watch list: a short pattern must catch the decorated staff names
+    /// without catching an ordinary player who happens to contain the same letters.
+    #[test]
+    fn watch_patterns_match_tokens_not_substrings() {
+        assert!(pattern_hit("gm", "[GM]Rico"));
+        assert!(pattern_hit("gm", "GM-Kim"));
+        assert!(pattern_hit("gm", "gm"));
+        assert!(!pattern_hit("gm", "Sigmund"));
+        assert!(!pattern_hit("gm", "Magma"));
+        assert!(pattern_hit("administrator", "Administrator"));
+        assert!(pattern_hit("portal", "(RAN PORTAl)"));
+        assert!(!pattern_hit("portal", "PortalGunner"));
+        // Wildcards opt into plain substring/glob behaviour.
+        assert!(pattern_hit("*portal*", "PortalGunner"));
+        assert!(pattern_hit("gm?", "gm1"));
+        assert!(!pattern_hit("gm?", "gm12"));
+        assert!(!pattern_hit("admin", ""));
+    }
+
+    /// A GM account trips watch mode on the account level alone, whatever the character is called.
+    #[test]
+    fn watch_reason_uses_account_level_and_badge() {
+        set_watch_list(DEFAULT_WATCH.iter().map(|s| s.to_string()).collect());
+        set_watch_gm_flag(true);
+        let mut info = PcInfo {
+            name: "Bolbolon".into(), level: Some(80), class: None, school: None,
+            guild: String::new(), nick: String::new(), badge: String::new(),
+            user_level: Some(0), tags: Vec::new(),
+            hp_now: None, hp_max: None, map: None, pos_x: None, pos_z: None,
+        };
+        assert!(watch_reason(&info).is_none(), "an ordinary player must walk past");
+        info.user_level = Some(22); // USER_GM1
+        assert!(watch_reason(&info).is_some());
+        info.user_level = Some(0);
+        info.badge = "Administrator".into(); // <Administrator>(RAN PORTAl)
+        assert!(watch_reason(&info).is_some());
+        info.badge = String::new();
+        info.name = "(RAN PORTAl)".into();
+        assert!(watch_reason(&info).is_some());
     }
 
     fn hex(s: &str) -> Vec<u8> {

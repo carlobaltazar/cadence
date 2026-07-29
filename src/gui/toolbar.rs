@@ -413,6 +413,9 @@ unsafe extern "system" fn toolbar_wnd_proc(
                             let cfg = &(*ptr).config;
                             proximity::set_ignored(cfg.proximity_ignore.clone());
                             proximity::set_reaction(cfg.proximity_sequence.clone());
+                            proximity::set_trigger_watch(cfg.proximity_watch_only);
+                            proximity::set_watch_list(cfg.proximity_watch.clone());
+                            proximity::set_watch_gm_flag(cfg.proximity_watch_gm_flag);
                             proximity::set_scan_only(false); // Det always reacts (one-shot)
                             proximity::start(
                                 cfg.proximity_vk,

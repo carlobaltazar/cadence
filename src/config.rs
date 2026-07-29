@@ -82,6 +82,15 @@ pub struct AppConfig {
     /// Reaction sequence to play on detection. Empty = press the proximity key instead.
     #[serde(default)]
     pub proximity_sequence: String,
+    /// Trigger: false = react to any player, true = react only to GM/watch-list matches.
+    #[serde(default)]
+    pub proximity_watch_only: bool,
+    /// Name/badge/nick/guild patterns that count as a GM in watch mode.
+    #[serde(default = "default_proximity_watch")]
+    pub proximity_watch: Vec<String>,
+    /// Also trigger on a staff account level read from the character block, whatever the name.
+    #[serde(default = "default_true")]
+    pub proximity_watch_gm_flag: bool,
 }
 
 fn default_remote_port() -> u16 { 9847 }
@@ -93,6 +102,10 @@ fn default_proximity_vk() -> u16 { 0x45 } // 'E'
 // e.g. RAN Portal on 51.79.253.42:8104). Set an explicit IP in Settings only to override.
 fn default_proximity_server_ip() -> String { String::new() }
 fn default_proximity_cooldown() -> u64 { 500 }
+fn default_true() -> bool { true }
+fn default_proximity_watch() -> Vec<String> {
+    crate::proximity::DEFAULT_WATCH.iter().map(|s| s.to_string()).collect()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -134,6 +147,9 @@ impl Default for AppConfig {
             proximity_cooldown_ms: default_proximity_cooldown(),
             proximity_ignore: Vec::new(),
             proximity_sequence: String::new(),
+            proximity_watch_only: false,
+            proximity_watch: default_proximity_watch(),
+            proximity_watch_gm_flag: true,
         }
     }
 }

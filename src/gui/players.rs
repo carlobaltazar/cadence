@@ -55,6 +55,7 @@ const COLS: &[(usize, bool)] = &[
     (5, false),  // school
     (16, false), // map (name)
     (11, false), // guild
+    (14, false), // tag: <badge> / GM account level
     (9, true),   // hp now/max
     (9, false),  // pos x,z
     (11, false), // seen
@@ -246,7 +247,7 @@ fn line(cells: &[String]) -> String {
 fn header_line() -> String {
     line(&[
         " ".into(), "Name".into(), "Lv".into(), "Class".into(), "G".into(), "Schl".into(),
-        "Map".into(), "Guild".into(), "HP".into(), "Pos x,z".into(), "Seen".into(),
+        "Map".into(), "Guild".into(), "Tag".into(), "HP".into(), "Pos x,z".into(), "Seen".into(),
     ])
 }
 
@@ -267,8 +268,24 @@ fn row_line(p: &proximity::DetectedPlayer, ignored: bool) -> String {
     let seen = if p.seen_str.is_empty() { "-".into() } else { p.seen_str.clone() };
     line(&[
         if ignored { "*".into() } else { " ".into() },
-        p.name.clone(), lv, cls.into(), gen.into(), sch, map, guild, hp, pos, seen,
+        p.name.clone(), lv, cls.into(), gen.into(), sch, map, guild, tag_display(p), hp, pos, seen,
     ])
+}
+
+/// Staff markers for the Tag column: the `<Badge>` the client draws above the name, plus the
+/// account level when the character block reports a game-master account (EMUSERTYPE >= 19).
+fn tag_display(p: &proximity::DetectedPlayer) -> String {
+    let mut s = String::new();
+    if !p.badge.is_empty() {
+        s.push_str(&format!("<{}>", p.badge));
+    }
+    if let Some(l) = p.user_level.filter(|l| *l >= 19) {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(&format!("GM{}", l));
+    }
+    if s.is_empty() { "-".into() } else { s }
 }
 
 fn clear_label() -> &'static str {
@@ -324,6 +341,7 @@ fn collect_filtered() -> Vec<proximity::DetectedPlayer> {
         if !filter.is_empty()
             && !p.name.to_lowercase().contains(&filter)
             && !p.guild.to_lowercase().contains(&filter)
+            && !p.badge.to_lowercase().contains(&filter)
         {
             return false;
         }
@@ -544,7 +562,7 @@ unsafe fn export_xlsx(hwnd: HWND) {
     };
 
     let headers = [
-        "Name", "Level", "Class", "Gender", "School", "Map", "Guild",
+        "Name", "Level", "Class", "Gender", "School", "Map", "Guild", "Tag",
         "HP Now", "HP Max", "Pos X", "Pos Z", "Sightings", "Seen", "Ignored",
     ];
     let ignored = proximity::ignored_players();
@@ -570,6 +588,7 @@ unsafe fn export_xlsx(hwnd: HWND) {
             xlsx::Cell::Str(sch.to_string()),
             xlsx::Cell::Str(map_display(p)),
             xlsx::Cell::Str(guild_display(p)),
+            xlsx::Cell::Str(tag_display(p)),
             num_or_dash(p.hp_now),
             num_or_dash(p.hp_max),
             inum_or_dash(p.pos_x),

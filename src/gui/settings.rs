@@ -152,13 +152,14 @@ unsafe fn layout(hwnd: HWND) {
     for id in [
         IDC_SETTINGS_DIV1, IDC_SETTINGS_DIV2, IDC_SETTINGS_DIV3,
         IDC_STATIC_HP_LIVE, IDC_STATIC_MP_LIVE, IDC_STATIC_SP_LIVE,
+        IDC_EDIT_PROX_WATCH,
     ] {
         stretch_to_right(hwnd, id, right, dpi, false);
     }
     // Combos that span to the right edge.
     for id in [
         IDC_COMBO_RECORD_KEY, IDC_COMBO_PLAY_KEY, IDC_COMBO_QUEUE_KEY,
-        IDC_COMBO_PROX_IFACE, IDC_COMBO_PROX_ACTION,
+        IDC_COMBO_PROX_IFACE, IDC_COMBO_PROX_ACTION, IDC_COMBO_PROX_TRIGGER,
     ] {
         stretch_to_right(hwnd, id, right, dpi, true);
     }
@@ -207,7 +208,7 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
         // Resizable: WS_THICKFRAME + WS_MAXIMIZEBOX let the user widen/maximize the dialog;
         // WM_SIZE reflows the width-following controls and re-pins OK to the bottom.
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE,
-        sx, sy, 312, 840,
+        sx, sy, 312, 892,
         parent, hinstance,
     );
     SETTINGS_HWND.store(hwnd as isize, Ordering::Release);
@@ -343,6 +344,16 @@ unsafe extern "system" fn settings_wnd_proc(
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
                 42, 648, 84, 200, IDC_COMBO_PROX_KEY);
             populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), REMOTE_KEY_OPTIONS, Some(pcfg.proximity_vk));
+            // Trigger: react to everyone, or only to staff (see the GM names box below).
+            create_control(hwnd, hinstance, font, "STATIC", "Trigger:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 134, 652, 48, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                186, 648, 98, 200, IDC_COMBO_PROX_TRIGGER);
+            let h_trigger = GetDlgItem(hwnd, IDC_COMBO_PROX_TRIGGER as i32);
+            SendMessageW(h_trigger, CB_ADDSTRING, 0, wide("Any player").as_ptr() as LPARAM);
+            SendMessageW(h_trigger, CB_ADDSTRING, 0, wide("GM only").as_ptr() as LPARAM);
+            SendMessageW(h_trigger, CB_SETCURSEL, pcfg.proximity_watch_only as WPARAM, 0);
             create_control(hwnd, hinstance, font, "STATIC", "On detect:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 686, 62, 20, 0);
             create_control(hwnd, hinstance, font, "COMBOBOX", "",
@@ -361,12 +372,28 @@ unsafe extern "system" fn settings_wnd_proc(
                 }
             }
             SendMessageW(h_action, CB_SETCURSEL, sel_action as WPARAM, 0);
+            // Watch patterns used by the "GM only" trigger. Case-insensitive, matched as whole
+            // tokens against a player's name, <badge>, nick and guild — one per line or comma-
+            // separated. "*" and "?" wildcards are allowed (e.g. "*portal*").
+            create_control(hwnd, hinstance, font, "STATIC", "GM names:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 716, 62, 20, 0);
+            create_control(hwnd, hinstance, font, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL
+                    | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_WANTRETURN as u32,
+                0, 76, 712, 208, 48, IDC_EDIT_PROX_WATCH);
+            let watch_text = if pcfg.proximity_watch.is_empty() {
+                proximity::DEFAULT_WATCH.join(", ")
+            } else {
+                pcfg.proximity_watch.join(", ")
+            };
+            SendMessageW(GetDlgItem(hwnd, IDC_EDIT_PROX_WATCH as i32), WM_SETTEXT, 0,
+                wide(&watch_text).as_ptr() as LPARAM);
             create_control(hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, 716, 200, 26, IDC_BTN_PROX_PLAYERS);
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, 768, 200, 26, IDC_BTN_PROX_PLAYERS);
 
             // OK button (re-pinned to the window bottom by layout()).
             create_control(hwnd, hinstance, font, "BUTTON", "OK",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 121, 756, 70, 28, IDC_BTN_SETTINGS_OK);
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 121, 808, 70, 28, IDC_BTN_SETTINGS_OK);
 
             // Pre-fill the monitor X/Y/color fields and the burst rate from config (single fetch).
             // HP/MP/SP share one game window, so the sampled class/title come from HP's config.
@@ -653,10 +680,26 @@ unsafe extern "system" fn settings_wnd_proc(
                                 }
                             };
                             let prox_cooldown = (*ptr).config.proximity_cooldown_ms; // vestigial (one-shot)
+                            // Trigger mode + watch patterns (comma or newline separated).
+                            let prox_watch_only = SendMessageW(
+                                GetDlgItem(hwnd, IDC_COMBO_PROX_TRIGGER as i32), CB_GETCURSEL, 0, 0,
+                            ) == 1;
+                            let mut wbuf = vec![0u16; 2048];
+                            let wlen = GetWindowTextW(
+                                GetDlgItem(hwnd, IDC_EDIT_PROX_WATCH as i32),
+                                wbuf.as_mut_ptr(), wbuf.len() as i32,
+                            ) as usize;
+                            let prox_watch: Vec<String> = String::from_utf16_lossy(&wbuf[..wlen])
+                                .split(|c| c == ',' || c == '\r' || c == '\n')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
 
                             (*ptr).config.proximity_vk = prox_vk;
                             (*ptr).config.proximity_iface = prox_iface.clone();
                             (*ptr).config.proximity_sequence = prox_sequence.clone();
+                            (*ptr).config.proximity_watch_only = prox_watch_only;
+                            (*ptr).config.proximity_watch = prox_watch.clone();
                             // The ignore list is edited in the Players window (live + config cache),
                             // so pull the current value in rather than clobbering it with our stale copy.
                             (*ptr).config.proximity_ignore = proximity::ignored_players();
@@ -691,6 +734,10 @@ unsafe extern "system" fn settings_wnd_proc(
                             // Apply Proximity changes immediately. start() itself waits for any
                             // running capture to stop, so this reliably restarts detection.
                             proximity::set_reaction((*ptr).config.proximity_sequence.clone());
+                            // Trigger changes apply live, even to a scan already running.
+                            proximity::set_trigger_watch(prox_watch_only);
+                            proximity::set_watch_list(prox_watch);
+                            proximity::set_watch_gm_flag((*ptr).config.proximity_watch_gm_flag);
                             // Don't disturb an active passive scan (owned by the Players window) —
                             // closing Settings must not kill a running scan.
                             if proximity::is_scan_only() {
@@ -855,7 +902,7 @@ unsafe extern "system" fn settings_wnd_proc(
             let dpi = dpi_for_window(hwnd);
             let mmi = &mut *(l_param as *mut MINMAXINFO);
             mmi.ptMinTrackSize.x = scale(312, dpi);
-            mmi.ptMinTrackSize.y = scale(840, dpi);
+            mmi.ptMinTrackSize.y = scale(892, dpi);
             0
         }
         WM_CLOSE => {

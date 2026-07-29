@@ -168,6 +168,9 @@ fn main() {
     // config even when detection starts disabled (keeps the Settings save from wiping it).
     proximity::set_ignored(cfg.proximity_ignore.clone());
     proximity::set_reaction(cfg.proximity_sequence.clone());
+    proximity::set_trigger_watch(cfg.proximity_watch_only);
+    proximity::set_watch_list(cfg.proximity_watch.clone());
+    proximity::set_watch_gm_flag(cfg.proximity_watch_gm_flag);
     proximity::load_permanent(); // restore the all-time detected-players log
 
     // Auto-start proximity alert if configured

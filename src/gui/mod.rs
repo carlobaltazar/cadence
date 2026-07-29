@@ -84,6 +84,8 @@ pub(crate) const IDC_COMBO_PROX_KEY: u16 = 241;
 pub(crate) const IDC_COMBO_PROX_IFACE: u16 = 242;
 pub(crate) const IDC_BTN_PROX_PLAYERS: u16 = 245;
 pub(crate) const IDC_COMBO_PROX_ACTION: u16 = 246;
+pub(crate) const IDC_COMBO_PROX_TRIGGER: u16 = 247; // any player vs GM/watch list only
+pub(crate) const IDC_EDIT_PROX_WATCH: u16 = 248;    // watch patterns (comma/newline separated)
 // Section dividers (given IDs so the resize reflow can stretch them to the window width).
 pub(crate) const IDC_SETTINGS_DIV1: u16 = 250;
 pub(crate) const IDC_SETTINGS_DIV2: u16 = 251;
