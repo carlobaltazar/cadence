@@ -47,10 +47,17 @@ pub struct DetectedPlayer {
     /// Guild (club) name; empty if none.
     #[serde(default)]
     pub guild: String,
+    /// Second name line (`szNick`). Surfaced because the watch list matches against it, and an
+    /// unexplained detection is worse than a wide table.
+    #[serde(default)]
+    pub nick: String,
     /// Activity-system badge (`szBadge`) — the client draws it above the name as `<Badge>`.
     /// RAN Portal's staff character shows `<Administrator>`, so this is the GM giveaway.
     #[serde(default)]
     pub badge: String,
+    /// Why this player tripped the alert, when they did. Empty for everyone else.
+    #[serde(default)]
+    pub why: String,
     /// Account type from the char block (EMUSERTYPE): 0 normal, 19..22 = GM4..GM1, 30 = master.
     #[serde(default)]
     pub user_level: Option<u32>,
@@ -267,6 +274,7 @@ fn merge_fields(p: &mut DetectedPlayer, info: &PcInfo) {
     if info.class.is_some() { p.class = info.class; }
     if info.school.is_some() { p.school = info.school; }
     if !info.guild.is_empty() { p.guild = info.guild.clone(); }
+    if !info.nick.is_empty() { p.nick = info.nick.clone(); }
     if !info.badge.is_empty() { p.badge = info.badge.clone(); }
     if info.user_level.is_some() { p.user_level = info.user_level; }
     if info.hp_max.is_some() { p.hp_now = info.hp_now; p.hp_max = info.hp_max; }
@@ -286,7 +294,7 @@ fn upsert(list: &Mutex<Vec<DetectedPlayer>>, info: &PcInfo, now: i64, stamp: &st
         let mut p = DetectedPlayer {
             name: info.name.clone(),
             level: None, class: None, school: None, guild: String::new(),
-            badge: String::new(), user_level: None,
+            nick: String::new(), badge: String::new(), user_level: None, why: String::new(),
             hp_now: None, hp_max: None, map: None, pos_x: None, pos_z: None,
             last_unix: now, seen_str: stamp.to_string(), count: 1,
         };
@@ -313,6 +321,17 @@ fn record_detection(info: &PcInfo) {
 
 fn is_ignored(name: &str) -> bool {
     IGNORE.lock().unwrap().iter().any(|n| n == name)
+}
+
+/// Stamp the reason a player tripped the alert onto their record, so "why did this fire?" is
+/// answerable from the Players list and the export long after the log has rolled over.
+fn record_reason(name: &str, why: &str) {
+    for list in [&SESSION, &PERMANENT] {
+        if let Some(p) = list.lock().unwrap().iter_mut().find(|p| p.name == name) {
+            p.why = why.to_string();
+        }
+    }
+    PERM_DIRTY.store(true, Ordering::Release);
 }
 
 /// Select the trigger: `false` = react to any player (minus the ignore list), `true` = react only
@@ -421,12 +440,27 @@ fn watch_reason(info: &PcInfo) -> Option<String> {
             }
         }
         for tag in &info.tags {
-            if pattern_hit(pat, tag) {
+            // Salvaged strings are lower-confidence than real fields, so don't let a two-letter
+            // pattern like "gm" match one — that is where a coincidence would bite.
+            if pat.len() >= 3 && pattern_hit(pat, tag) {
                 return Some(format!("tag \"{}\" matches \"{}\"", tag, pat));
             }
         }
     }
     None
+}
+
+/// Where the player is, for a log line: " @ 21/16" — the same coordinate the client's own minimap
+/// shows. Falls back to raw world units for a map whose axis origin we don't have, and to nothing
+/// at all when the packet carried no position.
+fn where_at(info: &PcInfo) -> String {
+    if let Some(g) = crate::mapcoord::grid_str(info.map, info.pos_x, info.pos_z) {
+        return format!(" @ {}", g);
+    }
+    match (info.pos_x, info.pos_z) {
+        (Some(x), Some(z)) => format!(" @ {},{} (world)", x, z),
+        _ => String::new(),
+    }
 }
 
 /// The staff markers worth showing in a log line / the Players table ("<Administrator> GM22").
@@ -701,8 +735,8 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
     // "Det"; the user re-arms manually). cooldown_ms is unused in one-shot mode.
     let _ = cooldown_ms;
     let mut disarm = false;
-    let mut hit_name: Option<(String, String)> = None; // (player name, why it matched)
-    let mut fired: Option<(String, String, bool)> = None; // (name, reason, sequence stopped?)
+    let mut hit_name: Option<(String, String, String)> = None; // (name, why it matched, where)
+    let mut fired: Option<(String, String, String, bool)> = None; // (name, reason, where, stopped?)
 
     let start = Instant::now();
     let mut last_stats = Instant::now();
@@ -830,13 +864,14 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                     // Badge / account level go in every line so unknown staff names are easy to
                     // spot in the log and add to the watch list.
                     let marks = staff_marks(&info);
+                    let at = where_at(&info);
                     if scan {
                         // Passive scan: log only, never react or disarm.
-                        dlog(&format!("[t+{:.1}s] scan: {}{}{}", start.elapsed().as_secs_f32(), name, lvl_s, marks));
+                        dlog(&format!("[t+{:.1}s] scan: {}{}{}{}", start.elapsed().as_secs_f32(), name, lvl_s, marks, at));
                     } else if disarm {
                         // Already flagged a detection this cycle — ignore the rest.
                     } else if is_ignored(&name) {
-                        dlog(&format!("[t+{:.1}s] player in view: {}{}{} (ignored)", start.elapsed().as_secs_f32(), name, lvl_s, marks));
+                        dlog(&format!("[t+{:.1}s] player in view: {}{}{}{} (ignored)", start.elapsed().as_secs_f32(), name, lvl_s, marks, at));
                     } else {
                         // In watch mode only a GM/watch-list match counts; otherwise any player does.
                         let reason = if TRIGGER_WATCH.load(Ordering::Acquire) {
@@ -847,12 +882,13 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                         match reason {
                             // Flag it; the reaction runs after parsing this batch.
                             Some(r) => {
-                                hit_name = Some((name, r));
+                                record_reason(&name, &r);
+                                hit_name = Some((name, r, at));
                                 disarm = true;
                             }
                             None => dlog(&format!(
-                                "[t+{:.1}s] player in view: {}{}{} (not on the GM/watch list)",
-                                start.elapsed().as_secs_f32(), name, lvl_s, marks
+                                "[t+{:.1}s] player in view: {}{}{}{} (not on the GM/watch list)",
+                                start.elapsed().as_secs_f32(), name, lvl_s, marks, at
                             )),
                         }
                     }
@@ -863,10 +899,10 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
             if disarm {
                 // Order: stop current sequence -> disarm (uncheck "Det" + stop capturing) -> react.
                 // The reaction runs after the loop breaks, so moving into a crowd can't re-trigger.
-                let (name, reason) = hit_name.take().unwrap_or_default();
+                let (name, reason, at) = hit_name.take().unwrap_or_default();
                 let stopped = stop_current_playback();
                 notify_hit(); // uncheck "Det"
-                fired = Some((name, reason, stopped));
+                fired = Some((name, reason, at, stopped));
                 break; // stop capturing BEFORE the reaction runs
             }
         }
@@ -874,12 +910,13 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
 
     // Capture has stopped. NOW run the reaction (key or sequence) — detection is already disarmed,
     // so a reaction that moves you into a crowd cannot re-trigger it.
-    if let Some((name, reason, stopped)) = fired {
+    if let Some((name, reason, at, stopped)) = fired {
         let action = react_action(vk);
         dlog(&format!(
-            "[t+{:.1}s] *** PLAYER DETECTED: {} ({}) *** \u{2014} disarmed; {}{} (re-check 'Det' to re-arm)",
+            "[t+{:.1}s] *** PLAYER DETECTED: {}{} ({}) *** \u{2014} disarmed; {}{} (re-check 'Det' to re-arm)",
             start.elapsed().as_secs_f32(),
             name,
+            at,
             reason,
             if stopped { "stopped running sequence; " } else { "" },
             action
@@ -1078,9 +1115,12 @@ fn parse_pc(payload: &[u8]) -> PcInfo {
         _ => (None, None),
     };
     let map = ru16(payload, 176).filter(|m| *m != 0xFFFF);
+    // vPos is a D3DXVECTOR3 at 184: x@184, height@188, z@192. Floored, not rounded, because the
+    // client floors before converting to the minimap grid (see mapcoord) — rounding would put a
+    // player in the neighbouring square whenever the fractional part is >= .5.
     let (pos_x, pos_z) = match (rf32(payload, 184), rf32(payload, 192)) {
         (Some(x), Some(z)) if x.is_finite() && z.is_finite() && x.abs() < 1.0e6 && z.abs() < 1.0e6 => {
-            (Some(x.round() as i32), Some(z.round() as i32))
+            (Some(x.floor() as i32), Some(z.floor() as i32))
         }
         _ => (None, None),
     };
@@ -1104,7 +1144,13 @@ fn parse_pc(payload: &[u8]) -> PcInfo {
         nick: rstr(payload, OFF_NICK, 32),
         badge,
         user_level,
-        tags: tail_tags(payload),
+        // Only fall back to scavenging strings out of the tail when the layout is NOT the one we
+        // mapped — that is the case the fallback exists for. On a known-good block the badge is
+        // read from its real offset, and scanning further would match struct padding, which the
+        // server transmits uninitialised (see the junk runs at 1501/1549/1651 in the reference
+        // capture). Matching watch patterns against uninitialised memory means detections nobody
+        // can explain afterwards.
+        tags: if exact { Vec::new() } else { tail_tags(payload) },
         hp_now,
         hp_max,
         map,
@@ -1579,12 +1625,31 @@ mod tests {
                 assert_eq!(info.school, Some(2)); // Phoenix
                 assert_eq!((info.hp_now, info.hp_max), (Some(199), Some(199)));
                 assert_eq!(info.map, Some(22));
-                assert_eq!((info.pos_x, info.pos_z), (Some(-53), Some(-48)));
+                // World (-53.12, -47.67) floored the way the client floors it before building
+                // the minimap coordinate.
+                assert_eq!((info.pos_x, info.pos_z), (Some(-54), Some(-48)));
+                // ...which on map 22 is the "21/16" the client would draw on the minimap.
+                assert_eq!(
+                    crate::mapcoord::grid_str(info.map, info.pos_x, info.pos_z).as_deref(),
+                    Some("21/16")
+                );
                 // Staff fields: this is an ordinary player, so the badge is empty and the
                 // account level reads 0 (USER_COMMON) — proof the tail offsets land in the
                 // right place rather than in the buff arrays.
                 assert_eq!(info.badge, "");
                 assert_eq!(info.user_level, Some(0));
+                // A known-good block must not scavenge strings out of the tail: that region is
+                // struct padding the server sends uninitialised, and matching watch patterns
+                // against it produced detections with no visible cause.
+                assert!(info.tags.is_empty(), "no tag scavenging on a recognised layout");
+                // The whole packet, through the real matcher, must not trip GM mode.
+                set_watch_list(DEFAULT_WATCH.iter().map(|s| s.to_string()).collect());
+                set_watch_gm_flag(true);
+                assert!(
+                    watch_reason(&info).is_none(),
+                    "an ordinary player tripped GM mode: {:?}",
+                    watch_reason(&info)
+                );
             }
             b += isz;
         }
@@ -1650,6 +1715,26 @@ mod tests {
         assert!(watch_reason(&info).is_some());
         info.badge = String::new();
         info.name = "(RAN PORTAl)".into();
+        assert!(watch_reason(&info).is_some());
+    }
+
+    /// Salvaged tail strings are uninitialised struct padding on an unrecognised layout. A short
+    /// pattern must not match one, or GM mode fires on random bytes with nothing to show for it.
+    #[test]
+    fn junk_tail_strings_dont_trip_short_patterns() {
+        set_watch_list(DEFAULT_WATCH.iter().map(|s| s.to_string()).collect());
+        set_watch_gm_flag(true);
+        let mut info = PcInfo {
+            name: "Bolbolon".into(), level: Some(80), class: None, school: None,
+            guild: String::new(), nick: String::new(), badge: String::new(),
+            user_level: Some(0), tags: Vec::new(),
+            hp_now: None, hp_max: None, map: None, pos_x: None, pos_z: None,
+        };
+        // Shapes actually observed in the padding of real packets, plus the coincidence to avoid.
+        info.tags = vec![")gm".into(), "Z)/".into(), "(C".into(), "gm/".into()];
+        assert!(watch_reason(&info).is_none(), "2-letter patterns must not match salvaged junk");
+        // A long, specific pattern is still allowed to match a salvaged string.
+        info.tags = vec!["Administrator".into()];
         assert!(watch_reason(&info).is_some());
     }
 

@@ -1,10 +1,10 @@
 use crate::player;
 use crate::timing::PrecisionTimer;
 use crate::win32_helpers::{lock_or_recover, wide};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use winapi::shared::windef::HWND;
 use winapi::um::wingdi::GetPixel;
 use winapi::um::winuser::*;
@@ -50,6 +50,75 @@ impl BarState {
 }
 
 static BARS: [BarState; BAR_COUNT] = [BarState::new(), BarState::new(), BarState::new()];
+
+/// Passive per-bar observations for the reporting thread: when the pixel was
+/// last sampled and whether it currently reads off-color ("low"). Written by
+/// the worker loop below, read by `snapshot()`. Independent of FIRE_COOLDOWN —
+/// this records what the bar looks like, not when we healed.
+struct BarObs {
+    last_sample_ms: AtomicU64,
+    low: AtomicBool,
+    low_since_ms: AtomicU64, // 0 = not currently low
+}
+
+impl BarObs {
+    const fn new() -> Self {
+        BarObs {
+            last_sample_ms: AtomicU64::new(0),
+            low: AtomicBool::new(false),
+            low_since_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+static OBS: [BarObs; BAR_COUNT] = [BarObs::new(), BarObs::new(), BarObs::new()];
+
+/// Whether the anchored game window currently exists (regardless of focus).
+/// Meaningful only while the worker thread runs with a window anchor.
+static WINDOW_FOUND: AtomicBool = AtomicBool::new(true);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy)]
+pub struct BarInfo {
+    pub enabled: bool,
+    pub low: bool,
+    pub low_since_ms: u64,
+    pub last_sample_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct BarsSnapshot {
+    pub window_found: bool,
+    pub bars: [BarInfo; BAR_COUNT],
+}
+
+/// Point-in-time view of the bar observations, for the reporting thread.
+pub fn snapshot() -> BarsSnapshot {
+    let mut bars = [BarInfo {
+        enabled: false,
+        low: false,
+        low_since_ms: 0,
+        last_sample_ms: 0,
+    }; BAR_COUNT];
+    for i in 0..BAR_COUNT {
+        bars[i] = BarInfo {
+            enabled: BARS[i].enabled.load(Ordering::Acquire),
+            low: OBS[i].low.load(Ordering::Acquire),
+            low_since_ms: OBS[i].low_since_ms.load(Ordering::Acquire),
+            last_sample_ms: OBS[i].last_sample_ms.load(Ordering::Acquire),
+        };
+    }
+    BarsSnapshot {
+        window_found: WINDOW_FOUND.load(Ordering::Acquire),
+        bars,
+    }
+}
 
 // Shared game-window anchor (class, title) — all bars sample from this window.
 static ANCHOR: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
@@ -163,6 +232,7 @@ fn ensure_running() {
                 let (hwnd, hdc) = if use_window_anchor {
                     let class_w = wide(&class);
                     let hwnd = find_window_matching(class_w.as_ptr(), &title);
+                    WINDOW_FOUND.store(!hwnd.is_null(), Ordering::Release);
                     if hwnd.is_null() {
                         thread::sleep(Duration::from_millis(500));
                         continue;
@@ -195,14 +265,27 @@ fn ensure_running() {
                     let y = b.y.load(Ordering::Acquire);
                     let ref_color = b.ref_color.load(Ordering::Acquire);
                     let color = GetPixel(hdc, x, y);
-                    if color != CLR_INVALID
-                        && color_dist(color, ref_color) > COLOR_TOLERANCE
-                        && last_fire[i].elapsed() >= FIRE_COOLDOWN
-                    {
-                        // Bar is below threshold and the per-bar cooldown elapsed:
-                        // fire once, then wait FIRE_COOLDOWN before the next press.
-                        player::send_key_press(BAR_VK[i], scans[i]);
-                        last_fire[i] = Instant::now();
+                    if color != CLR_INVALID {
+                        let low = color_dist(color, ref_color) > COLOR_TOLERANCE;
+                        let now = now_ms();
+                        OBS[i].last_sample_ms.store(now, Ordering::Release);
+                        OBS[i].low.store(low, Ordering::Release);
+                        if low {
+                            let _ = OBS[i].low_since_ms.compare_exchange(
+                                0,
+                                now,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                        } else {
+                            OBS[i].low_since_ms.store(0, Ordering::Release);
+                        }
+                        if low && last_fire[i].elapsed() >= FIRE_COOLDOWN {
+                            // Bar is below threshold and the per-bar cooldown elapsed:
+                            // fire once, then wait FIRE_COOLDOWN before the next press.
+                            player::send_key_press(BAR_VK[i], scans[i]);
+                            last_fire[i] = Instant::now();
+                        }
                     }
                 }
 

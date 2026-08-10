@@ -4,15 +4,18 @@ mod burst;
 mod config;
 mod gui;
 mod hotkeys;
+mod mapcoord;
 mod monitor;
 mod network;
 mod pet_cycle;
 mod player;
 mod proximity;
 mod recorder;
+mod report;
 mod sequence;
 mod storage;
 mod timing;
+mod update;
 mod win32_helpers;
 mod xlsx;
 
@@ -115,6 +118,17 @@ fn main() {
     // Let proximity notify the toolbar to uncheck "Det" when a detection fires (one-shot).
     proximity::set_notify(hwnd as isize, gui::WM_APP_PROXIMITY_HIT);
 
+    // Clear the exe a previous in-place update renamed aside, then look for a newer release.
+    // The check runs on a worker thread and only ever posts a message; it never blocks startup.
+    update::cleanup_old();
+    if cfg.update_check_on_start {
+        update::start_check(
+            hwnd as isize,
+            gui::WM_APP_UPDATE_AVAILABLE,
+            cfg.update_skip_version.clone(),
+        );
+    }
+
     // Auto-start receiver if configured
     if cfg.remote_auto_listen && cfg.remote_port > 0 {
         let password = if cfg.remote_password.is_empty() {
@@ -163,6 +177,9 @@ fn main() {
             cfg.sp_monitor_color,
         );
     }
+
+    // Auto-start fleet heartbeat reporting (dashboard server), if enabled.
+    report::start(&cfg);
 
     // Load the proximity ignore list into the live detector unconditionally, so it mirrors
     // config even when detection starts disabled (keeps the Settings save from wiping it).
@@ -269,6 +286,7 @@ fn main() {
     }
 
     // Cleanup
+    report::stop();
     proximity::stop();
     burst::stop();
     monitor::stop_all();

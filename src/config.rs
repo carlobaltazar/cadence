@@ -91,6 +91,25 @@ pub struct AppConfig {
     /// Also trigger on a staff account level read from the character block, whatever the name.
     #[serde(default = "default_true")]
     pub proximity_watch_gm_flag: bool,
+    /// Check GitHub for a newer release a few seconds after launch.
+    #[serde(default = "default_true")]
+    pub update_check_on_start: bool,
+    /// A version the user chose to skip; it is found but never prompted for again.
+    #[serde(default)]
+    pub update_skip_version: String,
+    /// Push heartbeats/events to the fleet dashboard. Defaults on so an exe rollout
+    /// lights up every machine with no per-machine config edits; opt out here.
+    #[serde(default = "default_true")]
+    pub report_enabled: bool,
+    #[serde(default = "default_report_url")]
+    pub report_url: String,
+    /// Shared fleet token; must match the dashboard server's AGENT_TOKEN.
+    #[serde(default = "default_report_token")]
+    pub report_token: String,
+    /// Optional human label shown next to the machine name on the dashboard
+    /// (e.g. the character name). Empty = machine name only.
+    #[serde(default)]
+    pub report_label: String,
 }
 
 fn default_remote_port() -> u16 { 9847 }
@@ -103,6 +122,8 @@ fn default_proximity_vk() -> u16 { 0x45 } // 'E'
 fn default_proximity_server_ip() -> String { String::new() }
 fn default_proximity_cooldown() -> u64 { 500 }
 fn default_true() -> bool { true }
+fn default_report_url() -> String { "https://147-182-215-152.sslip.io/api/report".to_string() }
+fn default_report_token() -> String { "ccdea6d580af677289951e42c88f7b34763eeb0f1ced6534".to_string() }
 fn default_proximity_watch() -> Vec<String> {
     crate::proximity::DEFAULT_WATCH.iter().map(|s| s.to_string()).collect()
 }
@@ -150,6 +171,12 @@ impl Default for AppConfig {
             proximity_watch_only: false,
             proximity_watch: default_proximity_watch(),
             proximity_watch_gm_flag: true,
+            update_check_on_start: true,
+            update_skip_version: String::new(),
+            report_enabled: true,
+            report_url: default_report_url(),
+            report_token: default_report_token(),
+            report_label: String::new(),
         }
     }
 }

@@ -1,5 +1,5 @@
 use crate::win32_helpers::{wide, create_control, dpi_for_window, scaled_font, scale};
-use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder};
+use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder, update};
 use super::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -248,6 +248,90 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
     }
 }
 
+/// Show the "new version available" prompt and carry out the answer. Must run on the UI thread —
+/// the "skip this version" branch writes the toolbar's config. Both the startup check and the
+/// Settings button reach it the same way, by posting WM_APP_UPDATE_AVAILABLE here.
+pub(crate) unsafe fn offer_update(toolbar: HWND, info: update::UpdateInfo) {
+    let owner = toolbar;
+    // Long release notes would push the buttons off screen; a summary is enough to decide.
+    let mut notes: String = info.notes.lines().take(8).collect::<Vec<_>>().join("\n");
+    if notes.chars().count() > 600 {
+        notes = notes.chars().take(600).collect::<String>() + "\u{2026}";
+    }
+    let head = format!(
+        "Cadence {} is available.\nYou have {}.",
+        info.version,
+        update::current_version()
+    );
+
+    // A copy living somewhere unwritable (e.g. Program Files) can't swap itself out. Don't try to
+    // elevate — just offer the download page, which is what the user does by hand today.
+    if !update::can_self_update() {
+        let text = format!(
+            "{}\n\n{}\n\nThis copy is in a folder Cadence can't write to, so it can't update \
+             itself.\n\nOpen the download page?",
+            head, notes
+        );
+        if MessageBoxW(owner, wide(&text).as_ptr(), wide("Cadence Update").as_ptr(),
+            MB_YESNO | MB_ICONINFORMATION) == IDYES
+        {
+            open_url(update::RELEASES_PAGE);
+        }
+        return;
+    }
+
+    let text = format!(
+        "{}\n\n{}\n\nYes \u{2014} download and restart now\nNo \u{2014} remind me next launch\n\
+         Cancel \u{2014} skip version {}",
+        head, notes, info.version
+    );
+    match MessageBoxW(owner, wide(&text).as_ptr(), wide("Cadence Update").as_ptr(),
+        MB_YESNOCANCEL | MB_ICONINFORMATION)
+    {
+        IDYES => {
+            // Hint that something is happening; the status label is rewritten every timer tick,
+            // so the window title is the one spot that stays put during the download.
+            SetWindowTextW(toolbar, wide("Cadence \u{2014} updating\u{2026}").as_ptr());
+            let tb = toolbar as isize;
+            std::thread::spawn(move || match update::apply(&info) {
+                // The replacement is already running: close this instance so it releases the exe.
+                Ok(()) => {
+                    PostMessageW(tb as HWND, WM_CLOSE, 0, 0);
+                }
+                Err(e) => {
+                    let msg = format!("Update failed:\n\n{}\n\nCadence is unchanged.", e);
+                    MessageBoxW(std::ptr::null_mut(), wide(&msg).as_ptr(),
+                        wide("Cadence Update").as_ptr(), MB_OK | MB_ICONERROR);
+                    // SetWindowTextW (not a posted WM_SETTEXT) so the string outlives the call.
+                    SetWindowTextW(tb as HWND, wide("Cadence").as_ptr());
+                }
+            });
+        }
+        IDCANCEL => {
+            let ptr = GetWindowLongPtrW(toolbar, GWLP_USERDATA) as *mut ToolbarControls;
+            if !ptr.is_null() {
+                (*ptr).config.update_skip_version = info.version.clone();
+                if let Err(e) = config::save_config(&(*ptr).config) {
+                    eprintln!("[Cadence] Config save failed: {}", e);
+                }
+            }
+        }
+        _ => {} // IDNO: ask again next launch
+    }
+}
+
+/// Open a URL in the default browser.
+pub(crate) unsafe fn open_url(url: &str) {
+    winapi::um::shellapi::ShellExecuteW(
+        std::ptr::null_mut(),
+        wide("open").as_ptr(),
+        wide(url).as_ptr(),
+        std::ptr::null(),
+        std::ptr::null(),
+        SW_SHOWNORMAL,
+    );
+}
+
 unsafe fn warn_unconfigured(hwnd: HWND, bar: &str) {
     let msg = crate::win32_helpers::wide(&format!(
         "Configure {} pixel in Settings first.\nSet X/Y and click Sample (or Pick).",
@@ -465,6 +549,13 @@ unsafe extern "system" fn toolbar_wnd_proc(
                 if let Err(e) = config::save_config(&(*ptr).config) {
                     eprintln!("[Cadence] Config save failed: {}", e);
                 }
+            }
+            0
+        }
+        WM_APP_UPDATE_AVAILABLE => {
+            // The background check found a newer release; prompt now that we're on the UI thread.
+            if let Some(info) = update::take_pending() {
+                offer_update(hwnd, info);
             }
             0
         }

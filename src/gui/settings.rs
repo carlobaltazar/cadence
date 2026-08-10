@@ -201,8 +201,10 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
     let sx = parent_rect.left;
     let sy = parent_rect.bottom + 4;
 
+    // Version in the title so users can say which build they're on when reporting something.
+    let title = format!("Settings \u{2014} Cadence {}", crate::update::current_version());
     let hwnd = register_and_create_dialog(
-        "CadenceSettings", "Settings",
+        "CadenceSettings", &title,
         settings_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         // Resizable: WS_THICKFRAME + WS_MAXIMIZEBOX let the user widen/maximize the dialog;
@@ -390,6 +392,10 @@ unsafe extern "system" fn settings_wnd_proc(
                 wide(&watch_text).as_ptr() as LPARAM);
             create_control(hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, 768, 200, 26, IDC_BTN_PROX_PLAYERS);
+            // Manual update check; the automatic one runs at launch. Slots into the gap left by
+            // the Players button on the same row, so the dialog doesn't grow.
+            create_control(hwnd, hinstance, font, "BUTTON", "Update",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 216, 768, 68, 26, IDC_BTN_UPDATE);
 
             // OK button (re-pinned to the window bottom by layout()).
             create_control(hwnd, hinstance, font, "BUTTON", "OK",
@@ -537,6 +543,35 @@ unsafe extern "system" fn settings_wnd_proc(
                 let owner = GetWindow(hwnd, GW_OWNER);
                 let owner = if owner.is_null() { hwnd } else { owner };
                 super::players::show_players_dialog(owner);
+                return 0;
+            } else if control_id == IDC_BTN_UPDATE {
+                // On-demand check. Runs on a worker thread so a slow/dead network can't freeze the
+                // dialog, then hands the answer back here to prompt on the UI thread.
+                let toolbar = GetWindow(hwnd, GW_OWNER);
+                let toolbar = if toolbar.is_null() { GetParent(hwnd) } else { toolbar };
+                let (dlg, tb) = (hwnd as isize, toolbar as isize);
+                std::thread::spawn(move || match crate::update::check() {
+                    // Hand off to the toolbar so the prompt (and the config write behind
+                    // "skip this version") happens on the UI thread, exactly as the
+                    // automatic startup check does.
+                    Ok(Some(info)) => unsafe {
+                        crate::update::set_pending(info);
+                        PostMessageW(tb as HWND, WM_APP_UPDATE_AVAILABLE, 0, 0);
+                    },
+                    Ok(None) => unsafe {
+                        let msg = format!(
+                            "You're on the latest version ({}).",
+                            crate::update::current_version()
+                        );
+                        MessageBoxW(dlg as HWND, wide(&msg).as_ptr(),
+                            wide("Cadence Update").as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    },
+                    Err(e) => unsafe {
+                        let msg = format!("Couldn't check for updates:\n\n{}", e);
+                        MessageBoxW(dlg as HWND, wide(&msg).as_ptr(),
+                            wide("Cadence Update").as_ptr(), MB_OK | MB_ICONWARNING);
+                    },
+                });
                 return 0;
             } else if control_id == IDC_BTN_SETTINGS_OK {
                 // Read selections

@@ -54,6 +54,9 @@ pub(crate) const IDC_CHK_DET: u16 = 115;
 
 /// Posted to the toolbar window when proximity detection fires, so it can uncheck "Det" (one-shot).
 pub(crate) const WM_APP_PROXIMITY_HIT: u32 = winapi::um::winuser::WM_APP + 3;
+// Posted by the update checker's worker thread when a newer release is on GitHub, so the prompt
+// is raised on the UI thread instead of from the worker.
+pub(crate) const WM_APP_UPDATE_AVAILABLE: u32 = winapi::um::winuser::WM_APP + 4;
 
 // Settings dialog controls
 pub(crate) const IDC_COMBO_RECORD_KEY: u16 = 201;
@@ -86,6 +89,7 @@ pub(crate) const IDC_BTN_PROX_PLAYERS: u16 = 245;
 pub(crate) const IDC_COMBO_PROX_ACTION: u16 = 246;
 pub(crate) const IDC_COMBO_PROX_TRIGGER: u16 = 247; // any player vs GM/watch list only
 pub(crate) const IDC_EDIT_PROX_WATCH: u16 = 248;    // watch patterns (comma/newline separated)
+pub(crate) const IDC_BTN_UPDATE: u16 = 249;         // manual "check for updates"
 // Section dividers (given IDs so the resize reflow can stretch them to the window width).
 pub(crate) const IDC_SETTINGS_DIV1: u16 = 250;
 pub(crate) const IDC_SETTINGS_DIV2: u16 = 251;

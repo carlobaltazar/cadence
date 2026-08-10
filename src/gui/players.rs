@@ -7,7 +7,7 @@
 //! toggle at the top runs a passive capture that logs players WITHOUT pressing the key.
 
 use crate::win32_helpers::{create_control, dpi_for_window, register_and_create_dialog, scale, scaled_font, wide};
-use crate::{config, proximity, xlsx};
+use crate::{config, mapcoord, proximity, xlsx};
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
@@ -55,10 +55,12 @@ const COLS: &[(usize, bool)] = &[
     (5, false),  // school
     (16, false), // map (name)
     (11, false), // guild
+    (10, false), // nick
     (14, false), // tag: <badge> / GM account level
     (9, true),   // hp now/max
     (9, false),  // pos x,z
     (11, false), // seen
+    (30, false), // why it tripped the alert (blank for everyone else)
 ];
 
 fn class_name(c: u16) -> (&'static str, &'static str) {
@@ -95,39 +97,47 @@ fn school_name(s: u16) -> &'static str {
 /// Map name for a DROP_PC map id (SNATIVEID.wMainID). Table decoded from RAN Portal's
 /// Data\glogic\mapslist.mst (EMBYTECRYPT_MAPSLIST substitution cipher). Unknown ids fall back to
 /// their number in the caller.
+///
+/// Ids 1..=30 were one slot too high until the mapslist was re-read against each record's own id
+/// field: id 22 is PracticingYard (w_Total_suryun), not MarketPlace (w_tradezone1, id 21). The
+/// reference DROP_PC capture confirms it — its map-22 positions only land on the in-game grid
+/// with w_Total_suryun's axis origin (see `mapcoord`).
 fn map_name(id: u16) -> Option<&'static str> {
     let n = match id {
         0 => "SG_Campus1F",
-        2 => "SG_Campus",
-        3 => "SacredGateHole",
-        4 => "MP_Campus1F",
-        5 => "MP_Campus",
-        6 => "MysticPeakHole",
-        7 => "PhoenixCampus1F",
-        8 => "PhoenixCampus",
-        9 => "PhoenixHole",
-        10 => "LeonineCampus",
-        11 => "LeonineCampus1F",
-        12 => "LeonineCampus2F",
-        13 => "LeonineCampus3F",
-        14 => "LeonineCampusB1",
-        15 => "LeonineCampusB2",
-        16 => "TradingHole",
-        17 => "SG HolePassage",
-        18 => "WharfPassage",
-        19 => "Hangout 1F_Ch1",
-        20 => "Hangout 2F_Ch1",
-        21 => "Hangout 3F_Ch1",
-        22 => "MarketPlace",
-        23 => "PracticingYard",
-        24 => "Suryun",
-        25 => "ShibuyaII",
-        26 => "Trading3Passage",
-        27 => "Prison",
-        28 => "Middle Hole",
-        29 => "Root Hole",
-        30 => "LeonineCampusB3",
-        31 => "WeddingHall",
+        1 => "SG_Campus",
+        2 => "SacredGateHole",
+        3 => "MP_Campus1F",
+        4 => "MP_Campus",
+        5 => "MysticPeakHole",
+        6 => "PhoenixCampus1F",
+        7 => "PhoenixCampus",
+        8 => "PhoenixHole",
+        9 => "LeonineCampus",
+        10 => "LeonineCampus1F",
+        11 => "LeonineCampus2F",
+        12 => "LeonineCampus3F",
+        13 => "LeonineCampusB1",
+        14 => "LeonineCampusB2",
+        15 => "TradingHole",
+        16 => "SG HolePassage",
+        17 => "WharfPassage",
+        18 => "Hangout 1F_Ch1",
+        19 => "Hangout 2F_Ch1",
+        20 => "Hangout 3F_Ch1",
+        21 => "MarketPlace",
+        22 => "PracticingYard",
+        23 => "Suryun",
+        // 24..=30 follow the file's record order but their id bytes didn't decrypt; one id in
+        // 24..=31 has no record, so a name here could be one slot out. Everything above and
+        // below decrypted directly.
+        24 => "ShibuyaII",
+        25 => "Trading3Passage",
+        26 => "Prison",
+        27 => "Middle Hole",
+        28 => "Root Hole",
+        29 => "LeonineCampusB3",
+        30 => "WeddingHall",
         32 => "PrisonTestZone",
         33 => "Labatory7",
         34 => "Shibuya",
@@ -212,6 +222,20 @@ fn map_display(p: &proximity::DetectedPlayer) -> String {
     }
 }
 
+/// Position cell: the same coordinate the game prints on its minimap ("21/16"), so a sighting can
+/// be walked to directly. DROP_PC carries raw 3D world units, which never matched what the player
+/// sees on screen — `mapcoord` applies the client's own conversion. Maps whose axis origin isn't
+/// known keep showing the world units rather than a plausible-looking wrong grid.
+fn pos_display(p: &proximity::DetectedPlayer) -> String {
+    if let Some(g) = mapcoord::grid_str(p.map, p.pos_x, p.pos_z) {
+        return g;
+    }
+    match (p.pos_x, p.pos_z) {
+        (Some(x), Some(z)) => format!("{},{}", x, z),
+        _ => "-".into(),
+    }
+}
+
 /// Guild cell as rendered in the table: the club name, or "-" when the player has none.
 /// Shared by the row renderer and the Guild filter.
 fn guild_display(p: &proximity::DetectedPlayer) -> String {
@@ -247,7 +271,8 @@ fn line(cells: &[String]) -> String {
 fn header_line() -> String {
     line(&[
         " ".into(), "Name".into(), "Lv".into(), "Class".into(), "G".into(), "Schl".into(),
-        "Map".into(), "Guild".into(), "Tag".into(), "HP".into(), "Pos x,z".into(), "Seen".into(),
+        "Map".into(), "Guild".into(), "Nick".into(), "Tag".into(), "HP".into(), "Map x/y".into(),
+        "Seen".into(), "Why it fired".into(),
     ])
 }
 
@@ -260,15 +285,14 @@ fn row_line(p: &proximity::DetectedPlayer, ignored: bool) -> String {
         _ => "-".into(),
     };
     let map = map_display(p);
-    let pos = match (p.pos_x, p.pos_z) {
-        (Some(x), Some(z)) => format!("{},{}", x, z),
-        _ => "-".into(),
-    };
+    let pos = pos_display(p);
     let guild = guild_display(p);
     let seen = if p.seen_str.is_empty() { "-".into() } else { p.seen_str.clone() };
+    let nick = if p.nick.is_empty() { "-".into() } else { p.nick.clone() };
     line(&[
         if ignored { "*".into() } else { " ".into() },
-        p.name.clone(), lv, cls.into(), gen.into(), sch, map, guild, tag_display(p), hp, pos, seen,
+        p.name.clone(), lv, cls.into(), gen.into(), sch, map, guild, nick, tag_display(p), hp, pos,
+        seen, p.why.clone(),
     ])
 }
 
@@ -342,6 +366,7 @@ fn collect_filtered() -> Vec<proximity::DetectedPlayer> {
             && !p.name.to_lowercase().contains(&filter)
             && !p.guild.to_lowercase().contains(&filter)
             && !p.badge.to_lowercase().contains(&filter)
+            && !p.nick.to_lowercase().contains(&filter)
         {
             return false;
         }
@@ -562,8 +587,9 @@ unsafe fn export_xlsx(hwnd: HWND) {
     };
 
     let headers = [
-        "Name", "Level", "Class", "Gender", "School", "Map", "Guild", "Tag",
-        "HP Now", "HP Max", "Pos X", "Pos Z", "Sightings", "Seen", "Ignored",
+        "Name", "Level", "Class", "Gender", "School", "Map", "Guild", "Nick", "Tag",
+        "HP Now", "HP Max", "Map X/Y", "World X", "World Z", "Sightings", "Seen", "Ignored",
+        "Why It Fired",
     ];
     let ignored = proximity::ignored_players();
     let num_or_dash = |v: Option<u16>| match v {
@@ -588,14 +614,17 @@ unsafe fn export_xlsx(hwnd: HWND) {
             xlsx::Cell::Str(sch.to_string()),
             xlsx::Cell::Str(map_display(p)),
             xlsx::Cell::Str(guild_display(p)),
+            xlsx::Cell::Str(if p.nick.is_empty() { "-".into() } else { p.nick.clone() }),
             xlsx::Cell::Str(tag_display(p)),
             num_or_dash(p.hp_now),
             num_or_dash(p.hp_max),
+            xlsx::Cell::Str(mapcoord::grid_str(p.map, p.pos_x, p.pos_z).unwrap_or_else(|| "-".into())),
             inum_or_dash(p.pos_x),
             inum_or_dash(p.pos_z),
             xlsx::Cell::Num(p.count as f64),
             xlsx::Cell::Str(seen),
             xlsx::Cell::Str(if is_ignored { "yes".into() } else { String::new() }),
+            xlsx::Cell::Str(p.why.clone()),
         ]);
     }
 
