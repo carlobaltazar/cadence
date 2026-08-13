@@ -9,6 +9,11 @@ use winapi::um::winuser::*;
 
 static SEQUENCES_HWND: AtomicIsize = AtomicIsize::new(0);
 
+// Sequence name per list row, so selection never has to parse names back out of decorated
+// display text (hotkey suffixes, last/new markers). A row's LB_ITEMDATA is its 1-based index
+// into this vec; group headers keep item data 0.
+static ROW_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 pub unsafe fn show_sequences_window(parent: HWND) {
     let existing = SEQUENCES_HWND.load(Ordering::Acquire) as HWND;
     if !existing.is_null() && IsWindow(existing) != 0 {
@@ -241,6 +246,10 @@ unsafe fn handle_delete_seq(hwnd: HWND) {
                 cfg.default_sequence = None;
                 let _ = config::save_config(&cfg);
             }
+            // Forget the last-played memory if it named the deleted sequence.
+            if storage::last_played().name == name {
+                storage::set_last_played(String::new(), Vec::new());
+            }
             lock_or_recover(&SEQUENCE_QUEUE).retain(|n| n != &name);
             let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
             SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
@@ -315,6 +324,7 @@ unsafe fn handle_play_seq(hwnd: HWND) {
                 *lock_or_recover(&LAST_EVENTS) = Some(seq.events.clone());
                 player::set_source(player::PlaybackSource::Sequence(name.clone()));
                 player::play_sequence(seq.events);
+                refresh_sequences_list(); // move the "last played" marker immediately
             }
         }
     }
@@ -399,29 +409,31 @@ unsafe fn get_selected_sequence_name(hwnd: HWND) -> Option<String> {
     if idx < 0 {
         return None;
     }
-    // Header items have item data 0; sequence items have item data 1
-    if SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0) != 1 {
+    // Group headers carry item data 0; sequence rows carry their 1-based ROW_NAMES index,
+    // so the name comes back exact no matter how the display text is decorated.
+    let data = SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0);
+    if data <= 0 {
         return None;
     }
-    let len = SendMessageW(h_list, LB_GETTEXTLEN, idx as WPARAM, 0);
-    if len <= 0 {
-        return None;
-    }
-    let mut buf = vec![0u16; (len + 1) as usize];
-    SendMessageW(h_list, LB_GETTEXT, idx as WPARAM, buf.as_mut_ptr() as LPARAM);
-    let display = String::from_utf16_lossy(&buf[..len as usize]);
-    let display = display.trim_start().to_string(); // strip group indent
-    if let Some(bracket_pos) = display.rfind(" [") {
-        Some(display[..bracket_pos].to_string())
-    } else {
-        Some(display)
-    }
+    lock_or_recover(&ROW_NAMES).get(data as usize - 1).cloned()
+}
+
+/// Add one sequence row: display text decorated freely, real name kept in ROW_NAMES and
+/// referenced from the row's item data (1-based; 0 marks a group header).
+unsafe fn add_seq_row(h_list: HWND, display: &str, name: &str, rows: &mut Vec<String>) {
+    rows.push(name.to_string());
+    let ws = wide(display);
+    let ii = SendMessageW(h_list, LB_ADDSTRING, 0, ws.as_ptr() as LPARAM);
+    SendMessageW(h_list, LB_SETITEMDATA, ii as WPARAM, rows.len() as LPARAM);
 }
 
 unsafe fn populate_sequences_list(h_list: HWND) {
     if let Ok(items) = storage::list_sequences_with_groups() {
         let bindings = hotkeys::current_sequence_bindings();
         let collapsed = lock_or_recover(&COLLAPSED_GROUPS);
+        let last_played = storage::last_played().name;
+        let newest = storage::newest_sequence();
+        let mut rows: Vec<String> = Vec::new();
 
         let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut ungrouped: Vec<String> = Vec::new();
@@ -444,10 +456,9 @@ unsafe fn populate_sequences_list(h_list: HWND) {
 
             if !is_collapsed {
                 for name in names {
-                    let display = format_seq_display(name, &bindings, true);
-                    let ws = wide(&display);
-                    let ii = SendMessageW(h_list, LB_ADDSTRING, 0, ws.as_ptr() as LPARAM);
-                    SendMessageW(h_list, LB_SETITEMDATA, ii as WPARAM, 1isize as LPARAM);
+                    let display =
+                        format_seq_display(name, &bindings, true, &last_played, newest.as_deref());
+                    add_seq_row(h_list, &display, name, &mut rows);
                 }
             }
         }
@@ -461,29 +472,42 @@ unsafe fn populate_sequences_list(h_list: HWND) {
 
             if !is_collapsed {
                 for name in &ungrouped {
-                    let display = format_seq_display(name, &bindings, false);
-                    let ws = wide(&display);
-                    let ii = SendMessageW(h_list, LB_ADDSTRING, 0, ws.as_ptr() as LPARAM);
-                    SendMessageW(h_list, LB_SETITEMDATA, ii as WPARAM, 1isize as LPARAM);
+                    let display =
+                        format_seq_display(name, &bindings, false, &last_played, newest.as_deref());
+                    add_seq_row(h_list, &display, name, &mut rows);
                 }
             }
         } else {
             for name in &ungrouped {
-                let display = format_seq_display(name, &bindings, false);
-                let ws = wide(&display);
-                let ii = SendMessageW(h_list, LB_ADDSTRING, 0, ws.as_ptr() as LPARAM);
-                SendMessageW(h_list, LB_SETITEMDATA, ii as WPARAM, 1isize as LPARAM);
+                let display =
+                    format_seq_display(name, &bindings, false, &last_played, newest.as_deref());
+                add_seq_row(h_list, &display, name, &mut rows);
             }
         }
+
+        *lock_or_recover(&ROW_NAMES) = rows;
     }
 }
 
-fn format_seq_display(name: &str, bindings: &[(u16, String)], indent: bool) -> String {
-    let base = if let Some((vk, _)) = bindings.iter().find(|(_, n)| n == name) {
+fn format_seq_display(
+    name: &str,
+    bindings: &[(u16, String)],
+    indent: bool,
+    last_played: &str,
+    newest: Option<&str>,
+) -> String {
+    let mut base = if let Some((vk, _)) = bindings.iter().find(|(_, n)| n == name) {
         format!("{} [{}]", name, vk_name(*vk))
     } else {
         name.to_string()
     };
+    // "Which one did I run?" / "which one did I just record?" — answered in the list itself.
+    if name == last_played {
+        base.push_str("  \u{25C0} last played");
+    }
+    if newest == Some(name) {
+        base.push_str("  \u{2605} new");
+    }
     if indent { format!("  {}", base) } else { base }
 }
 

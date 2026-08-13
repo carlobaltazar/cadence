@@ -1,7 +1,7 @@
 use crate::win32_helpers::{
     wide, create_control, dpi_for_window, message_box_timeout, scaled_font, scale, MB_TIMEDOUT,
 };
-use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder, resume, update};
+use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder, resume, storage, update};
 use super::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -363,6 +363,16 @@ pub(crate) unsafe fn offer_update(toolbar: HWND, info: update::UpdateInfo) {
     }
 }
 
+/// Keep the status line short: long sequence names get an ellipsis.
+fn trim_name(s: &str) -> String {
+    const MAX: usize = 24;
+    if s.chars().count() > MAX {
+        s.chars().take(MAX - 1).collect::<String>() + "\u{2026}"
+    } else {
+        s.to_string()
+    }
+}
+
 /// Open a URL in the default browser.
 pub(crate) unsafe fn open_url(url: &str) {
     winapi::um::shellapi::ShellExecuteW(
@@ -609,19 +619,29 @@ unsafe extern "system" fn toolbar_wnd_proc(
             if w_param == TIMER_STATUS {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolbarControls;
                 if !ptr.is_null() {
-                    // Update status text
+                    // Update status text. Playing shows WHAT is playing; idle shows what was
+                    // played last — so nobody has to remember which sequence a VM was running.
                     let base_status = if recorder::is_recording() {
-                        "Recording..."
+                        "Recording...".to_string()
                     } else if player::is_playing() {
+                        let what = match player::current_source() {
+                            player::PlaybackSource::Sequence(name) => trim_name(&name),
+                            player::PlaybackSource::Queue(names) => {
+                                format!("queue ({})", names.len())
+                            }
+                            player::PlaybackSource::Adhoc => "(unsaved)".to_string(),
+                        };
                         if player::is_loop_mode() {
-                            "Playing (loop)"
+                            format!("Playing (loop): {}", what)
                         } else {
-                            "Playing..."
+                            format!("Playing: {}", what)
                         }
-                    } else if network::is_listening() {
-                        "Idle (Recv)"
                     } else {
-                        "Idle"
+                        let base = if network::is_listening() { "Idle (Recv)" } else { "Idle" };
+                        match storage::last_played().describe() {
+                            Some(desc) => format!("{} \u{2014} last: {}", base, trim_name(&desc)),
+                            None => base.to_string(),
+                        }
                     };
                     let pet = pet_cycle::is_active();
                     let hp = monitor::is_active(monitor::Bar::Hp);

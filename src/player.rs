@@ -56,7 +56,18 @@ static SOURCE: Mutex<PlaybackSource> = Mutex::new(PlaybackSource::Adhoc);
 /// Record where playback came from. Callers set this immediately before `play_*`; it is
 /// never cleared when playback ends — it is only read while `is_playing()` says so (and
 /// the benign race there resolves to "resume it anyway", which is what a 24/7 VM wants).
+/// Named playback is also remembered on disk so the toolbar can answer "what did I play?"
+/// across sessions; Adhoc (unsaved events, proximity one-shots) keeps the previous memory.
 pub fn set_source(source: PlaybackSource) {
+    match &source {
+        PlaybackSource::Sequence(name) => {
+            crate::storage::set_last_played(name.clone(), Vec::new())
+        }
+        PlaybackSource::Queue(names) => {
+            crate::storage::set_last_played(String::new(), names.clone())
+        }
+        PlaybackSource::Adhoc => {}
+    }
     *lock_or_recover(&SOURCE) = source;
 }
 
