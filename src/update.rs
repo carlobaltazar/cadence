@@ -8,6 +8,7 @@
 
 use crate::win32_helpers::wide;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use winapi::ctypes::c_int;
 use winapi::shared::minwindef::{DWORD, LPVOID};
@@ -40,6 +41,47 @@ pub struct UpdateInfo {
 // Filled by the background check, read by the UI thread when it handles the posted message.
 static PENDING: Mutex<Option<UpdateInfo>> = Mutex::new(None);
 
+// True from the moment an update prompt is posted until it resolves, so the periodic poll
+// and the manual Settings check can't stack a second dialog on top of one already showing.
+// Cleared on No/Cancel/failure; never on a successful apply — that process is exiting.
+static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_prompt_active(active: bool) {
+    PROMPT_ACTIVE.store(active, Ordering::Release);
+}
+
+pub fn prompt_active() -> bool {
+    PROMPT_ACTIVE.load(Ordering::Acquire)
+}
+
+// The version the user last answered "No" to, and when. Keeps the periodic poll from
+// re-asking every cycle, while staying in memory only so "No" still means "remind me
+// next launch" exactly as the dialog promises.
+static DECLINED: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+const REPROMPT_AFTER_NO_SECS: u64 = 6 * 3600;
+
+pub fn note_declined(version: &str) {
+    *DECLINED.lock().unwrap() = Some((version.to_string(), std::time::Instant::now()));
+}
+
+fn declined_recently(version: &str) -> bool {
+    snoozed(&DECLINED.lock().unwrap(), version, std::time::Instant::now())
+}
+
+/// Pure form of the snooze check, split out so the expiry logic is testable.
+fn snoozed(
+    entry: &Option<(String, std::time::Instant)>,
+    version: &str,
+    now: std::time::Instant,
+) -> bool {
+    match entry {
+        Some((v, at)) => {
+            v == version && now.saturating_duration_since(*at).as_secs() < REPROMPT_AFTER_NO_SECS
+        }
+        None => false,
+    }
+}
+
 /// The version of this build, for display in the UI.
 pub fn current_version() -> &'static str {
     VERSION
@@ -55,31 +97,58 @@ pub fn set_pending(info: UpdateInfo) {
     *PENDING.lock().unwrap() = Some(info);
 }
 
-/// Check GitHub on a worker thread; post `msg` to `hwnd` if a newer release is available.
-/// Delayed slightly so the check never competes with window creation on a slow machine.
-pub fn start_check(hwnd: isize, msg: u32, skip_version: String) {
+/// Check GitHub on a worker thread — once shortly after launch (if `check_on_start`), then
+/// every `interval_mins` for as long as the process runs (0 = no periodic re-check). The
+/// periodic re-check is what makes a 24/7 fleet updatable at all: without it a VM that
+/// never relaunches would never see a new release. Posts `msg` to `hwnd` whenever a newer,
+/// non-skipped, non-snoozed release is found.
+pub fn start_periodic(hwnd: isize, msg: u32, check_on_start: bool, interval_mins: u32) {
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        match check() {
-            Ok(Some(info)) => {
-                if info.version == skip_version {
-                    println!("[Cadence] Update {} available but skipped by config.", info.version);
-                    return;
-                }
-                println!("[Cadence] Update available: {} -> {}", VERSION, info.version);
-                set_pending(info);
-                if hwnd != 0 && msg != 0 {
-                    unsafe {
-                        if PostMessageW(hwnd as _, msg, 0, 0) == 0 {
-                            println!("[Cadence] Couldn't notify the UI about the update.");
-                        }
-                    }
-                }
-            }
-            Ok(None) => println!("[Cadence] Up to date ({}).", VERSION),
-            Err(e) => println!("[Cadence] Update check failed: {}", e),
+        if check_on_start {
+            // Delayed slightly so the check never competes with window creation on a slow machine.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            try_check_and_post(hwnd, msg);
+        }
+        if interval_mins == 0 {
+            return;
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(interval_mins as u64 * 60));
+            try_check_and_post(hwnd, msg);
         }
     });
+}
+
+fn try_check_and_post(hwnd: isize, msg: u32) {
+    if prompt_active() {
+        return; // one prompt at a time
+    }
+    // Read the skip fresh each cycle so "Cancel — skip version X" takes effect on the
+    // next poll instead of only after a relaunch.
+    let skip = crate::config::cached_config().update_skip_version;
+    match check() {
+        Ok(Some(info)) => {
+            if info.version == skip {
+                println!("[Cadence] Update {} available but skipped by config.", info.version);
+                return;
+            }
+            if declined_recently(&info.version) {
+                return;
+            }
+            println!("[Cadence] Update available: {} -> {}", VERSION, info.version);
+            set_pending(info);
+            set_prompt_active(true); // before the post, so a racing poll can't double up
+            let notified = hwnd != 0
+                && msg != 0
+                && unsafe { PostMessageW(hwnd as _, msg, 0, 0) != 0 };
+            if !notified {
+                println!("[Cadence] Couldn't notify the UI about the update.");
+                set_prompt_active(false);
+            }
+        }
+        Ok(None) => println!("[Cadence] Up to date ({}).", VERSION),
+        Err(e) => println!("[Cadence] Update check failed: {}", e),
+    }
 }
 
 /// Ask GitHub for the latest release. `Ok(None)` means this build is already current.
@@ -590,6 +659,21 @@ mod tests {
         let bytes = download_verified(&info).expect("asset downloads and passes verification");
         assert_eq!(&bytes[..2], b"MZ");
         assert_eq!(bytes.len() as u64, info.size);
+    }
+
+    #[test]
+    fn no_snooze_expires_and_is_per_version() {
+        let now = std::time::Instant::now();
+        let entry = Some(("3.5.0".to_string(), now));
+        // Same version inside the window: snoozed.
+        let later = now + std::time::Duration::from_secs(REPROMPT_AFTER_NO_SECS - 1);
+        assert!(snoozed(&entry, "3.5.0", later));
+        // Window elapsed: prompt again.
+        let expired = now + std::time::Duration::from_secs(REPROMPT_AFTER_NO_SECS);
+        assert!(!snoozed(&entry, "3.5.0", expired));
+        // A different (newer) version is never held back by an old "No".
+        assert!(!snoozed(&entry, "3.6.0", later));
+        assert!(!snoozed(&None, "3.5.0", later));
     }
 
     #[test]

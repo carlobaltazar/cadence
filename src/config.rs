@@ -97,6 +97,17 @@ pub struct AppConfig {
     /// A version the user chose to skip; it is found but never prompted for again.
     #[serde(default)]
     pub update_skip_version: String,
+    /// Minutes between periodic update polls while running, so a 24/7 VM notices new
+    /// releases without a relaunch. 0 = check at launch only.
+    #[serde(default = "default_update_interval_mins")]
+    pub update_check_interval_mins: u32,
+    /// Seconds before the update prompt auto-answers Yes, so unattended VMs update
+    /// themselves. 0 = wait for a human.
+    #[serde(default = "default_update_auto_confirm_secs")]
+    pub update_auto_confirm_secs: u32,
+    /// After an update restart, resume the sequence/queue that was playing.
+    #[serde(default = "default_true")]
+    pub update_auto_resume: bool,
     /// Push heartbeats/events to the fleet dashboard. Defaults on so an exe rollout
     /// lights up every machine with no per-machine config edits; opt out here.
     #[serde(default = "default_true")]
@@ -122,6 +133,8 @@ fn default_proximity_vk() -> u16 { 0x45 } // 'E'
 fn default_proximity_server_ip() -> String { String::new() }
 fn default_proximity_cooldown() -> u64 { 500 }
 fn default_true() -> bool { true }
+fn default_update_interval_mins() -> u32 { 30 }
+fn default_update_auto_confirm_secs() -> u32 { 60 }
 fn default_report_url() -> String { "https://147-182-215-152.sslip.io/api/report".to_string() }
 fn default_report_token() -> String { "ccdea6d580af677289951e42c88f7b34763eeb0f1ced6534".to_string() }
 fn default_proximity_watch() -> Vec<String> {
@@ -173,6 +186,9 @@ impl Default for AppConfig {
             proximity_watch_gm_flag: true,
             update_check_on_start: true,
             update_skip_version: String::new(),
+            update_check_interval_mins: default_update_interval_mins(),
+            update_auto_confirm_secs: default_update_auto_confirm_secs(),
+            update_auto_resume: true,
             report_enabled: true,
             report_url: default_report_url(),
             report_token: default_report_token(),

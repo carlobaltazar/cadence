@@ -14,6 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # With clients auto-updating on a timer, a tag that doesn't match Cargo.toml would
+      # ship an exe that self-reports the old version — every VM would then download,
+      # restart, still look outdated, and re-download forever. Refuse to build it.
+      - name: Verify tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $cargo) { throw "Tag v$tag does not match Cargo.toml version $cargo" }
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -24,8 +34,10 @@ jobs:
         run: choco install innosetup -y --no-progress
 
       - name: Build installer
+        shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\cadence.iss
+          $ver = "${{ github.ref_name }}".TrimStart("v")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$ver installer\cadence.iss
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -40,6 +40,46 @@ pub fn is_shuffle_mode() -> bool {
     SHUFFLE_MODE.load(Ordering::Acquire)
 }
 
+/// What the current (or most recent) playback was started from, so the auto-updater can
+/// resume the same thing after it restarts the process. `Adhoc` covers playback with no
+/// on-disk identity — unnamed LAST_EVENTS and proximity one-shot reactions — which is
+/// deliberately not resumable.
+#[derive(Clone)]
+pub enum PlaybackSource {
+    Sequence(String),
+    Queue(Vec<String>),
+    Adhoc,
+}
+
+static SOURCE: Mutex<PlaybackSource> = Mutex::new(PlaybackSource::Adhoc);
+
+/// Record where playback came from. Callers set this immediately before `play_*`; it is
+/// never cleared when playback ends — it is only read while `is_playing()` says so (and
+/// the benign race there resolves to "resume it anyway", which is what a 24/7 VM wants).
+pub fn set_source(source: PlaybackSource) {
+    *lock_or_recover(&SOURCE) = source;
+}
+
+pub fn current_source() -> PlaybackSource {
+    lock_or_recover(&SOURCE).clone()
+}
+
+/// Cancel playback and wait (up to `timeout_ms`) for the playback thread to acknowledge.
+/// The thread checks CANCEL before each event, so this lands on an event boundary — but
+/// it can sit inside one long inter-event delay, hence the timeout. Returns whether
+/// something was playing when called.
+pub fn stop_and_wait(timeout_ms: u64) -> bool {
+    if !is_playing() {
+        return false;
+    }
+    cancel_playback();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    while is_playing() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
+}
+
 /// Virtual-screen origin and span, used to normalize absolute mouse coords.
 fn vscreen() -> (i32, i32, i32, i32) {
     unsafe {

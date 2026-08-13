@@ -209,6 +209,7 @@ pub fn handle_play_toggle() {
                 }
             }
             if !event_lists.is_empty() {
+                player::set_source(player::PlaybackSource::Queue(queue.clone()));
                 player::play_queue(event_lists);
             }
         } else {
@@ -216,12 +217,14 @@ pub fn handle_play_toggle() {
             let cfg = config::load_config();
             if let Some(ref name) = cfg.default_sequence {
                 if let Ok(seq) = storage::load_sequence(name) {
+                    player::set_source(player::PlaybackSource::Sequence(name.clone()));
                     player::play_sequence(seq.events);
                     return;
                 }
             }
             let events = lock_or_recover(&LAST_EVENTS);
             if let Some(ref evts) = *events {
+                player::set_source(player::PlaybackSource::Adhoc);
                 player::play_sequence(evts.clone());
             }
         }
@@ -243,6 +246,7 @@ pub fn handle_play_queue_hotkey() {
         }
     }
     if !event_lists.is_empty() {
+        player::set_source(player::PlaybackSource::Queue(queue.clone()));
         player::play_queue(event_lists);
     }
 }
@@ -253,6 +257,7 @@ pub fn handle_play_sequence(vk: u16) {
     }
     if let Some(seq_name) = hotkeys::sequence_for_vk(vk) {
         if let Ok(seq) = storage::load_sequence(&seq_name) {
+            player::set_source(player::PlaybackSource::Sequence(seq_name.clone()));
             player::play_sequence(seq.events);
         }
     }

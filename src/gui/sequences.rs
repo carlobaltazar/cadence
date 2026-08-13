@@ -313,6 +313,7 @@ unsafe fn handle_play_seq(hwnd: HWND) {
         if !player::is_playing() && !recorder::is_recording() {
             if let Ok(seq) = storage::load_sequence(&name) {
                 *lock_or_recover(&LAST_EVENTS) = Some(seq.events.clone());
+                player::set_source(player::PlaybackSource::Sequence(name.clone()));
                 player::play_sequence(seq.events);
             }
         }

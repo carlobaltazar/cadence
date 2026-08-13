@@ -106,6 +106,45 @@ pub fn scaled_font(dpi: u32) -> HFONT {
     hfont
 }
 
+// ---- Timed message box ----
+
+/// Return value of user32!MessageBoxTimeoutW when the timer fired before any button.
+pub const MB_TIMEDOUT: i32 = 32000;
+
+/// MessageBoxW that auto-dismisses after `timeout_ms`, returning MB_TIMEDOUT if nobody
+/// answered in time. Uses the undocumented-but-stable-since-Windows-2000 user32 export
+/// MessageBoxTimeoutW, resolved dynamically like GetDpiForWindow above. `timeout_ms == 0`
+/// or a missing export degrade to a plain blocking MessageBoxW.
+pub unsafe fn message_box_timeout(
+    hwnd: HWND,
+    text: &str,
+    caption: &str,
+    utype: u32,
+    timeout_ms: u32,
+) -> i32 {
+    let wtext = wide(text);
+    let wcaption = wide(caption);
+    if timeout_ms != 0 {
+        let lib = LoadLibraryW(wide("user32.dll").as_ptr());
+        if !lib.is_null() {
+            let p = GetProcAddress(lib, c"MessageBoxTimeoutW".as_ptr());
+            if !p.is_null() {
+                type MsgBoxTimeoutW = unsafe extern "system" fn(
+                    HWND,
+                    *const u16,
+                    *const u16,
+                    u32,
+                    u16, // wLanguageId, 0 = neutral
+                    u32, // milliseconds
+                ) -> i32;
+                let f: MsgBoxTimeoutW = std::mem::transmute(p);
+                return f(hwnd, wtext.as_ptr(), wcaption.as_ptr(), utype, 0, timeout_ms);
+            }
+        }
+    }
+    MessageBoxW(hwnd, wtext.as_ptr(), wcaption.as_ptr(), utype)
+}
+
 // ---- Key options ----
 
 pub const KEY_OPTIONS: &[(u16, &str)] = &[

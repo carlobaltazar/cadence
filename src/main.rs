@@ -12,6 +12,7 @@ mod player;
 mod proximity;
 mod recorder;
 mod report;
+mod resume;
 mod sequence;
 mod storage;
 mod timing;
@@ -118,16 +119,17 @@ fn main() {
     // Let proximity notify the toolbar to uncheck "Det" when a detection fires (one-shot).
     proximity::set_notify(hwnd as isize, gui::WM_APP_PROXIMITY_HIT);
 
-    // Clear the exe a previous in-place update renamed aside, then look for a newer release.
-    // The check runs on a worker thread and only ever posts a message; it never blocks startup.
+    // Clear the exe a previous in-place update renamed aside, then start the update checker:
+    // once shortly after launch, and again every update_check_interval_mins so the 24/7 fleet
+    // notices new releases without a relaunch. Runs on a worker thread and only ever posts a
+    // message; it never blocks startup.
     update::cleanup_old();
-    if cfg.update_check_on_start {
-        update::start_check(
-            hwnd as isize,
-            gui::WM_APP_UPDATE_AVAILABLE,
-            cfg.update_skip_version.clone(),
-        );
-    }
+    update::start_periodic(
+        hwnd as isize,
+        gui::WM_APP_UPDATE_AVAILABLE,
+        cfg.update_check_on_start,
+        cfg.update_check_interval_mins,
+    );
 
     // Auto-start receiver if configured
     if cfg.remote_auto_listen && cfg.remote_port > 0 {
@@ -206,6 +208,27 @@ fn main() {
     if let Some(name) = load_name {
         if let Ok(seq) = storage::load_sequence(&name) {
             *win32_helpers::lock_or_recover(&gui::LAST_EVENTS) = Some(seq.events);
+        }
+    }
+
+    // Resume the playback an auto-update restart interrupted. The marker was written by
+    // the old instance just before it swapped itself out; take_marker() consumes it and
+    // rejects anything stale, so an ordinary launch never auto-plays.
+    if cfg.update_auto_resume {
+        if let Some(marker) = resume::take_marker() {
+            std::thread::spawn(move || {
+                // Give the relaunched process (and the game window) a moment to settle.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if player::is_playing() || recorder::is_recording() {
+                    return;
+                }
+                println!(
+                    "[Cadence] Resuming playback interrupted by the {} -> {} update.",
+                    marker.from_version,
+                    update::current_version()
+                );
+                resume::start_from(&marker.to_source());
+            });
         }
     }
 

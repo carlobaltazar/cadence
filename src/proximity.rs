@@ -627,17 +627,7 @@ fn press_key(vk: u16) {
 /// Stop any currently-playing sequence/queue and wait for it to actually stop. Returns whether
 /// something was playing.
 fn stop_current_playback() -> bool {
-    if !player::is_playing() {
-        return false;
-    }
-    player::cancel_playback();
-    for _ in 0..75 {
-        if !player::is_playing() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    true
+    player::stop_and_wait(1500)
 }
 
 /// Do the reaction: play the configured sequence, or press the key. Returns a log description.
@@ -650,7 +640,9 @@ fn react_action(vk: u16) -> String {
     } else {
         match storage::load_sequence(&seq) {
             Ok(s) => {
-                player::play_sequence_once(s.events); // one-shot: never loop, even if Loop is on
+                // One-shot: never loop, and never resume across an update restart.
+                player::set_source(player::PlaybackSource::Adhoc);
+                player::play_sequence_once(s.events);
                 format!("played sequence '{}' once", seq)
             }
             Err(e) => {

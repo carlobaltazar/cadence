@@ -126,6 +126,7 @@ fn execute_command(line: &str) -> String {
         if event_lists.is_empty() {
             return "ERR load_failed\n".to_string();
         }
+        player::set_source(player::PlaybackSource::Queue(queue.clone()));
         player::play_queue(event_lists);
         return "OK\n".to_string();
     }
@@ -140,6 +141,7 @@ fn execute_command(line: &str) -> String {
         }
         match storage::load_sequence(seq_name) {
             Ok(seq) => {
+                player::set_source(player::PlaybackSource::Sequence(seq_name.to_string()));
                 player::play_sequence(seq.events);
                 "OK\n".to_string()
             }

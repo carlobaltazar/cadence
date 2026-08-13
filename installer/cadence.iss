@@ -1,7 +1,11 @@
 ; Cadence Inno Setup Installer Script
 
 #define MyAppName "Cadence"
-#define MyAppVersion "3.3.0"
+; CI passes the real version from the release tag: ISCC /DMyAppVersion=x.y.z
+; A hand-built installer stamps 0.0.0 so a stale hardcoded number can never ship.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 #define MyAppPublisher "Cadence"
 #define MyAppExeName "cadence.exe"
 
