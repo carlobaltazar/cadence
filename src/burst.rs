@@ -1,6 +1,5 @@
 use crate::player;
 use crate::timing::PrecisionTimer;
-use crate::win32_helpers::wide;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use winapi::shared::windef::HWND;
@@ -54,21 +53,14 @@ pub fn start(rate_hz: u32, window_class: String, window_title: String) {
         let interval_micros: i64 = (1_000_000 / rate) as i64;
         let timer = PrecisionTimer::new();
 
-        let use_window_anchor = !window_class.is_empty();
-        let class_w = if use_window_anchor {
-            Some(wide(&window_class))
-        } else {
-            None
-        };
-
         // Resolve the game HWND once at start. We re-check foreground each
         // tick against this handle so Alt-Tab away stops the burst, but we
         // tolerate the window briefly disappearing (it just won't fire).
         let game_hwnd: HWND = unsafe {
-            if let Some(ref cw) = class_w {
-                crate::monitor::find_window_matching(cw.as_ptr(), &window_title)
-            } else {
+            if window_class.is_empty() {
                 std::ptr::null_mut()
+            } else {
+                crate::monitor::find_game_window(&window_class, &window_title)
             }
         };
 

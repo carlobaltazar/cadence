@@ -1,7 +1,7 @@
 use crate::player;
 use crate::timing::PrecisionTimer;
-use crate::win32_helpers::{lock_or_recover, wide};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use crate::win32_helpers::lock_or_recover;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -230,8 +230,7 @@ fn ensure_running() {
                 // Resolve the game window + DC ONCE per tick, then sample every
                 // enabled bar against it. Shared anchor => one GetDC for all bars.
                 let (hwnd, hdc) = if use_window_anchor {
-                    let class_w = wide(&class);
-                    let hwnd = find_window_matching(class_w.as_ptr(), &title);
+                    let hwnd = find_game_window(&class, &title);
                     WINDOW_FOUND.store(!hwnd.is_null(), Ordering::Release);
                     if hwnd.is_null() {
                         thread::sleep(Duration::from_millis(500));
@@ -301,26 +300,268 @@ fn ensure_running() {
     });
 }
 
-pub(crate) unsafe fn find_window_matching(class_ptr: *const u16, title_prefix: &str) -> HWND {
-    if title_prefix.is_empty() {
-        return FindWindowW(class_ptr, std::ptr::null());
-    }
+// --- Game-window resolution ------------------------------------------------------------------
+//
+// The pick flow stores the game window's class and title verbatim, but the class alone is not a
+// stable identity: the RAN client is MFC, and MFC auto-registers class names of the form
+// `Afx:<hInstance>:<style>:<hCursor>:<hbrBackground>:<hIcon>` whose last three fields are GDI
+// handle values that change on every game launch. An exact-class match therefore dies the moment
+// the client is reopened — which used to force a pixel re-pick on every VM after every
+// disconnect. Resolution is tiered instead: exact match first (fast path within a session), then
+// the stable Afx prefix, then the stored title — so the same saved anchor keeps working across
+// game relaunches.
 
-    let mut hwnd = FindWindowExW(
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        class_ptr,
-        std::ptr::null(),
-    );
-    while !hwnd.is_null() {
-        let mut buf = [0u16; 256];
-        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) as usize;
-        let actual: String = String::from_utf16_lossy(&buf[..len]);
-        if actual.starts_with(title_prefix) {
-            return hwnd;
+/// "Afx:00400000:8:00010003:00900011:024A1B55" -> Some("Afx:00400000:8:"). The first two fields
+/// after "Afx" (module base, window style) are stable per game build; the rest are per-launch
+/// GDI handles. None when the class isn't an MFC auto-generated name with volatile fields.
+fn afx_stable_prefix(class: &str) -> Option<String> {
+    let parts: Vec<&str> = class.split(':').collect();
+    if parts.len() >= 4 && parts[0] == "Afx" && !parts[1].is_empty() && !parts[2].is_empty() {
+        // The trailing ':' is load-bearing: "Afx:00400000:8:" must not match "Afx:00400000:80:…".
+        Some(format!("Afx:{}:{}:", parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
+/// Score a candidate window against the stored anchor. Lower is better; None = no match.
+///   0: exact class + title prefix (the pick-time window, same session)
+///   1: exact class, any title
+///   2: same MFC stable prefix (game relaunched), visible, not ours; title must match when stored
+///   3: title prefix only (class changed entirely), visible, not ours
+/// Tiers 0/1 skip the visibility test to preserve the old FindWindowW semantics exactly.
+fn match_tier(
+    stored_class: &str,
+    afx_prefix: Option<&str>,
+    stored_title: &str,
+    actual_class: &str,
+    actual_title: &str,
+    visible: bool,
+    own_process: bool,
+) -> Option<u8> {
+    let title_ok = !stored_title.is_empty() && actual_title.starts_with(stored_title);
+    if actual_class == stored_class {
+        return Some(if title_ok { 0 } else { 1 });
+    }
+    if !visible || own_process {
+        return None;
+    }
+    if let Some(prefix) = afx_prefix {
+        if actual_class.starts_with(prefix) && (stored_title.is_empty() || title_ok) {
+            return Some(2);
         }
-        hwnd = FindWindowExW(std::ptr::null_mut(), hwnd, class_ptr, std::ptr::null());
+    }
+    if title_ok {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+struct FindCtx<'a> {
+    stored_class: &'a str,
+    afx_prefix: Option<&'a str>,
+    stored_title: &'a str,
+    own_pid: u32,
+    foreground: HWND,
+    best: HWND,
+    best_tier: u8,
+}
+
+/// Read a live window's identity and score it. Safe against hung windows: `GetClassNameW` sends
+/// no messages, and `GetWindowTextW` on another process's window reads the cached title without
+/// sending WM_GETTEXT.
+unsafe fn window_tier(hwnd: HWND, ctx: &FindCtx) -> Option<u8> {
+    let mut cbuf = [0u16; 256];
+    let clen = GetClassNameW(hwnd, cbuf.as_mut_ptr(), cbuf.len() as i32) as usize;
+    let class = String::from_utf16_lossy(&cbuf[..clen]);
+    let mut tbuf = [0u16; 256];
+    let tlen = GetWindowTextW(hwnd, tbuf.as_mut_ptr(), tbuf.len() as i32) as usize;
+    let title = String::from_utf16_lossy(&tbuf[..tlen]);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    match_tier(
+        ctx.stored_class,
+        ctx.afx_prefix,
+        ctx.stored_title,
+        &class,
+        &title,
+        IsWindowVisible(hwnd) != 0,
+        pid == ctx.own_pid,
+    )
+}
+
+unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: isize) -> i32 {
+    let ctx = &mut *(lparam as *mut FindCtx);
+    if let Some(tier) = window_tier(hwnd, ctx) {
+        if tier < ctx.best_tier || (tier == ctx.best_tier && hwnd == ctx.foreground) {
+            ctx.best = hwnd;
+            ctx.best_tier = tier;
+        }
+        if tier == 0 && hwnd == ctx.foreground {
+            return 0; // can't do better; stop enumerating
+        }
+    }
+    1
+}
+
+// Resolved-window cache. The monitor calls the finder every 10 ms tick, so a full EnumWindows
+// each time would be wasteful; conversely, re-scanning at most every 2 s lets a weak title-only
+// match upgrade itself shortly after the real game window (re)appears.
+static CACHED_HWND: AtomicIsize = AtomicIsize::new(0);
+static LAST_ENUM_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_TIER: AtomicU32 = AtomicU32::new(u32::MAX);
+const REENUM_INTERVAL_MS: u64 = 2000;
+
+/// Find the game window for a stored (class, title) anchor, tolerating the class changes a game
+/// relaunch causes. Returns null when nothing matches. Shared by the bar monitor, Burst Q's
+/// focus check, and the Settings "Sample" button so they always agree on the window.
+pub(crate) unsafe fn find_game_window(stored_class: &str, stored_title: &str) -> HWND {
+    let now = now_ms();
+    let afx = afx_stable_prefix(stored_class);
+    let mut ctx = FindCtx {
+        stored_class,
+        afx_prefix: afx.as_deref(),
+        stored_title,
+        own_pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+        foreground: GetForegroundWindow(),
+        best: std::ptr::null_mut(),
+        best_tier: u8::MAX,
+    };
+
+    // Trust the cached handle while it still exists and still matches the anchor we were
+    // handed (a re-pick mid-session changes the anchor; HWND values can also be recycled).
+    let cached = CACHED_HWND.load(Ordering::Acquire) as HWND;
+    if !cached.is_null()
+        && now.saturating_sub(LAST_ENUM_MS.load(Ordering::Acquire)) < REENUM_INTERVAL_MS
+        && IsWindow(cached) != 0
+        && window_tier(cached, &ctx).is_some()
+    {
+        return cached;
     }
 
-    FindWindowW(class_ptr, std::ptr::null())
+    LAST_ENUM_MS.store(now, Ordering::Release);
+    EnumWindows(Some(enum_windows_cb), &mut ctx as *mut FindCtx as isize);
+    CACHED_HWND.store(ctx.best as isize, Ordering::Release);
+
+    let tier = if ctx.best.is_null() { u32::MAX } else { ctx.best_tier as u32 };
+    if LAST_TIER.swap(tier, Ordering::AcqRel) != tier {
+        match tier {
+            u32::MAX => println!("[Cadence] Game window lost."),
+            t => println!("[Cadence] Game window resolved (tier {}).", t),
+        }
+    }
+    ctx.best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REAL: &str = "Afx:00400000:8:00010003:00900011:024A1B55";
+    const RELAUNCHED: &str = "Afx:00400000:8:00020007:00A10035:0F1A2B3C";
+
+    #[test]
+    fn afx_prefix_of_real_class() {
+        assert_eq!(afx_stable_prefix(REAL).as_deref(), Some("Afx:00400000:8:"));
+    }
+
+    #[test]
+    fn afx_prefix_requires_volatile_fields() {
+        assert_eq!(afx_stable_prefix("Afx:00400000:8"), None); // short form: exact match covers it
+        assert_eq!(afx_stable_prefix("Afx:00400000"), None);
+        assert_eq!(afx_stable_prefix("Afx:"), None);
+        assert_eq!(afx_stable_prefix(""), None);
+    }
+
+    #[test]
+    fn afx_prefix_rejects_non_afx() {
+        assert_eq!(afx_stable_prefix("Notepad"), None);
+        assert_eq!(afx_stable_prefix("AfxFrameOrView140u"), None);
+        assert_eq!(afx_stable_prefix("Afxx:1:2:3:4:5"), None);
+    }
+
+    fn tier(actual_class: &str, actual_title: &str, visible: bool, own: bool) -> Option<u8> {
+        let afx = afx_stable_prefix(REAL);
+        match_tier(REAL, afx.as_deref(), "Ran Client", actual_class, actual_title, visible, own)
+    }
+
+    #[test]
+    fn tier0_exact_class_and_title() {
+        assert_eq!(tier(REAL, "Ran Client", true, false), Some(0));
+        // Title matching is a prefix match, like the old finder.
+        assert_eq!(tier(REAL, "Ran Client - Char", true, false), Some(0));
+        // Exact class doesn't require visibility (old FindWindowW semantics).
+        assert_eq!(tier(REAL, "Ran Client", false, false), Some(0));
+    }
+
+    #[test]
+    fn tier1_exact_class_wrong_title() {
+        assert_eq!(tier(REAL, "Loading", true, false), Some(1));
+        // Empty stored title: class match lands on tier 1.
+        let afx = afx_stable_prefix(REAL);
+        assert_eq!(match_tier(REAL, afx.as_deref(), "", REAL, "anything", true, false), Some(1));
+    }
+
+    #[test]
+    fn tier2_relaunch_changes_volatile_fields() {
+        assert_eq!(tier(RELAUNCHED, "Ran Client", true, false), Some(2));
+        assert_eq!(tier(RELAUNCHED, "Ran Client", false, false), None); // must be visible
+        assert_eq!(tier(RELAUNCHED, "Other", true, false), None); // stored title must match
+        assert_eq!(tier(RELAUNCHED, "Ran Client", true, true), None); // never our own window
+    }
+
+    #[test]
+    fn tier2_prefix_boundary() {
+        // "Afx:00400000:8:" must not match a class whose style field merely starts with '8'.
+        assert_eq!(tier("Afx:00400000:80:x:y:z", "Some Title", true, false), None);
+        // …but the title fallback still applies if the title matches.
+        assert_eq!(tier("Afx:00400000:80:x:y:z", "Ran Client", true, false), Some(3));
+    }
+
+    #[test]
+    fn tier2_with_empty_stored_title() {
+        let afx = afx_stable_prefix(REAL);
+        assert_eq!(
+            match_tier(REAL, afx.as_deref(), "", RELAUNCHED, "whatever", true, false),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn tier3_title_only() {
+        assert_eq!(tier("SomeOtherClass", "Ran Client", true, false), Some(3));
+        assert_eq!(tier("SomeOtherClass", "Ran Client", true, true), None); // own process
+        assert_eq!(tier("SomeOtherClass", "Ran Client", false, false), None); // invisible
+        // Empty stored title disables the title fallback entirely.
+        let afx: Option<String> = None;
+        assert_eq!(
+            match_tier("SomeClass", afx.as_deref(), "", "Other", "Anything", true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn no_match_at_all() {
+        assert_eq!(tier("Explorer", "Recycle Bin", true, false), None);
+    }
+
+    /// Live test: requires a running RAN client. Feeds the finder the anchor a PREVIOUS
+    /// game session would have stored (same stable Afx prefix, different volatile
+    /// GDI-handle tail) and asserts it resolves to the live game window anyway — the
+    /// exact "game relaunched, config is stale" scenario. Run with:
+    /// `cargo test live_finds -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_finds_relaunched_game_window() {
+        let stale = "Afx:00400000:8:0000DEAD:0000BEEF:00C0FFEE";
+        let hwnd = unsafe { find_game_window(stale, "Ran Client") };
+        assert!(!hwnd.is_null(), "no window matched the stale anchor — is the game running?");
+        let mut buf = [0u16; 256];
+        let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), 256) } as usize;
+        let class = String::from_utf16_lossy(&buf[..len]);
+        println!("resolved live game window: class = {}", class);
+        assert!(class.starts_with("Afx:00400000:8:"), "resolved wrong window: {}", class);
+        assert_ne!(class, stale, "matched the stale class exactly — that can't happen live");
+    }
 }

@@ -11,6 +11,12 @@ use winapi::um::winuser::*;
 
 const GA_ROOT: u32 = 2;
 
+// Dialog design size (96-DPI units). Two columns — left: hotkeys + HP/MP/SP monitors,
+// right: Burst Q + Proximity — so the whole dialog (OK button included) fits a
+// 1024×768 screen even at 125% display scaling.
+const DIALOG_W: i32 = 640;
+const DIALOG_H: i32 = 560;
+
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 // Per-bar sampled color, indexed 0=HP, 1=MP, 2=SP.
 static SAMPLED_COLOR: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
@@ -148,40 +154,47 @@ unsafe fn layout(hwnd: HWND) {
     let m = scale(12, dpi);
     let right = cw - m;
 
-    // Full-width dividers + live-picker readouts.
-    for id in [
-        IDC_SETTINGS_DIV1, IDC_SETTINGS_DIV2, IDC_SETTINGS_DIV3,
-        IDC_STATIC_HP_LIVE, IDC_STATIC_MP_LIVE, IDC_STATIC_SP_LIVE,
-        IDC_EDIT_PROX_WATCH,
-    ] {
+    // Only the RIGHT column follows the window's right edge; the left column (hotkeys +
+    // bar monitors) and the vertical divider keep their created widths.
+    for id in [IDC_SETTINGS_DIV3, IDC_EDIT_PROX_WATCH] {
         stretch_to_right(hwnd, id, right, dpi, false);
     }
-    // Combos that span to the right edge.
-    for id in [
-        IDC_COMBO_RECORD_KEY, IDC_COMBO_PLAY_KEY, IDC_COMBO_QUEUE_KEY,
-        IDC_COMBO_PROX_IFACE, IDC_COMBO_PROX_ACTION, IDC_COMBO_PROX_TRIGGER,
-    ] {
+    // Right-column combos that span to the right edge.
+    for id in [IDC_COMBO_PROX_IFACE, IDC_COMBO_PROX_ACTION, IDC_COMBO_PROX_TRIGGER] {
         stretch_to_right(hwnd, id, right, dpi, true);
     }
 
-    // OK floats to the bottom-centre, but never above the last content control (the Detected
-    // Players button) — so a short window can't make it overlap. Grows downward with the window.
+    // OK floats to the bottom-centre, but never above the bottom of the TALLEST column
+    // (left: SP live readout; right: Players button) — so a short window can't make it
+    // overlap content. The min-track size guarantees the client can always hold the floor.
     let ok_w = scale(70, dpi);
     let ok_h = scale(28, dpi);
     let ok = GetDlgItem(hwnd, IDC_BTN_SETTINGS_OK as i32);
     if !ok.is_null() {
         let gap = scale(12, dpi);
-        let mut floor = m; // fallback if the Players button can't be located
-        let players = GetDlgItem(hwnd, IDC_BTN_PROX_PLAYERS as i32);
-        if !players.is_null() {
-            let mut pr: RECT = std::mem::zeroed();
-            GetWindowRect(players, &mut pr);
-            let mut pbl = POINT { x: pr.left, y: pr.bottom };
-            ScreenToClient(hwnd, &mut pbl);
-            floor = pbl.y + gap;
+        let mut floor = m; // fallback if neither column-bottom control can be located
+        for id in [IDC_STATIC_SP_LIVE, IDC_BTN_PROX_PLAYERS] {
+            let h = GetDlgItem(hwnd, id as i32);
+            if !h.is_null() {
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(h, &mut r);
+                let mut bl = POINT { x: r.left, y: r.bottom };
+                ScreenToClient(hwnd, &mut bl);
+                floor = floor.max(bl.y + gap);
+            }
         }
         let ok_y = (ch - m - ok_h).max(floor).max(0);
         MoveWindow(ok, (cw - ok_w) / 2, ok_y, ok_w, ok_h, TRUE);
+
+        // Stretch the vertical column divider down to the content floor.
+        let div = GetDlgItem(hwnd, IDC_SETTINGS_DIV2 as i32);
+        if !div.is_null() {
+            let mut dr: RECT = std::mem::zeroed();
+            GetWindowRect(div, &mut dr);
+            let mut dtl = POINT { x: dr.left, y: dr.top };
+            ScreenToClient(hwnd, &mut dtl);
+            MoveWindow(div, dtl.x, dtl.y, dr.right - dr.left, (floor - gap - dtl.y).max(0), TRUE);
+        }
     }
 }
 
@@ -198,8 +211,15 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
     let mut parent_rect: RECT = std::mem::zeroed();
     GetWindowRect(parent, &mut parent_rect);
 
-    let sx = parent_rect.left;
-    let sy = parent_rect.bottom + 4;
+    // Clamp the opening position to the work area so the dialog (and its OK button) can
+    // never spawn below the bottom of a low-resolution screen. SPI_GETWORKAREA is the
+    // primary monitor's work area — good enough, the toolbar lives there on the VMs.
+    let dpi = dpi_for_window(parent);
+    let (w_px, h_px) = (scale(DIALOG_W, dpi), scale(DIALOG_H, dpi));
+    let mut work: RECT = std::mem::zeroed();
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut RECT as *mut _, 0);
+    let sx = parent_rect.left.min(work.right - w_px).max(work.left);
+    let sy = (parent_rect.bottom + 4).min(work.bottom - h_px).max(work.top);
 
     // Version in the title so users can say which build they're on when reporting something.
     let title = format!("Settings \u{2014} Cadence {}", crate::update::current_version());
@@ -210,7 +230,7 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
         // Resizable: WS_THICKFRAME + WS_MAXIMIZEBOX let the user widen/maximize the dialog;
         // WM_SIZE reflows the width-following controls and re-pins OK to the bottom.
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE,
-        sx, sy, 312, 892,
+        sx, sy, DIALOG_W, DIALOG_H,
         parent, hinstance,
     );
     SETTINGS_HWND.store(hwnd as isize, Ordering::Release);
@@ -280,17 +300,19 @@ unsafe extern "system" fn settings_wnd_proc(
                 IDC_EDIT_SP_X, IDC_EDIT_SP_Y, IDC_BTN_SP_PICK, IDC_BTN_SP_SAMPLE,
                 IDC_STATIC_SP_COLOR, IDC_STATIC_SP_LIVE);
 
+            // Vertical divider between the two columns (left: hotkeys + bar monitors,
+            // right: Burst + Proximity). Repurposes the old DIV2 id.
             create_control(hwnd, hinstance, font, "STATIC", "",
-                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 468, 272, 2, IDC_SETTINGS_DIV2);
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDVERT, 0, 307, 12, 2, 446, IDC_SETTINGS_DIV2);
 
-            // -- Burst Q --
+            // -- Burst Q (right column) --
             create_control(hwnd, hinstance, font, "STATIC", "\u{2014} Burst Q \u{2014}",
-                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, 480, 272, 18, 0);
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 332, 12, 272, 18, 0);
             create_control(hwnd, hinstance, font, "STATIC", "Hotkey:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 510, 50, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 42, 50, 20, 0);
             create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                66, 506, 120, 200, IDC_COMBO_BURST_KEY);
+                386, 38, 120, 200, IDC_COMBO_BURST_KEY);
             let h_combo_burst = GetDlgItem(hwnd, IDC_COMBO_BURST_KEY as i32);
             SendMessageW(h_combo_burst, CB_ADDSTRING, 0, wide("(None)").as_ptr() as LPARAM);
             let current_burst_vk = hotkeys::current_burst_vk();
@@ -304,27 +326,27 @@ unsafe extern "system" fn settings_wnd_proc(
                 }
             }
             create_control(hwnd, hinstance, font, "STATIC", "Rate (Hz):",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 540, 60, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 72, 60, 20, 0);
             create_control(hwnd, hinstance, font, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
-                76, 536, 60, 22, IDC_EDIT_BURST_RATE);
+                396, 68, 60, 22, IDC_EDIT_BURST_RATE);
             create_control(hwnd, hinstance, font, "STATIC", "(50-200, default 100)",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 144, 540, 140, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 464, 72, 140, 20, 0);
 
             create_control(hwnd, hinstance, font, "STATIC", "",
-                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 572, 272, 2, IDC_SETTINGS_DIV3);
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 332, 104, 272, 2, IDC_SETTINGS_DIV3);
 
             // -- Proximity Alert --
             // Configuration only. Arming/disarming detection is the toolbar "Det" checkbox
             // (one control, one source of truth). Server IP is always auto-discovered.
             let pcfg = config::cached_config();
             create_control(hwnd, hinstance, font, "STATIC", "\u{2014} Proximity Alert \u{2014}",
-                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, 584, 272, 18, 0);
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 332, 116, 272, 18, 0);
             create_control(hwnd, hinstance, font, "STATIC", "Interface:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 618, 58, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 150, 58, 20, 0);
             create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                72, 614, 212, 240, IDC_COMBO_PROX_IFACE);
+                392, 146, 212, 240, IDC_COMBO_PROX_IFACE);
             let h_iface = GetDlgItem(hwnd, IDC_COMBO_PROX_IFACE as i32);
             SendMessageW(h_iface, CB_ADDSTRING, 0, wide("(Auto-select)").as_ptr() as LPARAM);
             let devices = proximity::list_devices();
@@ -341,26 +363,26 @@ unsafe extern "system" fn settings_wnd_proc(
             SendMessageW(h_iface, CB_SETCURSEL, sel_iface as WPARAM, 0);
             *lock_or_recover(&PROX_DEVICES) = dev_names;
             create_control(hwnd, hinstance, font, "STATIC", "Key:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 652, 28, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 184, 28, 20, 0);
             create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                42, 648, 84, 200, IDC_COMBO_PROX_KEY);
+                362, 180, 84, 200, IDC_COMBO_PROX_KEY);
             populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PROX_KEY as i32), REMOTE_KEY_OPTIONS, Some(pcfg.proximity_vk));
             // Trigger: react to everyone, or only to staff (see the GM names box below).
             create_control(hwnd, hinstance, font, "STATIC", "Trigger:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 134, 652, 48, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 454, 184, 48, 20, 0);
             create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                186, 648, 98, 200, IDC_COMBO_PROX_TRIGGER);
+                506, 180, 98, 200, IDC_COMBO_PROX_TRIGGER);
             let h_trigger = GetDlgItem(hwnd, IDC_COMBO_PROX_TRIGGER as i32);
             SendMessageW(h_trigger, CB_ADDSTRING, 0, wide("Any player").as_ptr() as LPARAM);
             SendMessageW(h_trigger, CB_ADDSTRING, 0, wide("GM only").as_ptr() as LPARAM);
             SendMessageW(h_trigger, CB_SETCURSEL, pcfg.proximity_watch_only as WPARAM, 0);
             create_control(hwnd, hinstance, font, "STATIC", "On detect:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 686, 62, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 218, 62, 20, 0);
             create_control(hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                76, 682, 208, 240, IDC_COMBO_PROX_ACTION);
+                396, 214, 208, 240, IDC_COMBO_PROX_ACTION);
             // "(Press Key)" uses the Key above; otherwise play the chosen recorded sequence.
             let h_action = GetDlgItem(hwnd, IDC_COMBO_PROX_ACTION as i32);
             SendMessageW(h_action, CB_ADDSTRING, 0, wide("(Press Key)").as_ptr() as LPARAM);
@@ -378,11 +400,11 @@ unsafe extern "system" fn settings_wnd_proc(
             // tokens against a player's name, <badge>, nick and guild — one per line or comma-
             // separated. "*" and "?" wildcards are allowed (e.g. "*portal*").
             create_control(hwnd, hinstance, font, "STATIC", "GM names:",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 716, 62, 20, 0);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 248, 62, 20, 0);
             create_control(hwnd, hinstance, font, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL
                     | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_WANTRETURN as u32,
-                0, 76, 712, 208, 48, IDC_EDIT_PROX_WATCH);
+                0, 396, 244, 208, 48, IDC_EDIT_PROX_WATCH);
             let watch_text = if pcfg.proximity_watch.is_empty() {
                 proximity::DEFAULT_WATCH.join(", ")
             } else {
@@ -391,15 +413,15 @@ unsafe extern "system" fn settings_wnd_proc(
             SendMessageW(GetDlgItem(hwnd, IDC_EDIT_PROX_WATCH as i32), WM_SETTEXT, 0,
                 wide(&watch_text).as_ptr() as LPARAM);
             create_control(hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, 768, 200, 26, IDC_BTN_PROX_PLAYERS);
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 332, 300, 200, 26, IDC_BTN_PROX_PLAYERS);
             // Manual update check; the automatic one runs at launch. Slots into the gap left by
             // the Players button on the same row, so the dialog doesn't grow.
             create_control(hwnd, hinstance, font, "BUTTON", "Update",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 216, 768, 68, 26, IDC_BTN_UPDATE);
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 536, 300, 68, 26, IDC_BTN_UPDATE);
 
             // OK button (re-pinned to the window bottom by layout()).
             create_control(hwnd, hinstance, font, "BUTTON", "OK",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 121, 808, 70, 28, IDC_BTN_SETTINGS_OK);
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 285, 470, 70, 28, IDC_BTN_SETTINGS_OK);
 
             // Pre-fill the monitor X/Y/color fields and the burst rate from config (single fetch).
             // HP/MP/SP share one game window, so the sampled class/title come from HP's config.
@@ -477,36 +499,12 @@ unsafe extern "system" fn settings_wnd_proc(
                     let class = lock_or_recover(&SAMPLED_CLASS).clone();
                     let title = lock_or_recover(&SAMPLED_TITLE).clone();
 
+                    // Resolve through the same tiered finder the live monitor uses, so
+                    // Sample and the monitor always agree on which window they read.
                     let (sample_hwnd, sample_x, sample_y) = if class.is_empty() {
                         (std::ptr::null_mut(), x, y)
                     } else {
-                        let class_w = wide(&class);
-                        let mut found: HWND = FindWindowExW(
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            class_w.as_ptr(),
-                            std::ptr::null(),
-                        );
-                        if !title.is_empty() {
-                            while !found.is_null() {
-                                let mut buf = [0u16; 256];
-                                let len = GetWindowTextW(found, buf.as_mut_ptr(), buf.len() as i32) as usize;
-                                let actual = String::from_utf16_lossy(&buf[..len]);
-                                if actual.starts_with(&title) {
-                                    break;
-                                }
-                                found = FindWindowExW(
-                                    std::ptr::null_mut(),
-                                    found,
-                                    class_w.as_ptr(),
-                                    std::ptr::null(),
-                                );
-                            }
-                            if found.is_null() {
-                                found = FindWindowW(class_w.as_ptr(), std::ptr::null());
-                            }
-                        }
-                        (found, x, y)
+                        (crate::monitor::find_game_window(&class, &title), x, y)
                     };
 
                     if !class.is_empty() && sample_hwnd.is_null() {
@@ -556,6 +554,9 @@ unsafe extern "system" fn settings_wnd_proc(
                     // automatic startup check does.
                     Ok(Some(info)) => unsafe {
                         crate::update::set_pending(info);
+                        // Latch the gate exactly like the periodic poll does, so a poll
+                        // firing now can't stack a second prompt on this one.
+                        crate::update::set_prompt_active(true);
                         PostMessageW(tb as HWND, WM_APP_UPDATE_AVAILABLE, 0, 0);
                     },
                     Ok(None) => unsafe {
@@ -936,8 +937,8 @@ unsafe extern "system" fn settings_wnd_proc(
         WM_GETMINMAXINFO => {
             let dpi = dpi_for_window(hwnd);
             let mmi = &mut *(l_param as *mut MINMAXINFO);
-            mmi.ptMinTrackSize.x = scale(312, dpi);
-            mmi.ptMinTrackSize.y = scale(892, dpi);
+            mmi.ptMinTrackSize.x = scale(DIALOG_W, dpi);
+            mmi.ptMinTrackSize.y = scale(DIALOG_H, dpi);
             0
         }
         WM_CLOSE => {
