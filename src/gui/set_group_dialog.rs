@@ -51,16 +51,15 @@ unsafe extern "system" fn set_group_wnd_proc(
                 10, 14, 42, 20, 0,
             );
 
+            // Pre-fill with the first selected sequence's group; the entered group is
+            // applied to every selected sequence on OK.
             let current_group = {
-                let guard = lock_or_recover(&SET_GROUP_SEQ_NAME);
-                if let Some(ref filename) = *guard {
-                    storage::load_sequence(filename)
-                        .ok()
-                        .and_then(|seq| seq.group)
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
+                let guard = lock_or_recover(&SET_GROUP_SEQ_NAMES);
+                guard
+                    .first()
+                    .and_then(|filename| storage::load_sequence(filename).ok())
+                    .and_then(|seq| seq.group)
+                    .unwrap_or_default()
             };
 
             let wgroup = wide(&current_group);
@@ -107,20 +106,26 @@ unsafe extern "system" fn set_group_wnd_proc(
                 let len = GetWindowTextW(h_edit, buf.as_mut_ptr(), buf.len() as i32);
                 let new_group = String::from_utf16_lossy(&buf[..len as usize]).trim().to_string();
 
-                let seq_filename = lock_or_recover(&SET_GROUP_SEQ_NAME).clone();
-                if let Some(filename) = seq_filename {
-                    match storage::load_sequence(&filename) {
+                let seq_filenames = lock_or_recover(&SET_GROUP_SEQ_NAMES).clone();
+                for filename in &seq_filenames {
+                    match storage::load_sequence(filename) {
                         Ok(mut seq) => {
-                            seq.group = if new_group.is_empty() { None } else { Some(new_group) };
+                            seq.group = if new_group.is_empty() {
+                                None
+                            } else {
+                                Some(new_group.clone())
+                            };
                             if let Err(e) = storage::save_sequence(&seq) {
                                 eprintln!("[Cadence] Failed to save group: {}", e);
                             }
-                            sequences::refresh_sequences_list();
                         }
                         Err(e) => {
                             eprintln!("[Cadence] Failed to load sequence for group update: {}", e);
                         }
                     }
+                }
+                if !seq_filenames.is_empty() {
+                    sequences::refresh_sequences_list();
                 }
 
                 DestroyWindow(hwnd);

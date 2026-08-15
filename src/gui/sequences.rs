@@ -71,9 +71,11 @@ unsafe extern "system" fn sequences_wnd_proc(
                 10, 2, 200, 16, 0,
             );
 
+            // Extended selection: click, Shift+click for ranges, Ctrl+click to toggle —
+            // so Delete / >> / Set Group / Play can act on many sequences at once.
             let h_list = create_control(
                 hwnd, hinstance, font, "LISTBOX", "",
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY as u32,
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY as u32 | LBS_EXTENDEDSEL as u32,
                 WS_EX_CLIENTEDGE as u32,
                 10, 20, 220, 290, IDC_LIST_SEQUENCES,
             );
@@ -101,7 +103,7 @@ unsafe extern "system" fn sequences_wnd_proc(
 
             create_control(
                 hwnd, hinstance, font, "LISTBOX", "",
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY as u32,
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY as u32 | LBS_EXTENDEDSEL as u32,
                 WS_EX_CLIENTEDGE as u32,
                 286, 20, 220, 290, IDC_LIST_QUEUE,
             );
@@ -158,6 +160,12 @@ unsafe extern "system" fn sequences_wnd_proc(
                 96, 385, 80, 30, IDC_BTN_SET_GROUP,
             );
 
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Select All",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                182, 385, 86, 30, IDC_BTN_SELECT_ALL,
+            );
+
             // Shuffle checkbox
             let chk_shuffle = create_control(
                 hwnd, hinstance, font, "BUTTON", "Shuffle",
@@ -189,6 +197,11 @@ unsafe extern "system" fn sequences_wnd_proc(
                 x if x == IDC_BTN_SET_DEFAULT => handle_set_default(hwnd),
                 x if x == IDC_BTN_RENAME_SEQ => handle_rename_seq(hwnd),
                 x if x == IDC_BTN_SET_GROUP => handle_set_group(hwnd),
+                x if x == IDC_BTN_SELECT_ALL => {
+                    let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
+                    // Select every row; headers get filtered out by the bulk operations.
+                    SendMessageW(h_list, LB_SETSEL, 1, -1isize);
+                }
                 x if x == IDC_LIST_SEQUENCES => {
                     if HIWORD(w_param as u32) == LBN_SELCHANGE {
                         handle_list_click(hwnd);
@@ -226,37 +239,52 @@ unsafe fn handle_bind_key(hwnd: HWND) {
 }
 
 unsafe fn handle_delete_seq(hwnd: HWND) {
-    if let Some(name) = get_selected_sequence_name(hwnd) {
-        let msg = wide(&format!("Delete \"{}\"?", name));
-        let title = wide("Confirm Delete");
-        let result = MessageBoxW(
-            hwnd,
-            msg.as_ptr(),
-            title.as_ptr(),
-            MB_YESNO | MB_ICONQUESTION,
-        );
-        if result == IDYES {
-            if let Err(e) = storage::delete_sequence(&name) {
-                eprintln!("[Cadence] Failed to delete sequence: {}", e);
-            }
-            refresh_bindings();
-            // Clear default sequence if it was the deleted one
-            let mut cfg = config::load_config();
-            if cfg.default_sequence.as_deref() == Some(&name) {
-                cfg.default_sequence = None;
-                let _ = config::save_config(&cfg);
-            }
-            // Forget the last-played memory if it named the deleted sequence.
-            if storage::last_played().name == name {
-                storage::set_last_played(String::new(), Vec::new());
-            }
-            lock_or_recover(&SEQUENCE_QUEUE).retain(|n| n != &name);
-            let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
-            SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
-            populate_sequences_list(h_list);
-            refresh_queue_list(hwnd);
+    let names = get_selected_sequence_names(hwnd);
+    if names.is_empty() {
+        return;
+    }
+    // One confirmation for the whole selection; list a handful of names, then a count.
+    let shown: Vec<&str> = names.iter().take(8).map(|n| n.as_str()).collect();
+    let listing = if names.len() > shown.len() {
+        format!("{}\n\u{2026}and {} more", shown.join("\n"), names.len() - shown.len())
+    } else {
+        shown.join("\n")
+    };
+    let prompt = if names.len() == 1 {
+        format!("Delete \"{}\"?", names[0])
+    } else {
+        format!("Delete these {} sequences?\n\n{}", names.len(), listing)
+    };
+    let result = MessageBoxW(hwnd, wide(&prompt).as_ptr(), wide("Confirm Delete").as_ptr(),
+        MB_YESNO | MB_ICONQUESTION);
+    if result != IDYES {
+        return;
+    }
+    let mut cfg = config::load_config();
+    let mut cfg_changed = false;
+    for name in &names {
+        if let Err(e) = storage::delete_sequence(name) {
+            eprintln!("[Cadence] Failed to delete sequence: {}", e);
+        }
+        // Clear default sequence if it was among the deleted
+        if cfg.default_sequence.as_deref() == Some(name.as_str()) {
+            cfg.default_sequence = None;
+            cfg_changed = true;
+        }
+        // Forget the last-played memory if it named a deleted sequence.
+        if storage::last_played().name == *name {
+            storage::set_last_played(String::new(), Vec::new());
         }
     }
+    if cfg_changed {
+        let _ = config::save_config(&cfg);
+    }
+    refresh_bindings();
+    lock_or_recover(&SEQUENCE_QUEUE).retain(|n| !names.contains(n));
+    let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
+    SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
+    populate_sequences_list(h_list);
+    refresh_queue_list(hwnd);
 }
 
 unsafe fn handle_set_default(hwnd: HWND) {
@@ -281,15 +309,18 @@ unsafe fn handle_rename_seq(hwnd: HWND) {
 }
 
 unsafe fn handle_set_group(hwnd: HWND) {
-    if let Some(name) = get_selected_sequence_name(hwnd) {
-        *lock_or_recover(&SET_GROUP_SEQ_NAME) = Some(name);
+    let names = get_selected_sequence_names(hwnd);
+    if !names.is_empty() {
+        *lock_or_recover(&SET_GROUP_SEQ_NAMES) = names;
         set_group_dialog::show_set_group_dialog(hwnd);
     }
 }
 
 unsafe fn handle_list_click(hwnd: HWND) {
     let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
-    let idx = SendMessageW(h_list, LB_GETCURSEL, 0, 0);
+    // Caret = the item actually clicked; LB_GETCURSEL is not meaningful on an
+    // extended-selection list box.
+    let idx = SendMessageW(h_list, LB_GETCARETINDEX, 0, 0);
     if idx < 0 { return; }
 
     // Only act on header items (data = 0); sequence items (data = 1) are ignored
@@ -318,42 +349,74 @@ unsafe fn handle_list_click(hwnd: HWND) {
 }
 
 unsafe fn handle_play_seq(hwnd: HWND) {
-    if let Some(name) = get_selected_sequence_name(hwnd) {
-        if !player::is_playing() && !recorder::is_recording() {
-            if let Ok(seq) = storage::load_sequence(&name) {
-                *lock_or_recover(&LAST_EVENTS) = Some(seq.events.clone());
-                player::set_source(player::PlaybackSource::Sequence(name.clone()));
-                player::play_sequence(seq.events);
-                refresh_sequences_list(); // move the "last played" marker immediately
+    let names = get_selected_sequence_names(hwnd);
+    if names.is_empty() || player::is_playing() || recorder::is_recording() {
+        return;
+    }
+    if names.len() == 1 {
+        if let Ok(seq) = storage::load_sequence(&names[0]) {
+            *lock_or_recover(&LAST_EVENTS) = Some(seq.events.clone());
+            player::set_source(player::PlaybackSource::Sequence(names[0].clone()));
+            player::play_sequence(seq.events);
+            refresh_sequences_list(); // move the "last played" marker immediately
+        }
+    } else {
+        // Several selected: play them back-to-back as an ad-hoc queue, in list order.
+        let mut event_lists = Vec::new();
+        for name in &names {
+            if let Ok(seq) = storage::load_sequence(name) {
+                event_lists.push(seq.events);
             }
+        }
+        if !event_lists.is_empty() {
+            player::set_source(player::PlaybackSource::Queue(names));
+            player::play_queue(event_lists);
+            refresh_sequences_list();
         }
     }
 }
 
 unsafe fn handle_queue_add(hwnd: HWND) {
-    if let Some(name) = get_selected_sequence_name(hwnd) {
-        lock_or_recover(&SEQUENCE_QUEUE).push(name);
+    let names = get_selected_sequence_names(hwnd);
+    if !names.is_empty() {
+        lock_or_recover(&SEQUENCE_QUEUE).extend(names);
         refresh_queue_list(hwnd);
     }
 }
 
 unsafe fn handle_queue_remove(hwnd: HWND) {
     let h_queue = GetDlgItem(hwnd, IDC_LIST_QUEUE as i32);
-    let idx = SendMessageW(h_queue, LB_GETCURSEL, 0, 0);
-    if idx >= 0 {
-        let idx = idx as usize;
-        let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
-        if idx < queue.len() {
-            queue.remove(idx);
-        }
-        drop(queue);
-        refresh_queue_list(hwnd);
+    let count = SendMessageW(h_queue, LB_GETSELCOUNT, 0, 0);
+    if count <= 0 {
+        return;
     }
+    let mut idxs = vec![0i32; count as usize];
+    let got = SendMessageW(h_queue, LB_GETSELITEMS, count as WPARAM, idxs.as_mut_ptr() as LPARAM);
+    if got <= 0 {
+        return;
+    }
+    // Remove back-to-front so earlier indices stay valid.
+    idxs[..got as usize].sort_unstable_by(|a, b| b.cmp(a));
+    let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
+    for &idx in &idxs[..got as usize] {
+        if (idx as usize) < queue.len() {
+            queue.remove(idx as usize);
+        }
+    }
+    drop(queue);
+    refresh_queue_list(hwnd);
+}
+
+/// Re-select one row after a reorder (extended-sel lists use LB_SETSEL, not LB_SETCURSEL).
+unsafe fn select_queue_row(h_queue: HWND, idx: usize) {
+    SendMessageW(h_queue, LB_SETSEL, 0, -1isize); // clear
+    SendMessageW(h_queue, LB_SETSEL, 1, idx as LPARAM);
+    SendMessageW(h_queue, LB_SETCARETINDEX, idx as WPARAM, 0);
 }
 
 unsafe fn handle_queue_up(hwnd: HWND) {
     let h_queue = GetDlgItem(hwnd, IDC_LIST_QUEUE as i32);
-    let idx = SendMessageW(h_queue, LB_GETCURSEL, 0, 0);
+    let idx = SendMessageW(h_queue, LB_GETCARETINDEX, 0, 0);
     if idx > 0 {
         let idx = idx as usize;
         let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
@@ -362,13 +425,13 @@ unsafe fn handle_queue_up(hwnd: HWND) {
         }
         drop(queue);
         refresh_queue_list(hwnd);
-        SendMessageW(h_queue, LB_SETCURSEL, (idx - 1) as WPARAM, 0);
+        select_queue_row(h_queue, idx - 1);
     }
 }
 
 unsafe fn handle_queue_down(hwnd: HWND) {
     let h_queue = GetDlgItem(hwnd, IDC_LIST_QUEUE as i32);
-    let idx = SendMessageW(h_queue, LB_GETCURSEL, 0, 0);
+    let idx = SendMessageW(h_queue, LB_GETCARETINDEX, 0, 0);
     if idx >= 0 {
         let idx = idx as usize;
         let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
@@ -376,7 +439,7 @@ unsafe fn handle_queue_down(hwnd: HWND) {
             queue.swap(idx, idx + 1);
             drop(queue);
             refresh_queue_list(hwnd);
-            SendMessageW(h_queue, LB_SETCURSEL, (idx + 1) as WPARAM, 0);
+            select_queue_row(h_queue, idx + 1);
         }
     }
 }
@@ -403,19 +466,43 @@ unsafe fn handle_play_queue() {
 // ---- Helpers ----
 
 /// Get the raw sequence name from the selected listbox item. Returns None for group headers.
-unsafe fn get_selected_sequence_name(hwnd: HWND) -> Option<String> {
+/// All selected sequence rows in list order (group headers filtered out).
+unsafe fn get_selected_sequence_names(hwnd: HWND) -> Vec<String> {
     let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
-    let idx = SendMessageW(h_list, LB_GETCURSEL, 0, 0);
-    if idx < 0 {
-        return None;
+    let count = SendMessageW(h_list, LB_GETSELCOUNT, 0, 0);
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut idxs = vec![0i32; count as usize];
+    let got = SendMessageW(h_list, LB_GETSELITEMS, count as WPARAM, idxs.as_mut_ptr() as LPARAM);
+    if got <= 0 {
+        return Vec::new();
     }
     // Group headers carry item data 0; sequence rows carry their 1-based ROW_NAMES index,
-    // so the name comes back exact no matter how the display text is decorated.
-    let data = SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0);
-    if data <= 0 {
-        return None;
+    // so names come back exact no matter how the display text is decorated.
+    let rows = lock_or_recover(&ROW_NAMES);
+    idxs[..got as usize]
+        .iter()
+        .filter_map(|&idx| {
+            let data = SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0);
+            if data > 0 { rows.get(data as usize - 1).cloned() } else { None }
+        })
+        .collect()
+}
+
+/// The single selected sequence, for one-target actions (Bind Key, Rename, Default).
+/// Tells the user off instead of guessing when several are selected.
+unsafe fn get_selected_sequence_name(hwnd: HWND) -> Option<String> {
+    let mut names = get_selected_sequence_names(hwnd);
+    match names.len() {
+        1 => names.pop(),
+        0 => None,
+        _ => {
+            MessageBoxW(hwnd, wide("Select a single sequence for this action.").as_ptr(),
+                wide("Cadence").as_ptr(), MB_OK | MB_ICONINFORMATION);
+            None
+        }
     }
-    lock_or_recover(&ROW_NAMES).get(data as usize - 1).cloned()
 }
 
 /// Add one sequence row: display text decorated freely, real name kept in ROW_NAMES and

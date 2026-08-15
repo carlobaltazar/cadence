@@ -30,8 +30,8 @@ pub(crate) static BIND_SEQ_NAME: Mutex<Option<String>> = Mutex::new(None);
 // Store selected sequence name for rename dialog
 pub(crate) static RENAME_SEQ_NAME: Mutex<Option<String>> = Mutex::new(None);
 
-// Store selected sequence name for set-group dialog
-pub(crate) static SET_GROUP_SEQ_NAME: Mutex<Option<String>> = Mutex::new(None);
+// Selected sequence names for the set-group dialog (bulk: the group applies to all of them)
+pub(crate) static SET_GROUP_SEQ_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 // Groups that are currently collapsed in the sequences list
 pub(crate) static COLLAPSED_GROUPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -125,6 +125,7 @@ pub(crate) const IDC_BTN_PLAY_SEQ: u16 = 404;
 pub(crate) const IDC_BTN_SET_DEFAULT: u16 = 405;
 pub(crate) const IDC_BTN_RENAME_SEQ: u16 = 406;
 pub(crate) const IDC_BTN_SET_GROUP: u16 = 407;
+pub(crate) const IDC_BTN_SELECT_ALL: u16 = 408;
 
 // Queue controls
 pub(crate) const IDC_BTN_QUEUE_ADD: u16 = 601;
