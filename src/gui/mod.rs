@@ -94,6 +94,11 @@ pub(crate) const IDC_BTN_UPDATE: u16 = 249;         // manual "check for updates
 pub(crate) const IDC_SETTINGS_DIV1: u16 = 250;
 pub(crate) const IDC_SETTINGS_DIV2: u16 = 251;
 pub(crate) const IDC_SETTINGS_DIV3: u16 = 252;
+// Pet Guard (Settings, right column)
+pub(crate) const IDC_CHK_PET_GUARD: u16 = 253;
+pub(crate) const IDC_EDIT_PET_GUARD_SECS: u16 = 254;
+pub(crate) const IDC_SETTINGS_DIV4: u16 = 255;
+pub(crate) const IDC_STATIC_PET_GUARD_HELP: u16 = 256;
 
 // Players (detected/ignore) dialog controls
 pub(crate) const IDC_LIST_PLAYERS: u16 = 901;

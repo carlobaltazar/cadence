@@ -35,6 +35,13 @@ pub struct AppConfig {
     pub pet_cycle_enabled: bool,
     #[serde(default = "default_pet_cycle_interval")]
     pub pet_cycle_interval_secs: u64,
+    /// Pet Guard: when the MP/SP monitor reads low (impossible with the regen pet out),
+    /// press the pet toggle to call it back, and flag "pet might be hungry" if it stays low.
+    #[serde(default)]
+    pub pet_guard_enabled: bool,
+    /// Seconds MP/SP must stay low (despite the pet call) before reporting hungry.
+    #[serde(default = "default_pet_guard_hungry_secs")]
+    pub pet_guard_hungry_secs: u32,
     #[serde(default)]
     pub hp_monitor_enabled: bool,
     #[serde(default)]
@@ -125,6 +132,7 @@ pub struct AppConfig {
 
 fn default_remote_port() -> u16 { 9847 }
 fn default_pet_cycle_interval() -> u64 { 120 }
+fn default_pet_guard_hungry_secs() -> u32 { 5 }
 fn default_burst_rate_hz() -> u32 { 100 }
 fn default_burst_vk() -> u16 { 0x14 } // Caps Lock
 fn default_proximity_vk() -> u16 { 0x45 } // 'E'
@@ -158,6 +166,8 @@ impl Default for AppConfig {
             default_sequence: None,
             pet_cycle_enabled: false,
             pet_cycle_interval_secs: default_pet_cycle_interval(),
+            pet_guard_enabled: false,
+            pet_guard_hungry_secs: default_pet_guard_hungry_secs(),
             hp_monitor_enabled: false,
             hp_monitor_x: 0,
             hp_monitor_y: 0,

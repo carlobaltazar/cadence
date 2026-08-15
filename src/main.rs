@@ -180,6 +180,9 @@ fn main() {
         );
     }
 
+    // Pet Guard rides on the MP/SP monitors (see monitor.rs); arm it from config.
+    monitor::set_pet_guard(cfg.pet_guard_enabled, cfg.pet_guard_hungry_secs);
+
     // Auto-start fleet heartbeat reporting (dashboard server), if enabled.
     report::start(&cfg);
 

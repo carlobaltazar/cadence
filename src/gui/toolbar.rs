@@ -653,6 +653,7 @@ unsafe extern "system" fn toolbar_wnd_proc(
                     if hp { status.push_str(" [HP]"); }
                     if mp { status.push_str(" [MP]"); }
                     if sp { status.push_str(" [SP]"); }
+                    if monitor::pet_guard_enabled() { status.push_str(" [PetG]"); }
                     if burst_on { status.push_str(" [BURST]"); }
                     SetWindowTextW((*ptr).hwnd_status, wide(&status).as_ptr());
 

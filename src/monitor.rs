@@ -31,6 +31,25 @@ const FIRE_COOLDOWN: Duration = Duration::from_millis(120);
 const BAR_VK: [u16; BAR_COUNT] = [0x51, 0x57, 0x45];
 const BAR_NAME: [&str; BAR_COUNT] = ["HP", "MP", "SP"];
 
+// --- Pet Guard ------------------------------------------------------------------------------
+// The pet is the character's regen source; with it out, MP/SP regen so fast the "low" pixel is
+// unreachable. So MP or SP reading low means the pet is NOT out (a hide/call toggle got dropped by
+// lag, or a hungry pet auto-hid). The guard presses the pet toggle key to call it back, and flags
+// "pet might be hungry" for the dashboard if the bar stays low anyway.
+const PET_VK: u16 = 0x41; // 'A' -- same pet call/hide toggle pet_cycle.rs uses
+// Low must persist this long before the first press: a one-frame glitch or a loading screen reads
+// off-color too, and toggling a healthy pet would HIDE it.
+const PET_CALL_DEBOUNCE: Duration = Duration::from_millis(1500);
+// Re-press while still low, in case the press itself was eaten by the same lag.
+const PET_CALL_RETRY: Duration = Duration::from_secs(8);
+
+static PET_GUARD: AtomicBool = AtomicBool::new(false);
+static PET_HUNGRY_AFTER_MS: AtomicU64 = AtomicU64::new(5000);
+/// Wall-clock ms when the current guard-relevant low episode began; 0 = not low.
+static PET_LOW_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+/// Pet-toggle presses sent during the current episode.
+static PET_CALLS: AtomicU32 = AtomicU32::new(0);
+
 struct BarState {
     enabled: AtomicBool,
     x: AtomicI32,
@@ -96,6 +115,14 @@ pub struct BarInfo {
 pub struct BarsSnapshot {
     pub window_found: bool,
     pub bars: [BarInfo; BAR_COUNT],
+    /// Pet Guard is switched on (regardless of whether MP/SP monitors are enabled).
+    pub pet_guard: bool,
+    /// Wall-clock ms when the guard's low episode began; 0 = not low.
+    pub pet_low_since_ms: u64,
+    /// Low has persisted past the configured hungry threshold.
+    pub pet_hungry: bool,
+    /// Pet-toggle presses in the current episode.
+    pub pet_calls: u32,
 }
 
 /// Point-in-time view of the bar observations, for the reporting thread.
@@ -114,10 +141,43 @@ pub fn snapshot() -> BarsSnapshot {
             last_sample_ms: OBS[i].last_sample_ms.load(Ordering::Acquire),
         };
     }
+    let pet_low_since_ms = PET_LOW_SINCE_MS.load(Ordering::Acquire);
+    let pet_hungry = pet_low_since_ms > 0
+        && now_ms().saturating_sub(pet_low_since_ms) >= PET_HUNGRY_AFTER_MS.load(Ordering::Acquire);
     BarsSnapshot {
         window_found: WINDOW_FOUND.load(Ordering::Acquire),
         bars,
+        pet_guard: PET_GUARD.load(Ordering::Acquire),
+        pet_low_since_ms,
+        pet_hungry,
+        pet_calls: PET_CALLS.load(Ordering::Acquire),
     }
+}
+
+/// Switch Pet Guard on/off and set how long MP/SP must stay low before the
+/// snapshot reports `pet_hungry`. Takes effect on the next monitor tick.
+pub fn set_pet_guard(enabled: bool, hungry_secs: u32) {
+    PET_HUNGRY_AFTER_MS.store(u64::from(hungry_secs.max(1)) * 1000, Ordering::Release);
+    let was = PET_GUARD.swap(enabled, Ordering::AcqRel);
+    if !enabled {
+        reset_pet_episode();
+    }
+    if was != enabled {
+        println!(
+            "[Cadence] Pet guard {} (hungry after {}s).",
+            if enabled { "enabled" } else { "disabled" },
+            hungry_secs
+        );
+    }
+}
+
+pub fn pet_guard_enabled() -> bool {
+    PET_GUARD.load(Ordering::Acquire)
+}
+
+fn reset_pet_episode() {
+    PET_LOW_SINCE_MS.store(0, Ordering::Release);
+    PET_CALLS.store(0, Ordering::Release);
 }
 
 // Shared game-window anchor (class, title) — all bars sample from this window.
@@ -212,6 +272,11 @@ fn ensure_running() {
         // Per-bar last-fire timestamps; start "armed" so the first drop fires immediately.
         let mut last_fire = [Instant::now() - FIRE_COOLDOWN; BAR_COUNT];
 
+        // Pet Guard episode state (thread-local; the atomics above mirror it for snapshot()).
+        let pet_scan = player::scan_code(PET_VK);
+        let mut pet_low_start: Option<Instant> = None;
+        let mut pet_last_call: Option<Instant> = None;
+
         loop {
             if CANCEL.load(Ordering::Acquire) {
                 break;
@@ -219,6 +284,9 @@ fn ensure_running() {
             if !any_enabled() {
                 // Nothing to watch right now. Stay alive (avoids a respawn race
                 // with set_bar) but idle cheaply until a bar is re-enabled.
+                pet_low_start = None;
+                pet_last_call = None;
+                reset_pet_episode();
                 thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -255,6 +323,9 @@ fn ensure_running() {
                     (std::ptr::null_mut(), hdc)
                 };
 
+                // Per-tick low readings (None = bar disabled or pixel unreadable this tick).
+                let mut tick_low: [Option<bool>; BAR_COUNT] = [None; BAR_COUNT];
+
                 for i in 0..BAR_COUNT {
                     let b = &BARS[i];
                     if !b.enabled.load(Ordering::Acquire) {
@@ -266,6 +337,7 @@ fn ensure_running() {
                     let color = GetPixel(hdc, x, y);
                     if color != CLR_INVALID {
                         let low = color_dist(color, ref_color) > COLOR_TOLERANCE;
+                        tick_low[i] = Some(low);
                         let now = now_ms();
                         OBS[i].last_sample_ms.store(now, Ordering::Release);
                         OBS[i].low.store(low, Ordering::Release);
@@ -289,6 +361,46 @@ fn ensure_running() {
                 }
 
                 ReleaseDC(hwnd, hdc);
+
+                // --- Pet Guard ---
+                // MP or SP low (whichever monitors are on) => pet not out. While HP reads low
+                // too the guard PAUSES (no press, no new episode, no reset): a long HP-low is
+                // death / a loading screen / the whole HUD off-color, none of which should
+                // toggle the pet; a short one is just a hit landing before the Q potion, and
+                // resetting the debounce on every hit would postpone the call indefinitely.
+                let mp_sp_low = tick_low[Bar::Mp as usize] == Some(true)
+                    || tick_low[Bar::Sp as usize] == Some(true);
+                let hp_low = tick_low[Bar::Hp as usize] == Some(true);
+                let guard_on = PET_GUARD.load(Ordering::Acquire);
+                if guard_on && hp_low {
+                    // hold
+                } else if guard_on && mp_sp_low {
+                    let start = *pet_low_start.get_or_insert_with(Instant::now);
+                    let _ = PET_LOW_SINCE_MS.compare_exchange(
+                        0,
+                        now_ms(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    let due = match pet_last_call {
+                        None => start.elapsed() >= PET_CALL_DEBOUNCE,
+                        Some(t) => t.elapsed() >= PET_CALL_RETRY,
+                    };
+                    if due {
+                        player::send_key_press(PET_VK, pet_scan);
+                        pet_last_call = Some(Instant::now());
+                        let n = PET_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
+                        println!(
+                            "[Cadence] Pet guard: MP/SP low for {}s, calling pet (#{}).",
+                            start.elapsed().as_secs(),
+                            n
+                        );
+                    }
+                } else if pet_low_start.is_some() || PET_LOW_SINCE_MS.load(Ordering::Acquire) != 0 {
+                    pet_low_start = None;
+                    pet_last_call = None;
+                    reset_pet_episode();
+                }
             }
 
             // Pace the loop without burning a full core.

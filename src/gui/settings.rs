@@ -156,7 +156,7 @@ unsafe fn layout(hwnd: HWND) {
 
     // Only the RIGHT column follows the window's right edge; the left column (hotkeys +
     // bar monitors) and the vertical divider keep their created widths.
-    for id in [IDC_SETTINGS_DIV3, IDC_EDIT_PROX_WATCH] {
+    for id in [IDC_SETTINGS_DIV3, IDC_SETTINGS_DIV4, IDC_EDIT_PROX_WATCH] {
         stretch_to_right(hwnd, id, right, dpi, false);
     }
     // Right-column combos that span to the right edge.
@@ -165,7 +165,7 @@ unsafe fn layout(hwnd: HWND) {
     }
 
     // OK floats to the bottom-centre, but never above the bottom of the TALLEST column
-    // (left: SP live readout; right: Players button) — so a short window can't make it
+    // (left: SP live readout; right: Pet Guard help line) — so a short window can't make it
     // overlap content. The min-track size guarantees the client can always hold the floor.
     let ok_w = scale(70, dpi);
     let ok_h = scale(28, dpi);
@@ -173,7 +173,7 @@ unsafe fn layout(hwnd: HWND) {
     if !ok.is_null() {
         let gap = scale(12, dpi);
         let mut floor = m; // fallback if neither column-bottom control can be located
-        for id in [IDC_STATIC_SP_LIVE, IDC_BTN_PROX_PLAYERS] {
+        for id in [IDC_STATIC_SP_LIVE, IDC_BTN_PROX_PLAYERS, IDC_STATIC_PET_GUARD_HELP] {
             let h = GetDlgItem(hwnd, id as i32);
             if !h.is_null() {
                 let mut r: RECT = std::mem::zeroed();
@@ -419,6 +419,27 @@ unsafe extern "system" fn settings_wnd_proc(
             create_control(hwnd, hinstance, font, "BUTTON", "Update",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 536, 300, 68, 26, IDC_BTN_UPDATE);
 
+            // -- Pet Guard (right column, below Proximity) --
+            // Rides on the MP/SP monitors: their pixel reading low means the regen pet is not out
+            // (a hide/call toggle got dropped, or a hungry pet auto-hid). The monitor thread presses
+            // the pet toggle to call it back and reports "hungry" to the dashboard if it stays low.
+            create_control(hwnd, hinstance, font, "STATIC", "",
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 332, 336, 272, 2, IDC_SETTINGS_DIV4);
+            create_control(hwnd, hinstance, font, "STATIC", "\u{2014} Pet Guard \u{2014}",
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 332, 344, 272, 18, 0);
+            create_control(hwnd, hinstance, font, "BUTTON", "Call pet ('A') when MP/SP reads low",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0, 332, 370, 272, 20, IDC_CHK_PET_GUARD);
+            create_control(hwnd, hinstance, font, "STATIC", "Flag hungry after:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 400, 104, 20, 0);
+            create_control(hwnd, hinstance, font, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
+                440, 396, 44, 22, IDC_EDIT_PET_GUARD_SECS);
+            create_control(hwnd, hinstance, font, "STATIC", "s still low \u{2192} dashboard",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 490, 400, 114, 20, 0);
+            create_control(hwnd, hinstance, font, "STATIC",
+                "Needs the MP or SP monitor on. Pauses while HP reads low.",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 426, 272, 20, IDC_STATIC_PET_GUARD_HELP);
+
             // OK button (re-pinned to the window bottom by layout()).
             create_control(hwnd, hinstance, font, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 285, 470, 70, 28, IDC_BTN_SETTINGS_OK);
@@ -435,6 +456,12 @@ unsafe extern "system" fn settings_wnd_proc(
                 *lock_or_recover(&SAMPLED_TITLE) = cfg.hp_monitor_window_title.clone();
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_BURST_RATE as i32),
                     wide(&cfg.burst_rate_hz.to_string()).as_ptr());
+                if cfg.pet_guard_enabled {
+                    SendMessageW(GetDlgItem(hwnd, IDC_CHK_PET_GUARD as i32), BM_SETCHECK,
+                        BST_CHECKED as WPARAM, 0);
+                }
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PET_GUARD_SECS as i32),
+                    wide(&cfg.pet_guard_hungry_secs.to_string()).as_ptr());
             }
 
             layout(hwnd); // size the width-following controls + OK to the initial client area
@@ -765,6 +792,27 @@ unsafe extern "system" fn settings_wnd_proc(
                                     cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
                             } else {
                                 monitor::disable_bar(Bar::Sp);
+                            }
+
+                            // Pet Guard: toggle + hungry threshold, applied live to the monitor thread.
+                            let pet_guard_on = SendMessageW(
+                                GetDlgItem(hwnd, IDC_CHK_PET_GUARD as i32), BM_GETCHECK, 0, 0,
+                            ) == BST_CHECKED as isize;
+                            let pet_guard_secs =
+                                (read_edit_i32(hwnd, IDC_EDIT_PET_GUARD_SECS).max(0) as u32).clamp(2, 120);
+                            (*ptr).config.pet_guard_enabled = pet_guard_on;
+                            (*ptr).config.pet_guard_hungry_secs = pet_guard_secs;
+                            monitor::set_pet_guard(pet_guard_on, pet_guard_secs);
+                            if pet_guard_on
+                                && !(*ptr).config.mp_monitor_enabled
+                                && !(*ptr).config.sp_monitor_enabled
+                            {
+                                let msg = wide(
+                                    "Pet Guard is on, but neither the MP nor the SP monitor is enabled.\n\
+                                     It only acts on their pixel readings \u{2014} tick MP or SP on the toolbar.",
+                                );
+                                let title = wide("Pet Guard");
+                                MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
                             }
 
                             // Apply Proximity changes immediately. start() itself waits for any

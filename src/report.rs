@@ -6,6 +6,10 @@
 //! The client reports raw truth only (bar states + how stale they are); all
 //! judgment calls (offline, HP-critical-sustained, death-suspected) are made
 //! server-side, so thresholds can be tuned without redeploying the fleet.
+//! The one client-side judgment is `pet` = "hungry": Pet Guard already had to
+//! wait its configured window before that word means anything, and the edge
+//! event is what makes the POST immediate. The server still decides when a
+//! sustained "hungry" becomes an alert.
 //! Timestamps are never sent — only relative ages — so VM clock skew is moot.
 //!
 //! The payload deliberately contains no window titles or exe paths.
@@ -51,6 +55,8 @@ struct ReportBody<'a> {
     window_found: bool,
     bars: WireBars,
     bars_age_secs: i64,
+    /// Pet Guard: "off" (disabled, or no MP/SP monitor to ride on), "ok", "hungry".
+    pet: &'static str,
     events: Vec<WireEvent>,
 }
 
@@ -104,13 +110,17 @@ fn bar_wire_state(b: &monitor::BarInfo) -> &'static str {
     }
 }
 
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Age in seconds of the freshest sample across enabled bars; -1 if nothing
 /// has ever been sampled (no bars enabled, or window never in foreground).
 fn bars_age_secs(snap: &monitor::BarsSnapshot) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now = now_unix_ms();
     snap.bars
         .iter()
         .filter(|b| b.enabled && b.last_sample_ms > 0)
@@ -119,11 +129,26 @@ fn bars_age_secs(snap: &monitor::BarsSnapshot) -> i64 {
         .unwrap_or(-1)
 }
 
+/// Pet Guard state on the wire. "off" unless the guard is on AND at least one of
+/// the MP/SP monitors it rides on is enabled; "hungry" once MP/SP has stayed low
+/// past the configured window despite the pet call.
+fn pet_wire_state(snap: &monitor::BarsSnapshot) -> &'static str {
+    let rides_on = snap.bars[1].enabled || snap.bars[2].enabled;
+    if !snap.pet_guard || !rides_on {
+        "off"
+    } else if snap.pet_hungry {
+        "hungry"
+    } else {
+        "ok"
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 struct Edges {
     playing: bool,
     window_found: bool,
     hp_low: bool,
+    pet_hungry: bool,
 }
 
 fn push(queue: &mut VecDeque<Pending>, kind: &'static str, detail: String) {
@@ -145,6 +170,7 @@ fn run(url: String, token: String, label: String) {
         playing: false,
         window_found: true,
         hp_low: false,
+        pet_hungry: false,
     };
     let mut first = true;
     // Start "due" so the first heartbeat goes out on the first tick.
@@ -157,11 +183,13 @@ fn run(url: String, token: String, label: String) {
 
         let snap = monitor::snapshot();
         let any_bar = snap.bars.iter().any(|b| b.enabled);
+        let pet = pet_wire_state(&snap);
         let cur = Edges {
             playing: player::is_playing(),
             // Window presence is only knowable while the bar monitor runs.
             window_found: if any_bar { snap.window_found } else { true },
             hp_low: snap.bars[0].enabled && snap.bars[0].low,
+            pet_hungry: pet == "hungry",
         };
 
         if first {
@@ -187,6 +215,23 @@ fn run(url: String, token: String, label: String) {
                     &mut queue,
                     if cur.hp_low { "hp_low" } else { "hp_recovered" },
                     String::new(),
+                );
+            }
+            if cur.pet_hungry != prev.pet_hungry {
+                let detail = if cur.pet_hungry {
+                    let low_secs = if snap.pet_low_since_ms > 0 {
+                        now_unix_ms().saturating_sub(snap.pet_low_since_ms) / 1000
+                    } else {
+                        0
+                    };
+                    format!("mp/sp low {}s, pet called {}x", low_secs, snap.pet_calls)
+                } else {
+                    String::new()
+                };
+                push(
+                    &mut queue,
+                    if cur.pet_hungry { "pet_hungry" } else { "pet_recovered" },
+                    detail,
                 );
             }
         }
@@ -221,6 +266,7 @@ fn run(url: String, token: String, label: String) {
                     sp: bar_wire_state(&snap.bars[2]),
                 },
                 bars_age_secs: bars_age_secs(&snap),
+                pet,
                 events,
             };
             match serde_json::to_vec(&body) {
@@ -274,6 +320,7 @@ mod tests {
             window_found: true,
             bars: WireBars { hp: "ok", mp: "low", sp: "off" },
             bars_age_secs: 2,
+            pet: "hungry",
             events: vec![WireEvent { kind: "playback_started", detail: String::new(), age_secs: 3 }],
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&body).unwrap()).unwrap();
@@ -282,8 +329,26 @@ mod tests {
         assert_eq!(v["bars"]["mp"], "low");
         assert_eq!(v["bars"]["sp"], "off");
         assert_eq!(v["bars_age_secs"], 2);
+        assert_eq!(v["pet"], "hungry");
         assert_eq!(v["events"][0]["kind"], "playback_started");
         assert_eq!(v["events"][0]["age_secs"], 3);
+    }
+
+    fn snap(pet_guard: bool, mp_on: bool, sp_on: bool, pet_hungry: bool) -> monitor::BarsSnapshot {
+        let mut s = monitor::snapshot();
+        s.pet_guard = pet_guard;
+        s.bars[1].enabled = mp_on;
+        s.bars[2].enabled = sp_on;
+        s.pet_hungry = pet_hungry;
+        s
+    }
+
+    #[test]
+    fn pet_state_is_off_unless_guard_rides_on_an_enabled_bar() {
+        assert_eq!(pet_wire_state(&snap(false, true, true, true)), "off");
+        assert_eq!(pet_wire_state(&snap(true, false, false, true)), "off");
+        assert_eq!(pet_wire_state(&snap(true, true, false, false)), "ok");
+        assert_eq!(pet_wire_state(&snap(true, false, true, true)), "hungry");
     }
 
     #[test]
