@@ -39,7 +39,7 @@ pub struct AppConfig {
     /// press the pet toggle to call it back, and flag "pet might be hungry" if it stays low.
     #[serde(default)]
     pub pet_guard_enabled: bool,
-    /// Seconds MP/SP must stay low (despite the pet call) before reporting hungry.
+    /// Seconds MP/SP must stay low AFTER the pet call before reporting hungry.
     #[serde(default = "default_pet_guard_hungry_secs")]
     pub pet_guard_hungry_secs: u32,
     #[serde(default)]

@@ -434,7 +434,7 @@ unsafe extern "system" fn settings_wnd_proc(
             create_control(hwnd, hinstance, font, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
                 440, 396, 44, 22, IDC_EDIT_PET_GUARD_SECS);
-            create_control(hwnd, hinstance, font, "STATIC", "s still low \u{2192} dashboard",
+            create_control(hwnd, hinstance, font, "STATIC", "s low after the call",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 490, 400, 114, 20, 0);
             create_control(hwnd, hinstance, font, "STATIC",
                 "Needs the MP or SP monitor on. Pauses while HP reads low.",

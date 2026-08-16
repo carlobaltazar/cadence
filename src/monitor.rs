@@ -49,6 +49,10 @@ static PET_HUNGRY_AFTER_MS: AtomicU64 = AtomicU64::new(5000);
 static PET_LOW_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// Pet-toggle presses sent during the current episode.
 static PET_CALLS: AtomicU32 = AtomicU32::new(0);
+/// Wall-clock ms of the FIRST pet-toggle press in this episode; 0 = none yet.
+/// "Hungry" is measured from here: still low N s after we actually called the pet.
+/// (Low-with-no-call is a held state — HP low too, i.e. loading screen / death.)
+static PET_FIRST_CALL_MS: AtomicU64 = AtomicU64::new(0);
 
 struct BarState {
     enabled: AtomicBool,
@@ -119,7 +123,7 @@ pub struct BarsSnapshot {
     pub pet_guard: bool,
     /// Wall-clock ms when the guard's low episode began; 0 = not low.
     pub pet_low_since_ms: u64,
-    /// Low has persisted past the configured hungry threshold.
+    /// Still low past the configured threshold AFTER the pet was called.
     pub pet_hungry: bool,
     /// Pet-toggle presses in the current episode.
     pub pet_calls: u32,
@@ -142,8 +146,10 @@ pub fn snapshot() -> BarsSnapshot {
         };
     }
     let pet_low_since_ms = PET_LOW_SINCE_MS.load(Ordering::Acquire);
+    let first_call_ms = PET_FIRST_CALL_MS.load(Ordering::Acquire);
     let pet_hungry = pet_low_since_ms > 0
-        && now_ms().saturating_sub(pet_low_since_ms) >= PET_HUNGRY_AFTER_MS.load(Ordering::Acquire);
+        && first_call_ms > 0
+        && now_ms().saturating_sub(first_call_ms) >= PET_HUNGRY_AFTER_MS.load(Ordering::Acquire);
     BarsSnapshot {
         window_found: WINDOW_FOUND.load(Ordering::Acquire),
         bars,
@@ -178,6 +184,7 @@ pub fn pet_guard_enabled() -> bool {
 fn reset_pet_episode() {
     PET_LOW_SINCE_MS.store(0, Ordering::Release);
     PET_CALLS.store(0, Ordering::Release);
+    PET_FIRST_CALL_MS.store(0, Ordering::Release);
 }
 
 // Shared game-window anchor (class, title) — all bars sample from this window.
@@ -389,6 +396,12 @@ fn ensure_running() {
                     if due {
                         player::send_key_press(PET_VK, pet_scan);
                         pet_last_call = Some(Instant::now());
+                        let _ = PET_FIRST_CALL_MS.compare_exchange(
+                            0,
+                            now_ms(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                         let n = PET_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
                         println!(
                             "[Cadence] Pet guard: MP/SP low for {}s, calling pet (#{}).",
