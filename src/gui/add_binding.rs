@@ -1,6 +1,6 @@
 use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, dpi_for_window, scaled_font, REMOTE_KEY_OPTIONS};
-use crate::{config, hotkeys};
-use crate::sequence::RemoteBinding;
+use crate::{config, hotkeys, storage};
+use crate::sequence::{BindingTarget, RemoteBinding};
 use super::*;
 use super::toolbar::ToolbarControls;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -30,7 +30,7 @@ pub unsafe fn show_add_binding_dialog(parent: HWND) {
         add_binding_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 300, 200,
+        sx, sy, 300, 236,
         parent, hinstance,
     );
     ADD_BINDING_HWND.store(hwnd as isize, Ordering::Release);
@@ -87,31 +87,49 @@ unsafe extern "system" fn add_binding_wnd_proc(
             );
             populate_key_combo(h_combo, REMOTE_KEY_OPTIONS, None);
 
-            // Sequence label + edit
+            // Target kind: what the hotkey fires on the hosts. A saved queue / group is
+            // expanded into sequence names by THIS machine when the key is pressed.
             create_control(
-                hwnd, hinstance, font, "STATIC", "Sequence:",
+                hwnd, hinstance, font, "STATIC", "Target:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
                 12, 80, 64, 20, 0,
             );
-
-            let h_seq = create_control(
-                hwnd, hinstance, font, "EDIT", "",
-                WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
-                80, 78, 196, 22, IDC_EDIT_BIND_SEQ,
+            let h_kind = create_control(
+                hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                80, 76, 120, 200, IDC_COMBO_BIND_KIND,
             );
-            SendMessageW(h_seq, EM_SETLIMITTEXT as u32, 128, 0);
+            for kind in BindingTarget::ALL {
+                SendMessageW(h_kind, CB_ADDSTRING, 0, wide(kind.label()).as_ptr() as LPARAM);
+            }
+            SendMessageW(h_kind, CB_SETCURSEL, 0, 0);
+
+            // Name: editable drop-down listing what exists of the chosen kind (typing is
+            // still allowed — the sequence may only exist on the hosts).
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Name:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 114, 64, 20, 0,
+            );
+            let h_name = create_control(
+                hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWN as u32 | CBS_AUTOHSCROLL as u32 | WS_VSCROLL, 0,
+                80, 110, 196, 300, IDC_COMBO_BIND_NAME,
+            );
+            SendMessageW(h_name, CB_LIMITTEXT, 128, 0);
+            populate_names(h_name, BindingTarget::Sequence);
 
             // OK / Cancel buttons
             create_control(
                 hwnd, hinstance, font, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                80, 120, 60, 28, IDC_BTN_BIND_ADD_OK,
+                80, 156, 60, 28, IDC_BTN_BIND_ADD_OK,
             );
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Cancel",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                150, 120, 60, 28, IDC_BTN_BIND_ADD_CANCEL,
+                150, 156, 60, 28, IDC_BTN_BIND_ADD_CANCEL,
             );
 
             0
@@ -126,6 +144,12 @@ unsafe extern "system" fn add_binding_wnd_proc(
                     DestroyWindow(hwnd);
                     ADD_BINDING_HWND.store(0, Ordering::Release);
                 }
+                x if x == IDC_COMBO_BIND_KIND => {
+                    if HIWORD(w_param as u32) == CBN_SELCHANGE {
+                        let kind = selected_kind(hwnd);
+                        populate_names(GetDlgItem(hwnd, IDC_COMBO_BIND_NAME as i32), kind);
+                    }
+                }
                 _ => {}
             }
             0
@@ -137,6 +161,34 @@ unsafe extern "system" fn add_binding_wnd_proc(
         }
         _ => DefWindowProcW(hwnd, msg, w_param, l_param),
     }
+}
+
+unsafe fn selected_kind(hwnd: HWND) -> BindingTarget {
+    let idx = SendMessageW(GetDlgItem(hwnd, IDC_COMBO_BIND_KIND as i32), CB_GETCURSEL, 0, 0);
+    BindingTarget::ALL.get(idx.max(0) as usize).copied().unwrap_or_default()
+}
+
+/// Fill the name drop-down with everything of `kind` on this machine (typed text is cleared).
+unsafe fn populate_names(h_name: HWND, kind: BindingTarget) {
+    SendMessageW(h_name, CB_RESETCONTENT, 0, 0);
+    let names: Vec<String> = match kind {
+        BindingTarget::Sequence => storage::list_sequences().unwrap_or_default(),
+        BindingTarget::Queue => storage::list_saved_queues(),
+        BindingTarget::Group => {
+            let mut groups: Vec<String> = storage::list_sequence_meta()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| m.group)
+                .collect();
+            groups.sort();
+            groups.dedup();
+            groups
+        }
+    };
+    for n in &names {
+        SendMessageW(h_name, CB_ADDSTRING, 0, wide(n).as_ptr() as LPARAM);
+    }
+    SetWindowTextW(h_name, wide("").as_ptr());
 }
 
 unsafe fn handle_ok(hwnd: HWND) {
@@ -171,23 +223,24 @@ unsafe fn handle_ok(hwnd: HWND) {
     }
     let vk_code = REMOTE_KEY_OPTIONS[key_idx].0;
 
-    // Read sequence name
-    let h_seq = GetDlgItem(hwnd, IDC_EDIT_BIND_SEQ as i32);
-    let len = GetWindowTextLengthW(h_seq);
-    if len <= 0 {
-        let msg = wide("Enter a sequence name");
+    // Read target kind + name (GetWindowText on a CBS_DROPDOWN combo reads its edit box)
+    let target = selected_kind(hwnd);
+    let h_name = GetDlgItem(hwnd, IDC_COMBO_BIND_NAME as i32);
+    let mut buf = [0u16; 160];
+    let len = GetWindowTextW(h_name, buf.as_mut_ptr(), buf.len() as i32);
+    let sequence_name = String::from_utf16_lossy(&buf[..len.max(0) as usize]).trim().to_string();
+    if sequence_name.is_empty() {
+        let msg = wide(&format!("Enter or pick a {} name", target.label().to_lowercase()));
         let title = wide("Error");
         MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
         return;
     }
-    let mut buf = vec![0u16; (len + 1) as usize];
-    GetWindowTextW(h_seq, buf.as_mut_ptr(), buf.len() as i32);
-    let sequence_name = String::from_utf16_lossy(&buf[..len as usize]);
 
     let binding = RemoteBinding {
         modifiers,
         vk_code,
         sequence_name,
+        target,
     };
 
     // Save to config via the remote dialog's parent (toolbar)

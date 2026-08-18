@@ -1,6 +1,8 @@
 use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, scale};
-use crate::{config, storage};
+use crate::{config, hotkeys, storage};
+use crate::sequence::BindingTarget;
 use super::*;
+use super::toolbar::ToolbarControls;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -114,13 +116,42 @@ unsafe extern "system" fn rename_dialog_wnd_proc(
                         Ok(()) => {
                             let new_sanitized = storage::sanitize_filename(&new_name);
 
-                            let mut cfg = config::load_config();
-                            if cfg.default_sequence.as_deref() == Some(&old_filename) {
-                                cfg.default_sequence = Some(new_sanitized.clone());
-                                let _ = config::save_config(&cfg);
+                            // Everything that referred to the old name follows it: default
+                            // sequence and remote bindings (config), the live queue, and every
+                            // saved queue on disk. Config edits go through the toolbar's
+                            // long-lived copy when it exists, or its next save would undo them.
+                            let fix_config = |cfg: &mut config::AppConfig| -> bool {
+                                let mut changed = false;
+                                if cfg.default_sequence.as_deref() == Some(&old_filename) {
+                                    cfg.default_sequence = Some(new_sanitized.clone());
+                                    changed = true;
+                                }
+                                for b in cfg.remote_bindings.iter_mut() {
+                                    if b.target == BindingTarget::Sequence && b.sequence_name == old_filename {
+                                        b.sequence_name = new_sanitized.clone();
+                                        changed = true;
+                                    }
+                                }
+                                changed
+                            };
+                            let toolbar = FindWindowW(wide("CadenceMain").as_ptr(), std::ptr::null());
+                            let ptr = GetWindowLongPtrW(toolbar, GWLP_USERDATA) as *mut ToolbarControls;
+                            if !ptr.is_null() {
+                                if fix_config(&mut (*ptr).config) {
+                                    let _ = config::save_config(&(*ptr).config);
+                                    hotkeys::set_remote_bindings((*ptr).config.remote_bindings.clone());
+                                }
+                            } else {
+                                let mut cfg = config::load_config();
+                                if fix_config(&mut cfg) {
+                                    let _ = config::save_config(&cfg);
+                                    hotkeys::set_remote_bindings(cfg.remote_bindings.clone());
+                                }
                             }
 
                             {
+                                // Not `edit_queue`: the contents still match the (also renamed)
+                                // saved queue, so the label stays.
                                 let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
                                 for entry in queue.iter_mut() {
                                     if *entry == old_filename {
@@ -128,6 +159,7 @@ unsafe extern "system" fn rename_dialog_wnd_proc(
                                     }
                                 }
                             }
+                            storage::rename_in_saved_queues(&old_filename, &new_sanitized);
 
                             refresh_bindings();
                             sequences::refresh_sequences_list();

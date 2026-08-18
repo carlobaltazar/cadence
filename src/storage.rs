@@ -1,17 +1,107 @@
-use crate::sequence::Sequence;
+use crate::sequence::{SavedQueue, Sequence};
 use crate::win32_helpers::lock_or_recover;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-fn sequences_dir() -> PathBuf {
+/// Cadence's data folder (`%APPDATA%\ranify2`, name kept from the old product name).
+pub fn data_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join("ranify2").join("sequences");
+    base.join("ranify2")
+}
+
+fn ensured_subdir(name: &str) -> PathBuf {
+    let dir = data_dir().join(name);
     if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("[Cadence] Failed to create sequences dir: {}", e);
+        eprintln!("[Cadence] Failed to create {} dir: {}", name, e);
     }
     dir
+}
+
+fn sequences_dir() -> PathBuf {
+    ensured_subdir("sequences")
+}
+
+fn queues_dir() -> PathBuf {
+    ensured_subdir("queues")
+}
+
+/// Sorted file stems of all `*.json` files in `dir` (empty when the dir is missing).
+fn list_json_stems(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                if let Some(stem) = path.file_stem() {
+                    names.push(stem.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+// ---- Saved queues -------------------------------------------------------------------------
+
+fn saved_queue_path(name: &str) -> PathBuf {
+    queues_dir().join(format!("{}.json", sanitize_filename(name)))
+}
+
+pub fn list_saved_queues() -> Vec<String> {
+    list_json_stems(&queues_dir()).unwrap_or_default()
+}
+
+pub fn saved_queue_exists(name: &str) -> bool {
+    saved_queue_path(name).exists()
+}
+
+pub fn load_saved_queue(name: &str) -> std::io::Result<SavedQueue> {
+    let json = fs::read_to_string(saved_queue_path(name))?;
+    serde_json::from_str(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Write (or overwrite) a saved queue. The stored name is the sanitized stem so that what the
+/// list shows is what `load_saved_queue` accepts.
+pub fn save_saved_queue(name: &str, items: Vec<String>) -> std::io::Result<SavedQueue> {
+    let stem = sanitize_filename(name);
+    let q = SavedQueue::new(stem.clone(), items);
+    let json = serde_json::to_string_pretty(&q)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    fs::write(saved_queue_path(&stem), json)?;
+    Ok(q)
+}
+
+pub fn delete_saved_queue(name: &str) -> std::io::Result<()> {
+    fs::remove_file(saved_queue_path(name))
+}
+
+/// Replace `old` with `new` in a saved queue's items; true if anything changed.
+fn rename_items(items: &mut [String], old: &str, new: &str) -> bool {
+    let mut changed = false;
+    for item in items.iter_mut() {
+        if item == old {
+            *item = new.to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// A sequence was renamed: keep every saved queue that referenced it pointing at the new name.
+pub fn rename_in_saved_queues(old: &str, new: &str) {
+    for qname in list_saved_queues() {
+        if let Ok(mut q) = load_saved_queue(&qname) {
+            if rename_items(&mut q.items, old, new) {
+                if let Err(e) = save_saved_queue(&q.name, q.items) {
+                    eprintln!("[Cadence] Couldn't update saved queue {}: {}", qname, e);
+                }
+            }
+        }
+    }
 }
 
 pub fn save_sequence(seq: &Sequence) -> std::io::Result<PathBuf> {
@@ -34,21 +124,7 @@ pub fn load_sequence(name: &str) -> std::io::Result<Sequence> {
 }
 
 pub fn list_sequences() -> std::io::Result<Vec<String>> {
-    let dir = sequences_dir();
-    let mut names = Vec::new();
-    if dir.exists() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                if let Some(stem) = path.file_stem() {
-                    names.push(stem.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-    names.sort();
-    Ok(names)
+    list_json_stems(&sequences_dir())
 }
 
 /// The bits of a sequence the list needs without holding every event list in memory.
@@ -203,8 +279,7 @@ impl LastPlayed {
 }
 
 fn last_played_path() -> PathBuf {
-    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("ranify2").join("last_played.json")
+    data_dir().join("last_played.json")
 }
 
 static LAST_PLAYED: Mutex<Option<LastPlayed>> = Mutex::new(None);
@@ -250,6 +325,14 @@ mod tests {
         assert_eq!(seq.describe().as_deref(), Some("farm loop"));
         let q = LastPlayed { name: String::new(), queue: vec!["a".into(), "b".into()] };
         assert_eq!(q.describe().as_deref(), Some("queue (2): a, b"));
+    }
+
+    #[test]
+    fn rename_items_replaces_every_occurrence() {
+        let mut items: Vec<String> = ["a", "b", "a", "c"].iter().map(|s| s.to_string()).collect();
+        assert!(rename_items(&mut items, "a", "z"));
+        assert_eq!(items, ["z", "b", "z", "c"]);
+        assert!(!rename_items(&mut items, "missing", "q"));
     }
 
     #[test]

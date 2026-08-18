@@ -1,4 +1,5 @@
 use crate::config;
+use crate::sequence::RemoteBinding;
 use crate::win32_helpers::lock_or_recover;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -27,7 +28,7 @@ struct HotkeySet {
     queue_vk: Option<u16>,
     burst_vk: Option<u16>,
     sequence_bindings: Vec<(u16, String)>, // (vk_code, sequence_name)
-    remote_bindings: Vec<(u32, u16, String)>, // (modifiers, vk_code, sequence_name)
+    remote_bindings: Vec<RemoteBinding>, // index-aligned with config.remote_bindings
 }
 
 impl HotkeySet {
@@ -125,14 +126,15 @@ pub fn set_sequence_bindings(bindings: Vec<(u16, String)>) {
     with_set(|set| set.sequence_bindings = bindings);
 }
 
-/// Set remote hotkey bindings (modifier+key → sequence name).
-pub fn set_remote_bindings(bindings: Vec<(u32, u16, String)>) {
+/// Set remote hotkey bindings (modifier+key → sequence / saved queue / group), same order as
+/// `config.remote_bindings` — the hook posts the index.
+pub fn set_remote_bindings(bindings: Vec<RemoteBinding>) {
     with_set(|set| set.remote_bindings = bindings);
 }
 
-/// Get the sequence name for a remote binding by index.
-pub fn remote_binding_at(index: usize) -> Option<String> {
-    with_set(|set| set.remote_bindings.get(index).map(|(_, _, name)| name.clone()))
+/// The remote binding at `index` (as posted by the hook), if still present.
+pub fn remote_binding_at(index: usize) -> Option<RemoteBinding> {
+    with_set(|set| set.remote_bindings.get(index).cloned())
 }
 
 /// Get the sequence name bound to a given VK, if any.
@@ -198,8 +200,8 @@ unsafe extern "system" fn hotkey_hook_proc(
                 // trigger remote sends during playback.
                 let mods = get_current_modifiers();
                 if mods != 0 {
-                    for (i, (bind_mods, bind_vk, _)) in set.remote_bindings.iter().enumerate() {
-                        if vk == *bind_vk && mods == *bind_mods {
+                    for (i, b) in set.remote_bindings.iter().enumerate() {
+                        if vk == b.vk_code && mods == b.modifiers {
                             PostThreadMessageW(
                                 thread_id,
                                 WM_APP_HOTKEY,

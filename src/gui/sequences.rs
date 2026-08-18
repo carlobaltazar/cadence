@@ -206,7 +206,17 @@ unsafe extern "system" fn sequences_wnd_proc(
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
                 400, 350, 104, 30, IDC_BTN_PLAY_QUEUE,
             );
+            // Named, persisted queues (repeats allowed) — save the current one / load one back.
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Saved Queues\u{2026}",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                286, 385, 220, 30, IDC_BTN_QUEUE_SAVED,
+            );
 
+            0
+        }
+        WM_APP_QUEUE_CHANGED => {
+            refresh_queue_list(hwnd);
             0
         }
         WM_COMMAND => {
@@ -237,6 +247,7 @@ unsafe extern "system" fn sequences_wnd_proc(
                     }
                 }
                 x if x == IDC_BTN_PLAY_QUEUE => handle_play_queue(),
+                x if x == IDC_BTN_QUEUE_SAVED => saved_queues_dialog::show_saved_queues_dialog(hwnd),
                 x if x == IDC_CHK_SHUFFLE => {
                     let h_chk = GetDlgItem(hwnd, IDC_CHK_SHUFFLE as i32);
                     let checked = SendMessageW(h_chk, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
@@ -309,7 +320,7 @@ unsafe fn handle_delete_seq(hwnd: HWND) {
         let _ = config::save_config(&cfg);
     }
     refresh_bindings();
-    lock_or_recover(&SEQUENCE_QUEUE).retain(|n| !names.contains(n));
+    edit_queue(|q| q.retain(|n| !names.contains(n)));
     let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
     SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
     populate_sequences_list(h_list);
@@ -415,11 +426,11 @@ unsafe fn handle_queue_add_group(hwnd: HWND) {
     if groups.is_empty() {
         return;
     }
-    let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
-    for group in &groups {
-        queue.extend(storage::group_members(group.as_deref()));
-    }
-    drop(queue);
+    edit_queue(|queue| {
+        for group in &groups {
+            queue.extend(storage::group_members(group.as_deref()));
+        }
+    });
     refresh_queue_list(hwnd);
 }
 
@@ -508,7 +519,7 @@ unsafe fn handle_play_seq(hwnd: HWND) {
 unsafe fn handle_queue_add(hwnd: HWND) {
     let names = get_selected_sequence_names(hwnd);
     if !names.is_empty() {
-        lock_or_recover(&SEQUENCE_QUEUE).extend(names);
+        edit_queue(|q| q.extend(names));
         refresh_queue_list(hwnd);
     }
 }
@@ -526,13 +537,13 @@ unsafe fn handle_queue_remove(hwnd: HWND) {
     }
     // Remove back-to-front so earlier indices stay valid.
     idxs[..got as usize].sort_unstable_by(|a, b| b.cmp(a));
-    let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
-    for &idx in &idxs[..got as usize] {
-        if (idx as usize) < queue.len() {
-            queue.remove(idx as usize);
+    edit_queue(|queue| {
+        for &idx in &idxs[..got as usize] {
+            if (idx as usize) < queue.len() {
+                queue.remove(idx as usize);
+            }
         }
-    }
-    drop(queue);
+    });
     refresh_queue_list(hwnd);
 }
 
@@ -548,11 +559,11 @@ unsafe fn handle_queue_up(hwnd: HWND) {
     let idx = SendMessageW(h_queue, LB_GETCARETINDEX, 0, 0);
     if idx > 0 {
         let idx = idx as usize;
-        let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
-        if idx < queue.len() {
-            queue.swap(idx, idx - 1);
-        }
-        drop(queue);
+        edit_queue(|queue| {
+            if idx < queue.len() {
+                queue.swap(idx, idx - 1);
+            }
+        });
         refresh_queue_list(hwnd);
         select_queue_row(h_queue, idx - 1);
     }
@@ -563,10 +574,15 @@ unsafe fn handle_queue_down(hwnd: HWND) {
     let idx = SendMessageW(h_queue, LB_GETCARETINDEX, 0, 0);
     if idx >= 0 {
         let idx = idx as usize;
-        let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
-        if idx + 1 < queue.len() {
-            queue.swap(idx, idx + 1);
-            drop(queue);
+        let swapped = edit_queue(|queue| {
+            if idx + 1 < queue.len() {
+                queue.swap(idx, idx + 1);
+                true
+            } else {
+                false
+            }
+        });
+        if swapped {
             refresh_queue_list(hwnd);
             select_queue_row(h_queue, idx + 1);
         }
@@ -588,7 +604,21 @@ unsafe fn handle_play_queue() {
         }
     }
     if !event_lists.is_empty() {
+        // Same as the queue hotkey / remote PLAY_QUEUE: name the source so the status line,
+        // last-played memory and the update-resume marker describe this queue.
+        player::set_source(player::PlaybackSource::Queue(queue));
         player::play_queue(event_lists);
+    }
+}
+
+/// The queue was replaced from another thread/window (saved queue loaded, remote PLAY_LIST):
+/// re-list it if the Items window is open. Posted, so it's safe off the UI thread.
+pub(crate) fn notify_queue_changed() {
+    let hwnd = SEQUENCES_HWND.load(Ordering::Acquire) as HWND;
+    if !hwnd.is_null() {
+        unsafe {
+            PostMessageW(hwnd, WM_APP_QUEUE_CHANGED, 0, 0);
+        }
     }
 }
 
@@ -752,12 +782,18 @@ unsafe fn refresh_queue_list(hwnd: HWND) {
         let wname = wide(&display);
         SendMessageW(h_list, LB_ADDSTRING, 0, wname.as_ptr() as LPARAM);
     }
-    // Caption carries the pass total — what one Play Queue actually takes.
+    // Caption carries the pass total — what one Play Queue actually takes — and the saved
+    // queue's name while the contents still match it.
+    let title = match queue_label() {
+        Some(label) => format!("Queue \"{}\"", label),
+        None => "Queue".to_string(),
+    };
     let caption = if queue.is_empty() {
-        "Queue".to_string()
+        title
     } else {
         format!(
-            "Queue \u{2014} {} item{}, {}",
+            "{} \u{2014} {} item{}, {}",
+            title,
             queue.len(),
             if queue.len() == 1 { "" } else { "s" },
             sequence::format_duration(sequence::queue_pass_micros(&timings)),

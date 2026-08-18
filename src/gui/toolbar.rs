@@ -587,7 +587,14 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         let what = match player::current_source() {
                             player::PlaybackSource::Sequence(name) => trim_name(&name),
                             player::PlaybackSource::Queue(names) => {
-                                format!("queue ({})", names.len())
+                                // Name the saved queue only when it's really the queue playing
+                                // (multi-select Play runs an ad-hoc list through the same source).
+                                let label = queue_label()
+                                    .filter(|_| *lock_or_recover(&SEQUENCE_QUEUE) == names);
+                                match label {
+                                    Some(label) => format!("{} ({})", trim_name(&label), names.len()),
+                                    None => format!("queue ({})", names.len()),
+                                }
                             }
                             player::PlaybackSource::Adhoc => "(unsaved)".to_string(),
                         };

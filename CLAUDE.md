@@ -54,8 +54,10 @@ remote control), `report` (dashboard heartbeat), `update` (GitHub poll).
 **Data on disk** (`%APPDATA%\ranify2\`, path still uses the old name): `config.json` (`AppConfig`,
 every field `#[serde(default)]`-tolerant so old files load), `sequences/<sanitized>.json` (one file
 per `Sequence`; the *sanitized filename stem* is the identity used everywhere — see
-`storage::sanitize_filename`), `last_played.json`, `detected_players.json`, plus a resume marker
-written across update restarts (`resume.rs`).
+`storage::sanitize_filename`), `queues/<stem>.json` (`SavedQueue`: a named, ordered list of
+sequence names — repeats allowed, a sequence may be in many), `last_played.json`,
+`detected_players.json`, plus a resume marker written across update restarts (`resume.rs`).
+`storage::data_dir()` is the one place the base path is built.
 
 **Config copies — the main footgun.** `config::save_config` writes the whole struct. The toolbar keeps
 a long-lived copy in `ToolbarControls.config` (behind `GWLP_USERDATA`); Settings/Remote/Add-binding
@@ -74,9 +76,12 @@ mis-reports for Right Shift/NumLock (else Shift+`-` plays as `-`). `PlaybackSour
 Queue / Adhoc) is set right before `play_*` and drives last-played, the status line, and resume.
 
 **Queue.** `gui::SEQUENCE_QUEUE` is an in-memory `Vec<String>` of sequence names consumed by the
-Items window, the queue hotkey, `network` `PLAY_QUEUE`, and `resume`. Groups are a per-sequence
-`group: Option<String>` + `group_order`; "Group >>" expands a group into individual queue entries at
-add time — there is no group object in the queue.
+Items window, the queue hotkey, `network` `PLAY_QUEUE`/`PLAY_LIST`, and `resume`. Mutate it only via
+`gui::edit_queue` (clears `QUEUE_LABEL`, the saved queue it was loaded from) or `gui::set_queue`
+(replace + label + posts `WM_APP_QUEUE_CHANGED` to the Items window — safe from any thread).
+Groups are a per-sequence `group: Option<String>` + `group_order` (folders: unique, one per
+sequence); "Group >>" expands a group into individual queue entries at add time — there is no group
+object in the queue. Saved queues (`Saved Queues…` in Items) are the persisted, repeatable form.
 
 **Bar monitor** (`monitor.rs`): one thread samples up to four pixels on the game window (found by
 class/title via `find_game_window`, shared anchor from HP's config); HP/MP/SP press Q/W/E on
@@ -85,8 +90,8 @@ bar states + `pet`/`skill` words; the server makes the alerting decisions.
 
 **GUI conventions.** Each dialog is its own file under `src/gui/`: `register_and_create_dialog`, an
 `AtomicIsize` singleton HWND, control IDs as `pub(crate) const IDC_*` in `gui/mod.rs` (numbered by
-dialog: 1xx toolbar, 2xx settings, 3xx save/rename/dup, 4xx sequence manager, 6xx queue, 7xx remote,
-8xx bindings, 9xx players). Layout literals are 96-dpi and scaled inside `create_control`. Listbox
+dialog: 1xx toolbar, 2xx settings, 3xx save/rename/dup, 4xx sequence manager, 6xx queue (62x saved
+queues dialog), 7xx remote, 8xx bindings, 9xx players). Layout literals are 96-dpi and scaled inside `create_control`. Listbox
 rows keep display text free-form and store the real name via `LB_SETITEMDATA` → `ROW_NAMES`
 (item data 0 = group header). Shared state between windows is `pub(crate) static Mutex<..>` in
 `gui/mod.rs`, always locked with `win32_helpers::lock_or_recover`.
@@ -96,7 +101,10 @@ them from the client layout with `AdjustWindowRectEx` (see `settings::outer_size
 shipped Settings with an invisible OK — every change was lost to the X button).
 
 **Remote protocol** (`network.rs`): newline commands over TCP with optional password —
-`PLAY <name>`, `PLAY_QUEUE`, `STOP` → `OK`/`ERR <reason>`.
+`PLAY <name>`, `PLAY_QUEUE` (host's own queue), `PLAY_LIST <label> <name> <name>…` (replaces the
+host's queue with the list, labels it, plays; names are file stems so whitespace-split is safe),
+`STOP` → `OK`/`ERR <reason>`. Remote hotkey bindings (`RemoteBinding.target`: sequence / queue /
+group) are expanded on the **sender** (`RemoteBinding::command`) so hosts only need the sequences.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
 is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets.

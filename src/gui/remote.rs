@@ -494,27 +494,11 @@ pub(crate) unsafe fn refresh_bindings_list(hwnd: HWND) {
     };
     populate_bindings_list(hwnd, &cfg);
     // Also update the hook
-    let remote_binds: Vec<(u32, u16, String)> = cfg.remote_bindings
-        .iter()
-        .map(|b| (b.modifiers, b.vk_code, b.sequence_name.clone()))
-        .collect();
-    hotkeys::set_remote_bindings(remote_binds);
+    hotkeys::set_remote_bindings(cfg.remote_bindings.clone());
 }
 
 unsafe fn reload_remote_bindings(hwnd: HWND) {
-    let parent = GetParent(hwnd);
-    let ptr = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut ToolbarControls;
-    let cfg = if !ptr.is_null() {
-        (*ptr).config.clone()
-    } else {
-        config::load_config()
-    };
-    populate_bindings_list(hwnd, &cfg);
-    let remote_binds: Vec<(u32, u16, String)> = cfg.remote_bindings
-        .iter()
-        .map(|b| (b.modifiers, b.vk_code, b.sequence_name.clone()))
-        .collect();
-    hotkeys::set_remote_bindings(remote_binds);
+    refresh_bindings_list(hwnd);
 }
 
 unsafe fn populate_bindings_list(hwnd: HWND, cfg: &config::AppConfig) {
@@ -524,25 +508,31 @@ unsafe fn populate_bindings_list(hwnd: HWND, cfg: &config::AppConfig) {
     }
     SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
     for b in &cfg.remote_bindings {
-        let display = format_binding(b.modifiers, b.vk_code, &b.sequence_name);
+        let display = format_binding(b);
         let wname = wide(&display);
         SendMessageW(h_list, LB_ADDSTRING, 0, wname.as_ptr() as LPARAM);
     }
 }
 
-fn format_binding(modifiers: u32, vk: u16, seq_name: &str) -> String {
+fn format_binding(b: &crate::sequence::RemoteBinding) -> String {
+    use crate::sequence::BindingTarget;
     let mut parts = Vec::new();
-    if modifiers & hotkeys::MOD_FLAG_CTRL != 0 {
+    if b.modifiers & hotkeys::MOD_FLAG_CTRL != 0 {
         parts.push("Ctrl");
     }
-    if modifiers & hotkeys::MOD_FLAG_ALT != 0 {
+    if b.modifiers & hotkeys::MOD_FLAG_ALT != 0 {
         parts.push("Alt");
     }
-    if modifiers & hotkeys::MOD_FLAG_SHIFT != 0 {
+    if b.modifiers & hotkeys::MOD_FLAG_SHIFT != 0 {
         parts.push("Shift");
     }
-    parts.push(remote_vk_name(vk));
-    format!("{} \u{2192} {}", parts.join("+"), seq_name)
+    parts.push(remote_vk_name(b.vk_code));
+    let kind = match b.target {
+        BindingTarget::Sequence => "",
+        BindingTarget::Queue => "queue: ",
+        BindingTarget::Group => "group: ",
+    };
+    format!("{} \u{2192} {}{}", parts.join("+"), kind, b.sequence_name)
 }
 
 unsafe fn save_remote_config<F: FnOnce(&mut config::AppConfig)>(hwnd: HWND, updater: F) {

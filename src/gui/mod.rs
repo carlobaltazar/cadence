@@ -6,6 +6,7 @@ mod bind_key;
 mod rename_dialog;
 mod set_group_dialog;
 mod duplicate_dialog;
+mod saved_queues_dialog;
 mod remote;
 mod add_binding;
 mod players;
@@ -22,8 +23,32 @@ pub static LAST_EVENTS: Mutex<Option<Vec<sequence::InputEvent>>> = Mutex::new(No
 // Pending events waiting for save dialog
 pub(crate) static PENDING_EVENTS: Mutex<Option<Vec<sequence::InputEvent>>> = Mutex::new(None);
 
-// Sequence queue (playlist) - in-memory only
+// Sequence queue (playlist) - in-memory only. Mutate through `edit_queue` / `set_queue` so the
+// saved-queue label and the Items window stay in step.
 pub(crate) static SEQUENCE_QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// Name of the saved queue the queue was loaded from; cleared by any edit.
+pub(crate) static QUEUE_LABEL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Replace the whole queue (a saved queue was loaded, locally or by a remote PLAY_LIST).
+/// Safe from any thread: the Items window is refreshed by a posted message.
+pub(crate) fn set_queue(names: Vec<String>, label: Option<String>) {
+    *lock_or_recover(&SEQUENCE_QUEUE) = names;
+    *lock_or_recover(&QUEUE_LABEL) = label;
+    sequences::notify_queue_changed();
+}
+
+/// Edit the queue in place; the result no longer matches a saved queue, so drop the label.
+/// (Does not repaint — the UI callers refresh their own list.)
+pub(crate) fn edit_queue<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    let r = f(&mut lock_or_recover(&SEQUENCE_QUEUE));
+    *lock_or_recover(&QUEUE_LABEL) = None;
+    r
+}
+
+pub(crate) fn queue_label() -> Option<String> {
+    lock_or_recover(&QUEUE_LABEL).clone()
+}
 
 // Store selected sequence name for bind-key dialog
 pub(crate) static BIND_SEQ_NAME: Mutex<Option<String>> = Mutex::new(None);
@@ -64,6 +89,8 @@ pub(crate) const WM_APP_UPDATE_AVAILABLE: u32 = winapi::um::winuser::WM_APP + 4;
 // Posted by the Settings "Update" button's worker thread when a newer release exists: the toolbar
 // installs it on the UI thread. This is the only path that ever downloads/restarts.
 pub(crate) const WM_APP_UPDATE_INSTALL: u32 = winapi::um::winuser::WM_APP + 5;
+/// The queue was replaced (saved queue loaded / remote PLAY_LIST); Items window re-lists it.
+pub(crate) const WM_APP_QUEUE_CHANGED: u32 = winapi::um::winuser::WM_APP + 6;
 
 // Settings dialog controls
 pub(crate) const IDC_COMBO_RECORD_KEY: u16 = 201;
@@ -162,6 +189,16 @@ pub(crate) const IDC_BTN_PLAY_QUEUE: u16 = 606;
 pub(crate) const IDC_CHK_SHUFFLE: u16 = 607;
 pub(crate) const IDC_BTN_QUEUE_ADD_GROUP: u16 = 608; // append a whole group, in its saved order
 pub(crate) const IDC_STATIC_QUEUE_TOTAL: u16 = 609;  // "Queue — N items, m:ss" caption
+pub(crate) const IDC_BTN_QUEUE_SAVED: u16 = 610;     // opens the Saved Queues dialog
+
+// Control IDs - Saved Queues dialog
+pub(crate) const IDC_LIST_SAVED_QUEUES: u16 = 620;
+pub(crate) const IDC_EDIT_SAVED_QUEUE_NAME: u16 = 621;
+pub(crate) const IDC_BTN_SQ_SAVE: u16 = 622;
+pub(crate) const IDC_BTN_SQ_LOAD: u16 = 623;
+pub(crate) const IDC_BTN_SQ_APPEND: u16 = 624;
+pub(crate) const IDC_BTN_SQ_DELETE: u16 = 625;
+pub(crate) const IDC_BTN_SQ_CLOSE: u16 = 626;
 
 // Bind key dialog controls
 pub(crate) const IDC_COMBO_BIND_KEY: u16 = 501;
@@ -196,9 +233,10 @@ pub(crate) const IDC_CHK_MOD_ALT: u16 = 851;
 pub(crate) const IDC_CHK_MOD_CTRL: u16 = 852;
 pub(crate) const IDC_CHK_MOD_SHIFT: u16 = 853;
 pub(crate) const IDC_COMBO_BIND_VK: u16 = 854;
-pub(crate) const IDC_EDIT_BIND_SEQ: u16 = 855;
+pub(crate) const IDC_COMBO_BIND_NAME: u16 = 855; // editable drop-down of targets of the chosen kind
 pub(crate) const IDC_BTN_BIND_ADD_OK: u16 = 856;
 pub(crate) const IDC_BTN_BIND_ADD_CANCEL: u16 = 857;
+pub(crate) const IDC_COMBO_BIND_KIND: u16 = 858;   // Sequence / Saved queue / Group
 
 // Timer IDs
 pub(crate) const TIMER_STATUS: usize = 1;

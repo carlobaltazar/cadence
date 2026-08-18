@@ -95,11 +95,7 @@ fn main() {
     hotkeys::set_sequence_bindings(bindings);
 
     // Load remote hotkey bindings
-    let remote_binds: Vec<(u32, u16, String)> = cfg.remote_bindings
-        .iter()
-        .map(|b| (b.modifiers, b.vk_code, b.sequence_name.clone()))
-        .collect();
-    hotkeys::set_remote_bindings(remote_binds);
+    hotkeys::set_remote_bindings(cfg.remote_bindings.clone());
 
     // Load queue hotkey binding
     if let Some(qvk) = cfg.queue_vk {
@@ -291,8 +287,24 @@ fn main() {
                 }
                 hotkeys::HOTKEY_REMOTE_SEND => {
                     let index = msg.lParam as usize;
-                    if let Some(seq_name) = hotkeys::remote_binding_at(index) {
+                    if let Some(binding) = hotkeys::remote_binding_at(index) {
                         let cfg = config::cached_config();
+                        // Saved queues / groups are expanded HERE, on the sender: hosts only need
+                        // the sequences, not this machine's queue files or group metadata.
+                        let cmd = binding.command(|target, name| match target {
+                            sequence::BindingTarget::Queue => storage::load_saved_queue(name)
+                                .map(|q| q.items)
+                                .unwrap_or_default(),
+                            sequence::BindingTarget::Group => storage::group_members(Some(name)),
+                            sequence::BindingTarget::Sequence => Vec::new(),
+                        });
+                        let Some(cmd) = cmd else {
+                            eprintln!(
+                                "[Cadence] Remote hotkey: {} '{}' is empty or missing, nothing sent.",
+                                binding.target.label(), binding.sequence_name
+                            );
+                            continue;
+                        };
                         if !cfg.remote_hosts.is_empty() {
                             let port = cfg.remote_port;
                             let pw = if cfg.remote_password.is_empty() {
@@ -300,7 +312,6 @@ fn main() {
                             } else {
                                 Some(cfg.remote_password)
                             };
-                            let cmd = format!("PLAY {}", seq_name);
                             for host in cfg.remote_hosts {
                                 let cmd = cmd.clone();
                                 let pw = pw.clone();

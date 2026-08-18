@@ -109,26 +109,24 @@ fn execute_command(line: &str) -> String {
         return "OK\n".to_string();
     }
 
+    // PLAY_QUEUE: play THIS host's current queue as-is.
     if trimmed == "PLAY_QUEUE" {
-        if player::is_playing() {
-            return "ERR already_playing\n".to_string();
-        }
         let queue = lock_or_recover(&gui::SEQUENCE_QUEUE).clone();
         if queue.is_empty() {
             return "ERR empty_queue\n".to_string();
         }
-        let mut event_lists = Vec::new();
-        for name in &queue {
-            if let Ok(seq) = storage::load_sequence(name) {
-                event_lists.push(seq.events);
-            }
-        }
-        if event_lists.is_empty() {
-            return "ERR load_failed\n".to_string();
-        }
-        player::set_source(player::PlaybackSource::Queue(queue.clone()));
-        player::play_queue(event_lists);
-        return "OK\n".to_string();
+        return play_names_as_queue(queue, None);
+    }
+
+    // PLAY_LIST <label> <name> <name> …: the sender expanded a saved queue / group into sequence
+    // names; load them into this host's queue (so the Items window, loop/shuffle, resume and
+    // last-played all see a normal queue) and play. Names are sanitized file stems, so
+    // whitespace-separated is unambiguous.
+    if let Some(rest) = trimmed.strip_prefix("PLAY_LIST ") {
+        let Some((label, names)) = parse_play_list(rest) else {
+            return "ERR empty_list\n".to_string();
+        };
+        return play_names_as_queue(names, Some(label));
     }
 
     if trimmed.starts_with("PLAY ") {
@@ -150,6 +148,42 @@ fn execute_command(line: &str) -> String {
     } else {
         "ERR unknown_command\n".to_string()
     }
+}
+
+/// Load every named sequence and play them as one queue pass. With `label` the list REPLACES
+/// this host's queue first (a saved queue / group arrived by PLAY_LIST); without it the host's
+/// own queue is being played and is left alone. Missing sequences are skipped like a local
+/// Play Queue; only an entirely unloadable list is an error.
+fn play_names_as_queue(names: Vec<String>, label: Option<String>) -> String {
+    if player::is_playing() {
+        return "ERR already_playing\n".to_string();
+    }
+    let mut event_lists = Vec::new();
+    for name in &names {
+        if let Ok(seq) = storage::load_sequence(name) {
+            event_lists.push(seq.events);
+        }
+    }
+    if event_lists.is_empty() {
+        return "ERR load_failed\n".to_string();
+    }
+    if label.is_some() {
+        gui::set_queue(names.clone(), label);
+    }
+    player::set_source(player::PlaybackSource::Queue(names));
+    player::play_queue(event_lists);
+    "OK\n".to_string()
+}
+
+/// `<label> <name> <name> …` → (label, names); None unless there is a label and ≥1 name.
+fn parse_play_list(rest: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = rest.split_whitespace();
+    let label = parts.next()?.to_string();
+    let names: Vec<String> = parts.map(str::to_string).collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some((label, names))
 }
 
 pub fn send_command(
@@ -199,8 +233,25 @@ fn read_line<R: BufRead>(reader: &mut R) -> Option<String> {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) => None,
-        Ok(n) if n > 512 => None,
+        // Generous: PLAY_LIST carries a whole expanded queue (dozens of names) on one line.
+        Ok(n) if n > 8192 => None,
         Ok(_) => Some(line),
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_list_parses_label_and_names() {
+        assert_eq!(
+            parse_play_list("night a b a"),
+            Some(("night".to_string(), vec!["a".to_string(), "b".to_string(), "a".to_string()]))
+        );
+        assert_eq!(parse_play_list("  night   x "), Some(("night".to_string(), vec!["x".to_string()])));
+        assert_eq!(parse_play_list("night"), None);
+        assert_eq!(parse_play_list(""), None);
     }
 }

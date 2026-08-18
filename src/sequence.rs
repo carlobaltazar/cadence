@@ -30,11 +30,73 @@ pub struct HotkeyBinding {
     pub vk_code: u16,
 }
 
+/// What a remote hotkey fires on the hosts. Legacy bindings (no field) are sequences.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingTarget {
+    #[default]
+    Sequence,
+    /// A saved queue (see `SavedQueue`), expanded by the SENDER into sequence names.
+    Queue,
+    /// A sequence group, expanded by the SENDER in group order.
+    Group,
+}
+
+impl BindingTarget {
+    pub const ALL: [BindingTarget; 3] = [BindingTarget::Sequence, BindingTarget::Queue, BindingTarget::Group];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BindingTarget::Sequence => "Sequence",
+            BindingTarget::Queue => "Saved queue",
+            BindingTarget::Group => "Group",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RemoteBinding {
     pub modifiers: u32,
     pub vk_code: u16,
+    /// Name of the target (JSON key kept from when only sequences could be bound).
     pub sequence_name: String,
+    #[serde(default)]
+    pub target: BindingTarget,
+}
+
+impl RemoteBinding {
+    /// The wire command this binding sends. `resolve` expands a saved queue / group name into
+    /// sequence names (injected so the mapping is testable without touching disk); an empty
+    /// expansion yields `None` (nothing to send).
+    pub fn command(&self, resolve: impl Fn(BindingTarget, &str) -> Vec<String>) -> Option<String> {
+        match self.target {
+            BindingTarget::Sequence => Some(format!("PLAY {}", self.sequence_name)),
+            BindingTarget::Queue | BindingTarget::Group => {
+                let names = resolve(self.target, &self.sequence_name);
+                if names.is_empty() {
+                    return None;
+                }
+                Some(format!("PLAY_LIST {} {}", self.sequence_name, names.join(" ")))
+            }
+        }
+    }
+}
+
+/// A named, ordered play list of sequence names. Unlike a group it may repeat a sequence and
+/// one sequence can sit in any number of saved queues. Identity is the sanitized file stem,
+/// exactly like sequences (`storage::sanitize_filename`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SavedQueue {
+    pub name: String,
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+impl SavedQueue {
+    pub fn new(name: String, items: Vec<String>) -> Self {
+        SavedQueue { name, items, created_at: chrono_now() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -171,5 +233,25 @@ mod tests {
         assert_eq!(queue_pass_micros(&[]), 0);
         assert_eq!(queue_pass_micros(&[(10, 3)]), 10);
         assert_eq!(queue_pass_micros(&[(10, 3), (20, 4), (30, 5)]), 10 + 16 + 25);
+    }
+
+    #[test]
+    fn remote_binding_command_per_target() {
+        let resolve = |t: BindingTarget, name: &str| match (t, name) {
+            (BindingTarget::Queue, "night") => vec!["a".to_string(), "b".to_string(), "a".to_string()],
+            (BindingTarget::Group, "buffs") => vec!["x".to_string()],
+            _ => Vec::new(),
+        };
+        let mk = |target, name: &str| RemoteBinding {
+            modifiers: 2, vk_code: 0x51, sequence_name: name.to_string(), target,
+        };
+        assert_eq!(mk(BindingTarget::Sequence, "farm").command(resolve).as_deref(), Some("PLAY farm"));
+        assert_eq!(mk(BindingTarget::Queue, "night").command(resolve).as_deref(), Some("PLAY_LIST night a b a"));
+        assert_eq!(mk(BindingTarget::Group, "buffs").command(resolve).as_deref(), Some("PLAY_LIST buffs x"));
+        assert_eq!(mk(BindingTarget::Group, "empty").command(resolve), None);
+        // Legacy config without a target field still parses as a sequence binding.
+        let legacy: RemoteBinding =
+            serde_json::from_str(r#"{"modifiers":4,"vk_code":82,"sequence_name":"buff_ht"}"#).unwrap();
+        assert_eq!(legacy.target, BindingTarget::Sequence);
     }
 }
