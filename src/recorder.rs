@@ -1,5 +1,5 @@
 use crate::hotkeys;
-use crate::sequence::{InputEvent, InputEventType, MouseButton};
+use crate::sequence::{fix_extended, InputEvent, InputEventType, MouseButton};
 use crate::timing::PrecisionTimer;
 use crate::win32_helpers::lock_or_recover;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -17,6 +17,7 @@ struct RecordingState {
     timer: PrecisionTimer,
     last_tick: i64,
     active: bool,
+    started: std::time::Instant,
 }
 
 static RECORDING: Mutex<Option<RecordingState>> = Mutex::new(None);
@@ -31,6 +32,7 @@ pub fn start_recording() {
         timer,
         last_tick: now,
         active: true,
+        started: std::time::Instant::now(),
     };
     *lock_or_recover(&RECORDING) = Some(state);
 
@@ -90,6 +92,14 @@ pub fn is_recording() -> bool {
     lock_or_recover(&RECORDING)
         .as_ref()
         .map_or(false, |s| s.active)
+}
+
+/// How long the current recording has been running; None when not recording.
+pub fn elapsed() -> Option<std::time::Duration> {
+    lock_or_recover(&RECORDING)
+        .as_ref()
+        .filter(|s| s.active)
+        .map(|s| s.started.elapsed())
 }
 
 fn push_event(event_type: InputEventType) {
@@ -211,10 +221,11 @@ unsafe extern "system" fn keyboard_hook_proc(
 
         let msg = w_param as u32;
         let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-        let extended = (info.flags & LLKHF_EXTENDED) != 0;
+        let vk_code = info.vkCode as u16;
+        let extended = fix_extended(vk_code, (info.flags & LLKHF_EXTENDED) != 0);
 
         push_event(InputEventType::KeyPress {
-            vk_code: info.vkCode as u16,
+            vk_code,
             scan_code: info.scanCode as u16,
             pressed,
             extended,

@@ -1,7 +1,7 @@
 use crate::win32_helpers::{
-    wide, create_control, dpi_for_window, message_box_timeout, scaled_font, scale, MB_TIMEDOUT,
+    wide, create_control, dpi_for_window, message_box_timeout, scaled_font, scale,
 };
-use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder, resume, storage, update};
+use crate::{burst, config, monitor, network, pet_cycle, player, proximity, recorder, resume, sequence, storage, update};
 use super::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -75,7 +75,7 @@ pub fn create_toolbar_window(cfg: &config::AppConfig) -> HWND {
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: scale(890, dpi),
+            right: scale(960, dpi),
             bottom: scale(52, dpi),
         };
         AdjustWindowRectEx(&mut rect, style, FALSE, ex_style as u32);
@@ -230,7 +230,7 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
     let status = create_control(
         hwnd, hinstance, font, "STATIC", "Idle",
         WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-        684, y + 2, 200, h, IDC_STATUS,
+        684, y + 2, 270, h, IDC_STATUS,
     );
 
     // Update stored controls
@@ -250,117 +250,65 @@ unsafe fn create_controls(hwnd: HWND, hinstance: HINSTANCE, cfg: &config::AppCon
     }
 }
 
-/// Show the "new version available" prompt and carry out the answer. Must run on the UI thread —
-/// the "skip this version" branch writes the toolbar's config. Both the periodic check and the
-/// Settings button reach it the same way, by posting WM_APP_UPDATE_AVAILABLE here.
+/// Install `info` now. Runs only because a human pressed Update in Settings (posted here as
+/// WM_APP_UPDATE_INSTALL so it happens on the UI thread). There is deliberately no confirmation
+/// dialog and no automatic path: a modal box in front of the game steals its keystrokes, and an
+/// unattended stop/swap/restart leaves the character un-potted long enough to die.
 ///
-/// The prompt auto-answers Yes after `update_auto_confirm_secs` (0 = wait forever), so the 22
-/// unattended fleet VMs converge on a release by themselves while a human at the console can
-/// still answer No/Cancel. Auto-Yes on a farming VM stops playback first and stages a resume
-/// marker so the updated instance picks the same sequence/queue straight back up.
-pub(crate) unsafe fn offer_update(toolbar: HWND, info: update::UpdateInfo) {
-    let owner = toolbar;
-    let cfg = config::cached_config();
-    let timeout_ms = cfg.update_auto_confirm_secs.saturating_mul(1000);
-    // Long release notes would push the buttons off screen; a summary is enough to decide.
-    let mut notes: String = info.notes.lines().take(8).collect::<Vec<_>>().join("\n");
-    if notes.chars().count() > 600 {
-        notes = notes.chars().take(600).collect::<String>() + "\u{2026}";
-    }
-    let head = format!(
-        "Cadence {} is available.\nYou have {}.",
-        info.version,
-        update::current_version()
-    );
-
+/// Stops playback at an event boundary, stages a resume marker (if `update_auto_resume`) so the
+/// updated instance picks the same sequence/queue straight back up, swaps the exe and exits.
+pub(crate) unsafe fn install_update(toolbar: HWND, info: update::UpdateInfo) {
     // A copy living somewhere unwritable (e.g. Program Files) can't swap itself out. Don't try to
-    // elevate — just offer the download page. A timeout counts as No: never pop a browser open
-    // on an unattended VM.
+    // elevate — point at the download page instead.
     if !update::can_self_update() {
         let text = format!(
-            "{}\n\n{}\n\nThis copy is in a folder Cadence can't write to, so it can't update \
-             itself.\n\nOpen the download page?",
-            head, notes
+            "Cadence {} is available (you have {}).\n\nThis copy is in a folder Cadence can't \
+             write to, so it can't update itself. Opening the download page.",
+            info.version,
+            update::current_version()
         );
-        if message_box_timeout(owner, &text, "Cadence Update",
-            MB_YESNO | MB_ICONINFORMATION, timeout_ms) == IDYES
-        {
-            open_url(update::RELEASES_PAGE);
-        }
-        update::note_declined(&info.version);
+        MessageBoxW(toolbar, wide(&text).as_ptr(), wide("Cadence Update").as_ptr(),
+            MB_OK | MB_ICONINFORMATION);
+        open_url(update::RELEASES_PAGE);
         update::set_prompt_active(false);
         return;
     }
 
-    let auto_line = if timeout_ms != 0 {
-        format!("\n\nAuto-installs in {} s if unattended.", cfg.update_auto_confirm_secs)
-    } else {
-        String::new()
-    };
-    let text = format!(
-        "{}\n\n{}\n\nYes \u{2014} download and restart now\nNo \u{2014} remind me later\n\
-         Cancel \u{2014} skip version {}{}",
-        head, notes, info.version, auto_line
-    );
-    let choice = message_box_timeout(owner, &text, "Cadence Update",
-        MB_YESNOCANCEL | MB_ICONINFORMATION, timeout_ms);
-    match choice {
-        c if c == IDYES || c == MB_TIMEDOUT => {
-            // Hint that something is happening; the status label is rewritten every timer tick,
-            // so the window title is the one spot that stays put during the download.
-            SetWindowTextW(toolbar, wide("Cadence \u{2014} updating\u{2026}").as_ptr());
-            let tb = toolbar as isize;
-            std::thread::spawn(move || {
-                // Stop the farm at an event boundary and remember what it was doing, so the
-                // updated instance can pick it straight back up. Proceed even if the playback
-                // thread is stuck in a long delay — it dies with this process anyway.
-                let source = player::current_source();
-                let was_playing = player::stop_and_wait(15_000);
-                if was_playing && config::cached_config().update_auto_resume {
-                    resume::write_marker(&source);
-                }
-                match update::apply(&info) {
-                    // The replacement is already running: close this instance so it releases
-                    // the exe.
-                    Ok(()) => {
-                        PostMessageW(tb as HWND, WM_CLOSE, 0, 0);
-                    }
-                    Err(e) => {
-                        // The restart the marker was staged for isn't happening; restart the
-                        // playback we stopped so the farm keeps running, and let the next
-                        // periodic poll retry the update.
-                        resume::clear_marker();
-                        if was_playing {
-                            resume::start_from(&source);
-                        }
-                        update::set_prompt_active(false);
-                        // SetWindowTextW (not a posted WM_SETTEXT) so the string outlives
-                        // the call.
-                        SetWindowTextW(tb as HWND, wide("Cadence").as_ptr());
-                        let msg = format!("Update failed:\n\n{}\n\nCadence is unchanged.", e);
-                        // Timed too — an error box must not sit forever on an unattended VM.
-                        message_box_timeout(std::ptr::null_mut(), &msg, "Cadence Update",
-                            MB_OK | MB_ICONERROR, 60_000);
-                    }
-                }
-            });
+    // Hint that something is happening; the status label is rewritten every timer tick, so the
+    // window title is the one spot that stays put during the download.
+    SetWindowTextW(toolbar, wide("Cadence \u{2014} updating\u{2026}").as_ptr());
+    let tb = toolbar as isize;
+    std::thread::spawn(move || {
+        // Stop the farm at an event boundary and remember what it was doing, so the updated
+        // instance can pick it straight back up. Proceed even if the playback thread is stuck in
+        // a long delay — it dies with this process anyway.
+        let source = player::current_source();
+        let was_playing = player::stop_and_wait(15_000);
+        if was_playing && config::cached_config().update_auto_resume {
+            resume::write_marker(&source);
         }
-        IDCANCEL => {
-            let ptr = GetWindowLongPtrW(toolbar, GWLP_USERDATA) as *mut ToolbarControls;
-            if !ptr.is_null() {
-                (*ptr).config.update_skip_version = info.version.clone();
-                if let Err(e) = config::save_config(&(*ptr).config) {
-                    eprintln!("[Cadence] Config save failed: {}", e);
-                }
+        match update::apply(&info) {
+            // The replacement is already running: close this instance so it releases the exe.
+            Ok(()) => {
+                PostMessageW(tb as HWND, WM_CLOSE, 0, 0);
             }
-            update::set_prompt_active(false);
+            Err(e) => {
+                // The restart the marker was staged for isn't happening; restart the playback we
+                // stopped so the farm keeps running.
+                resume::clear_marker();
+                if was_playing {
+                    resume::start_from(&source);
+                }
+                update::set_prompt_active(false);
+                // SetWindowTextW (not a posted WM_SETTEXT) so the string outlives the call.
+                SetWindowTextW(tb as HWND, wide("Cadence").as_ptr());
+                let msg = format!("Update failed:\n\n{}\n\nCadence is unchanged.", e);
+                // Timed — an error box must not sit forever in front of the game.
+                message_box_timeout(std::ptr::null_mut(), &msg, "Cadence Update",
+                    MB_OK | MB_ICONERROR, 60_000);
+            }
         }
-        _ => {
-            // IDNO: snooze this version for a while (and ask again next launch regardless).
-            update::note_declined(&info.version);
-            update::set_prompt_active(false);
-        }
-    }
+    });
 }
 
 /// Keep the status line short: long sequence names get an ellipsis.
@@ -606,9 +554,21 @@ unsafe extern "system" fn toolbar_wnd_proc(
             0
         }
         WM_APP_UPDATE_AVAILABLE => {
-            // The background check found a newer release; prompt now that we're on the UI thread.
+            // The background poll found a newer release. Passive notice only — the title bar is
+            // the one spot the status timer never rewrites. Installing is Settings › Update.
             if let Some(info) = update::take_pending() {
-                offer_update(hwnd, info);
+                let title = format!(
+                    "Cadence \u{2014} v{} available (Settings \u{203A} Update)",
+                    info.version
+                );
+                SetWindowTextW(hwnd, wide(&title).as_ptr());
+            }
+            0
+        }
+        WM_APP_UPDATE_INSTALL => {
+            // Settings › Update pressed and a newer release exists: install it on the UI thread.
+            if let Some(info) = update::take_pending() {
+                install_update(hwnd, info);
             } else {
                 // Nothing staged (e.g. a duplicate post) — don't leave the gate latched.
                 update::set_prompt_active(false);
@@ -621,8 +581,8 @@ unsafe extern "system" fn toolbar_wnd_proc(
                 if !ptr.is_null() {
                     // Update status text. Playing shows WHAT is playing; idle shows what was
                     // played last — so nobody has to remember which sequence a VM was running.
-                    let base_status = if recorder::is_recording() {
-                        "Recording...".to_string()
+                    let base_status = if let Some(elapsed) = recorder::elapsed() {
+                        format!("Recording... {}", sequence::format_duration(elapsed.as_micros() as i64))
                     } else if player::is_playing() {
                         let what = match player::current_source() {
                             player::PlaybackSource::Sequence(name) => trim_name(&name),
@@ -631,10 +591,23 @@ unsafe extern "system" fn toolbar_wnd_proc(
                             }
                             player::PlaybackSource::Adhoc => "(unsaved)".to_string(),
                         };
+                        // Clock: elapsed/pass. With Loop on, elapsed wraps each pass so it
+                        // reads as a position in the sequence, not total run time.
+                        let clock = match player::progress() {
+                            Some((elapsed, pass)) if pass > 0 => {
+                                let mut e = elapsed.as_micros() as i64;
+                                if player::is_loop_mode() {
+                                    e %= pass;
+                                }
+                                format!(" {}/{}", sequence::format_duration(e), sequence::format_duration(pass))
+                            }
+                            Some((elapsed, _)) => format!(" {}", sequence::format_duration(elapsed.as_micros() as i64)),
+                            None => String::new(),
+                        };
                         if player::is_loop_mode() {
-                            format!("Playing (loop): {}", what)
+                            format!("Playing (loop): {}{}", what, clock)
                         } else {
-                            format!("Playing: {}", what)
+                            format!("Playing: {}{}", what, clock)
                         }
                     } else {
                         let base = if network::is_listening() { "Idle (Recv)" } else { "Idle" };

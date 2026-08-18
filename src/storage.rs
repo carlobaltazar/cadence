@@ -57,16 +57,25 @@ pub struct SeqMeta {
     pub name: String,
     pub group: Option<String>,
     pub group_order: u32,
+    pub duration_micros: i64,
+    pub leading_delay_micros: i64,
 }
 
 pub fn list_sequence_meta() -> std::io::Result<Vec<SeqMeta>> {
     let names = list_sequences()?;
     let mut result = Vec::new();
     for name in names {
-        let (group, group_order) = load_sequence(&name)
-            .map(|seq| (seq.group, seq.group_order))
-            .unwrap_or((None, 0));
-        result.push(SeqMeta { name, group, group_order });
+        let meta = match load_sequence(&name) {
+            Ok(seq) => SeqMeta {
+                name,
+                duration_micros: seq.duration_micros(),
+                leading_delay_micros: seq.leading_delay_micros(),
+                group: seq.group,
+                group_order: seq.group_order,
+            },
+            Err(_) => SeqMeta { name, group: None, group_order: 0, duration_micros: 0, leading_delay_micros: 0 },
+        };
+        result.push(meta);
     }
     Ok(result)
 }
@@ -252,7 +261,9 @@ mod tests {
 
     #[test]
     fn group_members_sort_by_order_then_name() {
-        let m = |name: &str, order: u32| SeqMeta { name: name.into(), group: None, group_order: order };
+        let m = |name: &str, order: u32| SeqMeta {
+            name: name.into(), group: None, group_order: order, duration_micros: 0, leading_delay_micros: 0,
+        };
         let mut members = vec![m("zeta", 0), m("alpha", 2), m("beta", 0), m("gamma", 1)];
         sort_group_members(&mut members);
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();

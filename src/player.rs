@@ -1,14 +1,27 @@
-use crate::sequence::{InputEvent, InputEventType, MouseButton};
+use crate::sequence::{fix_extended, queue_pass_micros, InputEvent, InputEventType, MouseButton};
 use crate::timing::PrecisionTimer;
 use crate::win32_helpers::lock_or_recover;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use winapi::um::winuser::*;
 
 static PLAYING: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 static LOOP_MODE: AtomicBool = AtomicBool::new(false);
 static SHUFFLE_MODE: AtomicBool = AtomicBool::new(false);
+// For the toolbar clock: when the current playback started and how long one pass takes.
+static PLAY_STARTED: Mutex<Option<Instant>> = Mutex::new(None);
+static PASS_MICROS: AtomicI64 = AtomicI64::new(0);
+
+/// `(elapsed, one-pass duration in micros)` while playing; None otherwise.
+pub fn progress() -> Option<(Duration, i64)> {
+    if !is_playing() {
+        return None;
+    }
+    let started = (*lock_or_recover(&PLAY_STARTED))?;
+    Some((started.elapsed(), PASS_MICROS.load(Ordering::Acquire)))
+}
 
 // Serializes every SendInput call so background features (HP monitor, burst,
 // pet cycle) can't interleave events with queue playback. Each dispatch is
@@ -159,7 +172,8 @@ fn perform_event(event_type: &InputEventType, vs: (i32, i32, i32, i32)) {
             if !pressed {
                 flags |= KEYEVENTF_KEYUP;
             }
-            if *extended {
+            // Applied here too so recordings made before the fix play back correctly.
+            if fix_extended(*vk_code, *extended) {
                 flags |= KEYEVENTF_EXTENDEDKEY;
             }
             send_key_input(*vk_code, *scan_code, flags);
@@ -174,6 +188,16 @@ fn perform_event(event_type: &InputEventType, vs: (i32, i32, i32, i32)) {
 fn run_playback_opts(sequences: Vec<Vec<InputEvent>>, force_once: bool) {
     PLAYING.store(true, Ordering::Release);
     CANCEL.store(false, Ordering::Release);
+    // Shuffle only changes which item keeps its leading delay; close enough for a clock.
+    let timings: Vec<(i64, i64)> = sequences
+        .iter()
+        .map(|events| {
+            let total: i64 = events.iter().map(|e| e.delay_micros).sum();
+            (total, events.first().map_or(0, |e| e.delay_micros))
+        })
+        .collect();
+    PASS_MICROS.store(queue_pass_micros(&timings), Ordering::Release);
+    *lock_or_recover(&PLAY_STARTED) = Some(Instant::now());
 
     std::thread::spawn(move || {
         let timer = PrecisionTimer::new();

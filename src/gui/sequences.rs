@@ -1,6 +1,6 @@
 use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, vk_name};
 use std::collections::BTreeMap;
-use crate::{config, hotkeys, player, recorder, storage};
+use crate::{config, hotkeys, player, recorder, sequence, storage};
 use super::*;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use winapi::shared::minwindef::*;
@@ -123,7 +123,7 @@ unsafe extern "system" fn sequences_wnd_proc(
             create_control(
                 hwnd, hinstance, font, "STATIC", "Queue",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                286, 2, 200, 16, 0,
+                286, 2, 220, 16, IDC_STATIC_QUEUE_TOTAL,
             );
 
             create_control(
@@ -666,15 +666,10 @@ unsafe fn populate_sequences_list(h_list: HWND) {
             storage::sort_group_members(members);
         }
         storage::sort_group_members(&mut ungrouped);
-        let grouped: BTreeMap<String, Vec<String>> = grouped
-            .into_iter()
-            .map(|(g, members)| (g, members.into_iter().map(|m| m.name).collect()))
-            .collect();
-        let ungrouped: Vec<String> = ungrouped.into_iter().map(|m| m.name).collect();
 
         let has_groups = !grouped.is_empty();
 
-        for (group_name, names) in &grouped {
+        for (group_name, members) in &grouped {
             let is_collapsed = collapsed.iter().any(|g| g == group_name);
             let prefix = if is_collapsed { "[+]" } else { "[-]" };
             let header = wide(&format!("{} {}", prefix, group_name));
@@ -682,10 +677,10 @@ unsafe fn populate_sequences_list(h_list: HWND) {
             SendMessageW(h_list, LB_SETITEMDATA, hi as WPARAM, 0isize as LPARAM);
 
             if !is_collapsed {
-                for name in names {
+                for m in members {
                     let display =
-                        format_seq_display(name, &bindings, true, &last_played, newest.as_deref());
-                    add_seq_row(h_list, &display, name, &mut rows);
+                        format_seq_display(m, &bindings, true, &last_played, newest.as_deref());
+                    add_seq_row(h_list, &display, &m.name, &mut rows);
                 }
             }
         }
@@ -698,17 +693,17 @@ unsafe fn populate_sequences_list(h_list: HWND) {
             SendMessageW(h_list, LB_SETITEMDATA, hi as WPARAM, 0isize as LPARAM);
 
             if !is_collapsed {
-                for name in &ungrouped {
+                for m in &ungrouped {
                     let display =
-                        format_seq_display(name, &bindings, false, &last_played, newest.as_deref());
-                    add_seq_row(h_list, &display, name, &mut rows);
+                        format_seq_display(m, &bindings, false, &last_played, newest.as_deref());
+                    add_seq_row(h_list, &display, &m.name, &mut rows);
                 }
             }
         } else {
-            for name in &ungrouped {
+            for m in &ungrouped {
                 let display =
-                    format_seq_display(name, &bindings, false, &last_played, newest.as_deref());
-                add_seq_row(h_list, &display, name, &mut rows);
+                    format_seq_display(m, &bindings, false, &last_played, newest.as_deref());
+                add_seq_row(h_list, &display, &m.name, &mut rows);
             }
         }
 
@@ -717,17 +712,17 @@ unsafe fn populate_sequences_list(h_list: HWND) {
 }
 
 fn format_seq_display(
-    name: &str,
+    meta: &storage::SeqMeta,
     bindings: &[(u16, String)],
     indent: bool,
     last_played: &str,
     newest: Option<&str>,
 ) -> String {
-    let mut base = if let Some((vk, _)) = bindings.iter().find(|(_, n)| n == name) {
-        format!("{} [{}]", name, vk_name(*vk))
-    } else {
-        name.to_string()
-    };
+    let name = meta.name.as_str();
+    let mut base = format!("{} ({})", name, sequence::format_duration(meta.duration_micros));
+    if let Some((vk, _)) = bindings.iter().find(|(_, n)| n == name) {
+        base.push_str(&format!(" [{}]", vk_name(*vk)));
+    }
     // "Which one did I run?" / "which one did I just record?" — answered in the list itself.
     if name == last_played {
         base.push_str("  \u{25C0} last played");
@@ -745,10 +740,31 @@ unsafe fn refresh_queue_list(hwnd: HWND) {
         return;
     }
     SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
-    let queue = lock_or_recover(&SEQUENCE_QUEUE);
+    let queue = lock_or_recover(&SEQUENCE_QUEUE).clone();
+    // (duration, leading delay) per item; a missing file shows and counts as 0:00.
+    let mut timings: Vec<(i64, i64)> = Vec::with_capacity(queue.len());
     for (i, name) in queue.iter().enumerate() {
-        let display = format!("{}. {}", i + 1, name);
+        let timing = storage::load_sequence(name)
+            .map(|s| (s.duration_micros(), s.leading_delay_micros()))
+            .unwrap_or((0, 0));
+        timings.push(timing);
+        let display = format!("{}. {} ({})", i + 1, name, sequence::format_duration(timing.0));
         let wname = wide(&display);
         SendMessageW(h_list, LB_ADDSTRING, 0, wname.as_ptr() as LPARAM);
+    }
+    // Caption carries the pass total — what one Play Queue actually takes.
+    let caption = if queue.is_empty() {
+        "Queue".to_string()
+    } else {
+        format!(
+            "Queue \u{2014} {} item{}, {}",
+            queue.len(),
+            if queue.len() == 1 { "" } else { "s" },
+            sequence::format_duration(sequence::queue_pass_micros(&timings)),
+        )
+    };
+    let h_caption = GetDlgItem(hwnd, IDC_STATIC_QUEUE_TOTAL as i32);
+    if !h_caption.is_null() {
+        SetWindowTextW(h_caption, wide(&caption).as_ptr());
     }
 }

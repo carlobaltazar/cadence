@@ -61,6 +61,9 @@ pub(crate) const WM_APP_PROXIMITY_HIT: u32 = winapi::um::winuser::WM_APP + 3;
 // Posted by the update checker's worker thread when a newer release is on GitHub, so the prompt
 // is raised on the UI thread instead of from the worker.
 pub(crate) const WM_APP_UPDATE_AVAILABLE: u32 = winapi::um::winuser::WM_APP + 4;
+// Posted by the Settings "Update" button's worker thread when a newer release exists: the toolbar
+// installs it on the UI thread. This is the only path that ever downloads/restarts.
+pub(crate) const WM_APP_UPDATE_INSTALL: u32 = winapi::um::winuser::WM_APP + 5;
 
 // Settings dialog controls
 pub(crate) const IDC_COMBO_RECORD_KEY: u16 = 201;
@@ -158,6 +161,7 @@ pub(crate) const IDC_BTN_QUEUE_DOWN: u16 = 605;
 pub(crate) const IDC_BTN_PLAY_QUEUE: u16 = 606;
 pub(crate) const IDC_CHK_SHUFFLE: u16 = 607;
 pub(crate) const IDC_BTN_QUEUE_ADD_GROUP: u16 = 608; // append a whole group, in its saved order
+pub(crate) const IDC_STATIC_QUEUE_TOTAL: u16 = 609;  // "Queue — N items, m:ss" caption
 
 // Bind key dialog controls
 pub(crate) const IDC_COMBO_BIND_KEY: u16 = 501;
