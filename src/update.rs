@@ -38,12 +38,16 @@ pub struct UpdateInfo {
     pub size: u64,
 }
 
-// Filled by the background check, read by the UI thread when it handles the posted message.
+// Filled by a check, read by the UI thread when it handles the posted message.
 static PENDING: Mutex<Option<UpdateInfo>> = Mutex::new(None);
 
-// True from the moment an update prompt is posted until it resolves, so the periodic poll
-// and the manual Settings check can't stack a second dialog on top of one already showing.
-// Cleared on No/Cancel/failure; never on a successful apply — that process is exiting.
+// The newest release the background poll has seen, for the passive "vX available" notice in
+// the toolbar title and on the Settings Update button. Nothing acts on it by itself.
+static AVAILABLE: Mutex<Option<UpdateInfo>> = Mutex::new(None);
+
+// True while a manual install is in flight, so the periodic poll stays quiet and a second
+// press of Update can't start a second download. Never cleared on a successful apply — that
+// process is exiting.
 static PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_prompt_active(active: bool) {
@@ -54,54 +58,31 @@ pub fn prompt_active() -> bool {
     PROMPT_ACTIVE.load(Ordering::Acquire)
 }
 
-// The version the user last answered "No" to, and when. Keeps the periodic poll from
-// re-asking every cycle, while staying in memory only so "No" still means "remind me
-// next launch" exactly as the dialog promises.
-static DECLINED: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
-const REPROMPT_AFTER_NO_SECS: u64 = 6 * 3600;
-
-pub fn note_declined(version: &str) {
-    *DECLINED.lock().unwrap() = Some((version.to_string(), std::time::Instant::now()));
-}
-
-fn declined_recently(version: &str) -> bool {
-    snoozed(&DECLINED.lock().unwrap(), version, std::time::Instant::now())
-}
-
-/// Pure form of the snooze check, split out so the expiry logic is testable.
-fn snoozed(
-    entry: &Option<(String, std::time::Instant)>,
-    version: &str,
-    now: std::time::Instant,
-) -> bool {
-    match entry {
-        Some((v, at)) => {
-            v == version && now.saturating_duration_since(*at).as_secs() < REPROMPT_AFTER_NO_SECS
-        }
-        None => false,
-    }
-}
-
 /// The version of this build, for display in the UI.
 pub fn current_version() -> &'static str {
     VERSION
 }
 
-/// Take the update the background check found, if any.
+/// Take the update staged for the UI thread, if any.
 pub fn take_pending() -> Option<UpdateInfo> {
     PENDING.lock().unwrap().take()
 }
 
-/// Stage an update for the UI thread to prompt about (used by the manual Settings check).
+/// Stage an update for the UI thread (background notice or manual install).
 pub fn set_pending(info: UpdateInfo) {
     *PENDING.lock().unwrap() = Some(info);
 }
 
+/// The newer release the background poll last saw, if any.
+pub fn available() -> Option<UpdateInfo> {
+    AVAILABLE.lock().unwrap().clone()
+}
+
 /// Check GitHub on a worker thread — once shortly after launch (if `check_on_start`), then
-/// every `interval_mins` for as long as the process runs (0 = no periodic re-check). The
-/// periodic re-check is what makes a 24/7 fleet updatable at all: without it a VM that
-/// never relaunches would never see a new release. Posts `msg` to `hwnd` whenever a newer,
-/// non-skipped, non-snoozed release is found.
+/// every `interval_mins` for as long as the process runs (0 = no periodic re-check). Posts
+/// `msg` to `hwnd` whenever a newer, non-skipped release is found. That post only raises a
+/// passive notice: nothing downloads or restarts until a human presses Update in Settings —
+/// an unattended restart (or even a modal box in front of the game) gets characters killed.
 pub fn start_periodic(hwnd: isize, msg: u32, check_on_start: bool, interval_mins: u32) {
     std::thread::spawn(move || {
         if check_on_start {
@@ -121,10 +102,8 @@ pub fn start_periodic(hwnd: isize, msg: u32, check_on_start: bool, interval_mins
 
 fn try_check_and_post(hwnd: isize, msg: u32) {
     if prompt_active() {
-        return; // one prompt at a time
+        return; // an install is in flight; don't talk over it
     }
-    // Read the skip fresh each cycle so "Cancel — skip version X" takes effect on the
-    // next poll instead of only after a relaunch.
     let skip = crate::config::cached_config().update_skip_version;
     match check() {
         Ok(Some(info)) => {
@@ -132,18 +111,14 @@ fn try_check_and_post(hwnd: isize, msg: u32) {
                 println!("[Cadence] Update {} available but skipped by config.", info.version);
                 return;
             }
-            if declined_recently(&info.version) {
-                return;
-            }
             println!("[Cadence] Update available: {} -> {}", VERSION, info.version);
+            *AVAILABLE.lock().unwrap() = Some(info.clone());
             set_pending(info);
-            set_prompt_active(true); // before the post, so a racing poll can't double up
             let notified = hwnd != 0
                 && msg != 0
                 && unsafe { PostMessageW(hwnd as _, msg, 0, 0) != 0 };
             if !notified {
                 println!("[Cadence] Couldn't notify the UI about the update.");
-                set_prompt_active(false);
             }
         }
         Ok(None) => println!("[Cadence] Up to date ({}).", VERSION),
@@ -659,21 +634,6 @@ mod tests {
         let bytes = download_verified(&info).expect("asset downloads and passes verification");
         assert_eq!(&bytes[..2], b"MZ");
         assert_eq!(bytes.len() as u64, info.size);
-    }
-
-    #[test]
-    fn no_snooze_expires_and_is_per_version() {
-        let now = std::time::Instant::now();
-        let entry = Some(("3.5.0".to_string(), now));
-        // Same version inside the window: snoozed.
-        let later = now + std::time::Duration::from_secs(REPROMPT_AFTER_NO_SECS - 1);
-        assert!(snoozed(&entry, "3.5.0", later));
-        // Window elapsed: prompt again.
-        let expired = now + std::time::Duration::from_secs(REPROMPT_AFTER_NO_SECS);
-        assert!(!snoozed(&entry, "3.5.0", expired));
-        // A different (newer) version is never held back by an old "No".
-        assert!(!snoozed(&entry, "3.6.0", later));
-        assert!(!snoozed(&None, "3.5.0", later));
     }
 
     #[test]

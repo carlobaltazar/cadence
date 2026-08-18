@@ -109,6 +109,7 @@ pub fn scaled_font(dpi: u32) -> HFONT {
 // ---- Timed message box ----
 
 /// Return value of user32!MessageBoxTimeoutW when the timer fired before any button.
+#[allow(dead_code)] // callers currently only use the timeout as a dismissal, not the verdict
 pub const MB_TIMEDOUT: i32 = 32000;
 
 /// MessageBoxW that auto-dismisses after `timeout_ms`, returning MB_TIMEDOUT if nobody

@@ -113,6 +113,36 @@ unsafe fn create_section_controls(
     );
 }
 
+/// Pet Guard / Idle Guard checkbox clicked: push the new state into the live monitor and the
+/// saved config right away (the pixel/threshold fields still apply on OK, like everything else).
+unsafe fn apply_guard_toggle(hwnd: HWND, chk_id: u16) {
+    let ptr = GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA) as *mut ToolbarControls;
+    if ptr.is_null() {
+        return;
+    }
+    let on = SendMessageW(GetDlgItem(hwnd, chk_id as i32), BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+    let cfg = &mut (*ptr).config;
+    use crate::monitor::{self, Bar};
+    if chk_id == IDC_CHK_PET_GUARD {
+        let secs = (read_edit_i32(hwnd, IDC_EDIT_PET_GUARD_SECS).max(0) as u32).clamp(2, 120);
+        cfg.pet_guard_enabled = on;
+        cfg.pet_guard_hungry_secs = secs;
+        monitor::set_pet_guard(on, secs);
+    } else {
+        cfg.idle_guard_enabled = on;
+        if on && cfg.idle_guard_color != 0 {
+            monitor::set_bar(Bar::Skill,
+                cfg.hp_monitor_window_class.clone(), cfg.hp_monitor_window_title.clone(),
+                cfg.idle_guard_x, cfg.idle_guard_y, cfg.idle_guard_color);
+        } else {
+            monitor::disable_bar(Bar::Skill);
+        }
+    }
+    if let Err(e) = config::save_config(cfg) {
+        eprintln!("[Cadence] Config save failed: {}", e);
+    }
+}
+
 /// Read an integer from a numeric edit control, defaulting to 0.
 unsafe fn read_edit_i32(hwnd: HWND, id: u16) -> i32 {
     let mut buf = [0u16; 16];
@@ -449,9 +479,13 @@ unsafe extern "system" fn settings_wnd_proc(
                 wide(&watch_text).as_ptr() as LPARAM);
             create_control(hwnd, hinstance, font, "BUTTON", "Detected Players / Ignore\u{2026}",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 332, 300, 200, 26, IDC_BTN_PROX_PLAYERS);
-            // Manual update check; the automatic one runs at launch. Slots into the gap left by
-            // the Players button on the same row, so the dialog doesn't grow.
-            create_control(hwnd, hinstance, font, "BUTTON", "Update",
+            // The only way updates install (see IDC_BTN_UPDATE below). The background poll just
+            // notes what's available; surface that on the label so the button says why to press it.
+            let update_label = match crate::update::available() {
+                Some(info) => format!("Update \u{25B8} v{}", info.version),
+                None => "Update".to_string(),
+            };
+            create_control(hwnd, hinstance, font, "BUTTON", &update_label,
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 536, 300, 68, 26, IDC_BTN_UPDATE);
 
             // -- Pet Guard (right column, below Proximity) --
@@ -617,22 +651,30 @@ unsafe extern "system" fn settings_wnd_proc(
                 let owner = if owner.is_null() { hwnd } else { owner };
                 super::players::show_players_dialog(owner);
                 return 0;
+            } else if control_id == IDC_CHK_PET_GUARD || control_id == IDC_CHK_IDLE_GUARD {
+                // Guard toggles apply and persist the moment they're clicked, so closing with X
+                // (or an OK that trips a validation error) can't lose them.
+                apply_guard_toggle(hwnd, control_id);
+                return 0;
             } else if control_id == IDC_BTN_UPDATE {
-                // On-demand check. Runs on a worker thread so a slow/dead network can't freeze the
-                // dialog, then hands the answer back here to prompt on the UI thread.
+                // The only way an update ever installs: a human pressed this. Runs the check on a
+                // worker thread so a slow/dead network can't freeze the dialog, then hands off to
+                // the toolbar (UI thread) which stops playback and swaps the exe. No confirmation
+                // dialog — a modal box in front of the game steals its keystrokes.
+                if crate::update::prompt_active() {
+                    MessageBoxW(hwnd, wide("An update is already installing.").as_ptr(),
+                        wide("Cadence Update").as_ptr(), MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
                 let toolbar = GetWindow(hwnd, GW_OWNER);
                 let toolbar = if toolbar.is_null() { GetParent(hwnd) } else { toolbar };
                 let (dlg, tb) = (hwnd as isize, toolbar as isize);
                 std::thread::spawn(move || match crate::update::check() {
-                    // Hand off to the toolbar so the prompt (and the config write behind
-                    // "skip this version") happens on the UI thread, exactly as the
-                    // automatic startup check does.
                     Ok(Some(info)) => unsafe {
                         crate::update::set_pending(info);
-                        // Latch the gate exactly like the periodic poll does, so a poll
-                        // firing now can't stack a second prompt on this one.
+                        // Latch the gate so the periodic poll stays quiet while this installs.
                         crate::update::set_prompt_active(true);
-                        PostMessageW(tb as HWND, WM_APP_UPDATE_AVAILABLE, 0, 0);
+                        PostMessageW(tb as HWND, WM_APP_UPDATE_INSTALL, 0, 0);
                     },
                     Ok(None) => unsafe {
                         let msg = format!(
@@ -657,9 +699,13 @@ unsafe extern "system" fn settings_wnd_proc(
                 let rec_idx = SendMessageW(h_combo_rec, CB_GETCURSEL, 0, 0) as usize;
                 let play_idx = SendMessageW(h_combo_play, CB_GETCURSEL, 0, 0) as usize;
 
-                if rec_idx < KEY_OPTIONS.len() && play_idx < KEY_OPTIONS.len() {
-                    let new_rec_vk = KEY_OPTIONS[rec_idx].0;
-                    let new_stop_vk = KEY_OPTIONS[play_idx].0;
+                // A combo with no selection (current key not in KEY_OPTIONS) keeps the key it
+                // already has — OK must never silently do nothing, or every other change on the
+                // dialog is lost with no message.
+                let (cur_rec_vk, cur_stop_vk) = hotkeys::current_hotkeys();
+                {
+                    let new_rec_vk = KEY_OPTIONS.get(rec_idx).map_or(cur_rec_vk, |k| k.0);
+                    let new_stop_vk = KEY_OPTIONS.get(play_idx).map_or(cur_stop_vk, |k| k.0);
 
                     // Read queue key selection
                     let h_combo_queue = GetDlgItem(hwnd, IDC_COMBO_QUEUE_KEY as i32);
