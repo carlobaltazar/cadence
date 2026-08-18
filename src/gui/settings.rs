@@ -11,11 +11,31 @@ use winapi::um::winuser::*;
 
 const GA_ROOT: u32 = 2;
 
-// Dialog design size (96-DPI units). Two columns — left: hotkeys + HP/MP/SP monitors,
-// right: Burst Q + Proximity — so the whole dialog (OK button included) fits a
-// 1024×768 screen even at 125% display scaling.
+// Dialog design size (96-DPI units, CLIENT area). Two columns — left: hotkeys + the four
+// pixel sections, right: Burst Q + Proximity + Pet Guard. The window is created from this
+// client size via AdjustWindowRectEx (see `outer_size`) — never guess an outer height: v3.8.0
+// added a section and the fixed 560-px outer height silently pushed OK below the client edge.
 const DIALOG_W: i32 = 640;
-const DIALOG_H: i32 = 560;
+/// Bottom of the last left-column section (Idle Guard's live readout) + gap + OK + margin.
+const DIALOG_CLIENT_H: i32 = SECTIONS_TOP + 3 * SECTION_PITCH + SECTION_H + OK_GAP + OK_H + MARGIN;
+const MARGIN: i32 = 12;
+const OK_GAP: i32 = 12;
+const OK_W: i32 = 70;
+const OK_H: i32 = 28;
+
+const DIALOG_STYLE: u32 =
+    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE;
+const DIALOG_EX_STYLE: u32 = WS_EX_TOOLWINDOW;
+
+/// Outer window size (in pixels for `dpi`) whose client area is DIALOG_W × DIALOG_CLIENT_H at
+/// that DPI. Falls back to the system-DPI AdjustWindowRectEx if the ForDpi variant fails.
+unsafe fn outer_size(dpi: u32) -> (i32, i32) {
+    let mut rc = RECT { left: 0, top: 0, right: scale(DIALOG_W, dpi), bottom: scale(DIALOG_CLIENT_H, dpi) };
+    if AdjustWindowRectExForDpi(&mut rc, DIALOG_STYLE & !WS_VISIBLE, FALSE, DIALOG_EX_STYLE, dpi) == 0 {
+        AdjustWindowRectEx(&mut rc, DIALOG_STYLE & !WS_VISIBLE, FALSE, DIALOG_EX_STYLE);
+    }
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 // Per-slot sampled color, indexed 0=HP, 1=MP, 2=SP, 3=Skill (Idle Guard).
@@ -43,10 +63,13 @@ fn pick_ctrl_ids(target: u8) -> (u16, u16, u16, u16, u16) {
 
 const BAR_LABELS: [&str; 4] = ["HP", "MP", "SP", "Skill"];
 
-/// Vertical pitch of the four left-column pixel sections. Four sections (HP/MP/SP/Skill)
-/// have to fit above the OK floor inside DIALOG_H, hence the tight rows: header y0,
-/// X/Y/Pick y0+21, Sample/colour y0+48, live readout y0+74 (bottom y0+94).
+/// Vertical pitch of the four left-column pixel sections (HP/MP/SP/Skill): header y0,
+/// X/Y/Pick y0+21, Sample/colour y0+48, live readout y0+74 (bottom y0+SECTION_H). The first
+/// section starts at SECTIONS_TOP; DIALOG_CLIENT_H is derived from these, so adding a section
+/// grows the window instead of hiding OK.
+const SECTIONS_TOP: i32 = 128;
 const SECTION_PITCH: i32 = 96;
+const SECTION_H: i32 = 94;
 
 /// Build one pixel-monitor section (header, X/Y edits, Pick/Sample buttons, color +
 /// live labels) at vertical origin `y0`. `header_chk` != 0 makes the header a checkbox
@@ -109,7 +132,7 @@ unsafe fn create_section_controls(
     );
     create_control(
         hwnd, hinstance, font, "STATIC", "",
-        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 74, 268, 20, live,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, 0, 12, y0 + 74, 268, 20, live,
     );
 }
 
@@ -199,7 +222,7 @@ unsafe fn layout(hwnd: HWND) {
     if cw <= 0 || ch <= 0 {
         return;
     }
-    let m = scale(12, dpi);
+    let m = scale(MARGIN, dpi);
     let right = cw - m;
 
     // Only the RIGHT column follows the window's right edge; the left column (hotkeys +
@@ -212,14 +235,16 @@ unsafe fn layout(hwnd: HWND) {
         stretch_to_right(hwnd, id, right, dpi, true);
     }
 
-    // OK floats to the bottom-centre, but never above the bottom of the TALLEST column
-    // (left: Skill live readout; right: Pet Guard help line) — so a short window can't make it
-    // overlap content. The min-track size guarantees the client can always hold the floor.
-    let ok_w = scale(70, dpi);
-    let ok_h = scale(28, dpi);
+    // OK is pinned to the bottom-centre of the client. The min-track size (outer_size, derived
+    // from DIALOG_CLIENT_H) guarantees that sits below the TALLEST column (left: Skill live
+    // readout; right: Pet Guard help line). It is deliberately NOT pushed down to the content
+    // floor when the client is shorter: an OK that overlaps content beats an invisible one —
+    // v3.8.0 shipped exactly that, and every Settings change was lost to the X button.
+    let ok_w = scale(OK_W, dpi);
+    let ok_h = scale(OK_H, dpi);
     let ok = GetDlgItem(hwnd, IDC_BTN_SETTINGS_OK as i32);
     if !ok.is_null() {
-        let gap = scale(12, dpi);
+        let gap = scale(OK_GAP, dpi);
         let mut floor = m; // fallback if neither column-bottom control can be located
         for id in [IDC_STATIC_IDLE_LIVE, IDC_BTN_PROX_PLAYERS, IDC_STATIC_PET_GUARD_HELP] {
             let h = GetDlgItem(hwnd, id as i32);
@@ -231,7 +256,7 @@ unsafe fn layout(hwnd: HWND) {
                 floor = floor.max(bl.y + gap);
             }
         }
-        let ok_y = (ch - m - ok_h).max(floor).max(0);
+        let ok_y = (ch - m - ok_h).max(0);
         MoveWindow(ok, (cw - ok_w) / 2, ok_y, ok_w, ok_h, TRUE);
 
         // Stretch the vertical column divider down to the content floor.
@@ -263,7 +288,10 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
     // never spawn below the bottom of a low-resolution screen. SPI_GETWORKAREA is the
     // primary monitor's work area — good enough, the toolbar lives there on the VMs.
     let dpi = dpi_for_window(parent);
-    let (w_px, h_px) = (scale(DIALOG_W, dpi), scale(DIALOG_H, dpi));
+    // register_and_create_dialog scales its w/h by the parent's DPI, so hand it the 96-dpi
+    // outer size; the clamp below needs the real pixel size for this DPI.
+    let (w_96, h_96) = outer_size(96);
+    let (w_px, h_px) = outer_size(dpi);
     let mut work: RECT = std::mem::zeroed();
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut RECT as *mut _, 0);
     let sx = parent_rect.left.min(work.right - w_px).max(work.left);
@@ -274,11 +302,11 @@ pub unsafe fn show_settings_dialog(parent: HWND) {
     let hwnd = register_and_create_dialog(
         "CadenceSettings", &title,
         settings_wnd_proc,
-        WS_EX_TOOLWINDOW as u32,
+        DIALOG_EX_STYLE,
         // Resizable: WS_THICKFRAME + WS_MAXIMIZEBOX let the user widen/maximize the dialog;
         // WM_SIZE reflows the width-following controls and re-pins OK to the bottom.
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE,
-        sx, sy, DIALOG_W, DIALOG_H,
+        DIALOG_STYLE,
+        sx, sy, w_96, h_96,
         parent, hinstance,
     );
     SETTINGS_HWND.store(hwnd as isize, Ordering::Release);
@@ -339,7 +367,7 @@ unsafe extern "system" fn settings_wnd_proc(
 
             // -- Pixel monitors (HP / MP / SP + the Idle Guard's skill pixel), all via the
             // shared helper so they're identical --
-            let sec = |i: i32| 128 + i * SECTION_PITCH;
+            let sec = |i: i32| SECTIONS_TOP + i * SECTION_PITCH;
             create_section_controls(hwnd, hinstance, font, "\u{2014} HP Monitor \u{2014}", 0, sec(0),
                 IDC_EDIT_HP_X, IDC_EDIT_HP_Y, IDC_BTN_HP_PICK, IDC_BTN_HP_SAMPLE,
                 IDC_STATIC_HP_COLOR, 190, IDC_STATIC_HP_LIVE);
@@ -363,7 +391,7 @@ unsafe extern "system" fn settings_wnd_proc(
             create_control(hwnd, hinstance, font, "STATIC", "s",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 276, sec(3) + 51, 10, 20, 0);
             SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_IDLE_LIVE as i32),
-                wide("Sample the pixel WHILE the skill shows its cooldown.").as_ptr());
+                wide("Sample WHILE the skill shows its cooldown.").as_ptr());
 
             // Vertical divider between the two columns (left: hotkeys + bar monitors,
             // right: Burst + Proximity). Repurposes the old DIV2 id.
@@ -507,11 +535,11 @@ unsafe extern "system" fn settings_wnd_proc(
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 490, 400, 114, 20, 0);
             create_control(hwnd, hinstance, font, "STATIC",
                 "Needs the MP or SP monitor on. Pauses while HP reads low.",
-                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 426, 272, 20, IDC_STATIC_PET_GUARD_HELP);
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 426, 272, 34, IDC_STATIC_PET_GUARD_HELP);
 
             // OK button (re-pinned to the window bottom by layout()).
             create_control(hwnd, hinstance, font, "BUTTON", "OK",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 285, 470, 70, 28, IDC_BTN_SETTINGS_OK);
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 285, 470, OK_W, OK_H, IDC_BTN_SETTINGS_OK);
 
             // Pre-fill the monitor X/Y/color fields and the burst rate from config (single fetch).
             // HP/MP/SP share one game window, so the sampled class/title come from HP's config.
@@ -1089,8 +1117,11 @@ unsafe extern "system" fn settings_wnd_proc(
                     KillTimer(hwnd, TIMER_HP_PICK);
                     let text = wide("Pick");
                     SetWindowTextW(GetDlgItem(hwnd, pick_id as i32), text.as_ptr());
+                    // Title only (class when untitled): the Afx class string alone is wider
+                    // than the readout, and the class is saved regardless.
+                    let short_label = if under_title.is_empty() { under_class.clone() } else { under_title.clone() };
                     let captured_msg = if anchored {
-                        format!("Captured: {} ({}, {})", win_label, saved_x, saved_y)
+                        format!("Captured: {} ({}, {})", short_label, saved_x, saved_y)
                     } else {
                         format!("Captured (legacy absolute): ({}, {})", saved_x, saved_y)
                     };
@@ -1107,8 +1138,9 @@ unsafe extern "system" fn settings_wnd_proc(
         WM_GETMINMAXINFO => {
             let dpi = dpi_for_window(hwnd);
             let mmi = &mut *(l_param as *mut MINMAXINFO);
-            mmi.ptMinTrackSize.x = scale(DIALOG_W, dpi);
-            mmi.ptMinTrackSize.y = scale(DIALOG_H, dpi);
+            let (w, h) = outer_size(dpi);
+            mmi.ptMinTrackSize.x = w;
+            mmi.ptMinTrackSize.y = h;
             0
         }
         WM_CLOSE => {

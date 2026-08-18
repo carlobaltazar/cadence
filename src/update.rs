@@ -33,6 +33,8 @@ const MAX_EXE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone)]
 pub struct UpdateInfo {
     pub version: String,
+    /// Release body; kept for the log / a future notes view (no longer shown in a prompt).
+    #[allow(dead_code)]
     pub notes: String,
     pub url: String,
     pub size: u64,
