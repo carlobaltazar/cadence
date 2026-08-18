@@ -5,6 +5,7 @@ mod sequences;
 mod bind_key;
 mod rename_dialog;
 mod set_group_dialog;
+mod duplicate_dialog;
 mod remote;
 mod add_binding;
 mod players;
@@ -32,6 +33,9 @@ pub(crate) static RENAME_SEQ_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 // Selected sequence names for the set-group dialog (bulk: the group applies to all of them)
 pub(crate) static SET_GROUP_SEQ_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// Selected sequence names for the duplicate dialog (each gets its own copy)
+pub(crate) static DUPLICATE_SEQ_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 // Groups that are currently collapsed in the sequences list
 pub(crate) static COLLAPSED_GROUPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -99,6 +103,15 @@ pub(crate) const IDC_CHK_PET_GUARD: u16 = 253;
 pub(crate) const IDC_EDIT_PET_GUARD_SECS: u16 = 254;
 pub(crate) const IDC_SETTINGS_DIV4: u16 = 255;
 pub(crate) const IDC_STATIC_PET_GUARD_HELP: u16 = 256;
+// Idle Guard (Settings, left column, 4th pixel section: skill cooldown pixel)
+pub(crate) const IDC_EDIT_IDLE_X: u16 = 257;
+pub(crate) const IDC_EDIT_IDLE_Y: u16 = 258;
+pub(crate) const IDC_BTN_IDLE_PICK: u16 = 259;
+pub(crate) const IDC_BTN_IDLE_SAMPLE: u16 = 260;
+pub(crate) const IDC_STATIC_IDLE_COLOR: u16 = 261;
+pub(crate) const IDC_STATIC_IDLE_LIVE: u16 = 262;
+pub(crate) const IDC_CHK_IDLE_GUARD: u16 = 263;
+pub(crate) const IDC_EDIT_IDLE_SECS: u16 = 264;
 
 // Players (detected/ignore) dialog controls
 pub(crate) const IDC_LIST_PLAYERS: u16 = 901;
@@ -121,6 +134,7 @@ pub(crate) const IDC_BTN_PLAYER_EXPORT: u16 = 906; // export current view to .xl
 pub(crate) const IDC_EDIT_SEQ_NAME: u16 = 301;
 pub(crate) const IDC_BTN_SAVE_OK: u16 = 302;
 pub(crate) const IDC_BTN_SAVE_CANCEL: u16 = 303;
+pub(crate) const IDC_EDIT_DUP_GROUP: u16 = 304; // duplicate dialog: target group
 
 // Sequence manager controls
 pub(crate) const IDC_LIST_SEQUENCES: u16 = 401;
@@ -131,6 +145,9 @@ pub(crate) const IDC_BTN_SET_DEFAULT: u16 = 405;
 pub(crate) const IDC_BTN_RENAME_SEQ: u16 = 406;
 pub(crate) const IDC_BTN_SET_GROUP: u16 = 407;
 pub(crate) const IDC_BTN_SELECT_ALL: u16 = 408;
+pub(crate) const IDC_BTN_DUPLICATE_SEQ: u16 = 409;
+pub(crate) const IDC_BTN_SEQ_UP: u16 = 410;   // reorder within group
+pub(crate) const IDC_BTN_SEQ_DOWN: u16 = 411;
 
 // Queue controls
 pub(crate) const IDC_BTN_QUEUE_ADD: u16 = 601;
@@ -140,6 +157,7 @@ pub(crate) const IDC_BTN_QUEUE_UP: u16 = 604;
 pub(crate) const IDC_BTN_QUEUE_DOWN: u16 = 605;
 pub(crate) const IDC_BTN_PLAY_QUEUE: u16 = 606;
 pub(crate) const IDC_CHK_SHUFFLE: u16 = 607;
+pub(crate) const IDC_BTN_QUEUE_ADD_GROUP: u16 = 608; // append a whole group, in its saved order
 
 // Bind key dialog controls
 pub(crate) const IDC_COMBO_BIND_KEY: u16 = 501;

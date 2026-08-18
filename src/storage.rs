@@ -51,14 +51,100 @@ pub fn list_sequences() -> std::io::Result<Vec<String>> {
     Ok(names)
 }
 
-pub fn list_sequences_with_groups() -> std::io::Result<Vec<(String, Option<String>)>> {
+/// The bits of a sequence the list needs without holding every event list in memory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeqMeta {
+    pub name: String,
+    pub group: Option<String>,
+    pub group_order: u32,
+}
+
+pub fn list_sequence_meta() -> std::io::Result<Vec<SeqMeta>> {
     let names = list_sequences()?;
     let mut result = Vec::new();
     for name in names {
-        let group = load_sequence(&name).map(|seq| seq.group).unwrap_or(None);
-        result.push((name, group));
+        let (group, group_order) = load_sequence(&name)
+            .map(|seq| (seq.group, seq.group_order))
+            .unwrap_or((None, 0));
+        result.push(SeqMeta { name, group, group_order });
     }
     Ok(result)
+}
+
+/// Display/play order inside one group: explicit order first, name breaks ties (so legacy
+/// files, all order 0, stay alphabetical).
+pub fn sort_group_members(members: &mut [SeqMeta]) {
+    members.sort_by(|a, b| a.group_order.cmp(&b.group_order).then_with(|| a.name.cmp(&b.name)));
+}
+
+/// Ordered names of one group bucket (`None` = ungrouped).
+pub fn group_members(group: Option<&str>) -> Vec<String> {
+    let mut members: Vec<SeqMeta> = list_sequence_meta()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m.group.as_deref() == group)
+        .collect();
+    sort_group_members(&mut members);
+    members.into_iter().map(|m| m.name).collect()
+}
+
+/// Order value that puts a sequence after every current member of `group`.
+pub fn next_group_order(group: Option<&str>) -> u32 {
+    list_sequence_meta()
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m.group.as_deref() == group)
+        .map(|m| m.group_order + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Persist `names` as the exact order of their group: position becomes `group_order`.
+pub fn set_group_order(names_in_order: &[String]) -> std::io::Result<()> {
+    for (i, name) in names_in_order.iter().enumerate() {
+        let mut seq = load_sequence(name)?;
+        if seq.group_order != i as u32 {
+            seq.group_order = i as u32;
+            save_sequence(&seq)?;
+        }
+    }
+    Ok(())
+}
+
+/// First of `base_copy`, `base_copy2`, `base_copy3`, … that `exists` rejects. Only `[A-Za-z0-9_]`
+/// is appended so the display name and the sanitized filename stay identical.
+pub(crate) fn copy_name(base: &str, exists: impl Fn(&str) -> bool) -> String {
+    let first = format!("{}_copy", base);
+    if !exists(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|n| format!("{}_copy{}", base, n))
+        .find(|candidate| !exists(candidate))
+        .expect("unbounded counter")
+}
+
+pub fn unique_copy_name(base: &str) -> String {
+    let dir = sequences_dir();
+    copy_name(base, |candidate| {
+        dir.join(format!("{}.json", sanitize_filename(candidate))).exists()
+    })
+}
+
+/// Copy `src` under `new_name` into `group`, placed after that group's current members.
+/// Fails with `AlreadyExists` if the target name is taken (including `src` itself).
+pub fn duplicate_sequence(src: &str, new_name: &str, group: Option<String>) -> std::io::Result<()> {
+    let target = sequences_dir().join(format!("{}.json", sanitize_filename(new_name)));
+    if target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("A sequence named \"{}\" already exists", new_name),
+        ));
+    }
+    let seq = load_sequence(src)?;
+    let order = next_group_order(group.as_deref());
+    save_sequence(&seq.copy_as(new_name.to_string(), group, order))?;
+    Ok(())
 }
 
 /// Name of the most recently saved/modified sequence (by file mtime) — the one the
@@ -155,6 +241,22 @@ mod tests {
         assert_eq!(seq.describe().as_deref(), Some("farm loop"));
         let q = LastPlayed { name: String::new(), queue: vec!["a".into(), "b".into()] };
         assert_eq!(q.describe().as_deref(), Some("queue (2): a, b"));
+    }
+
+    #[test]
+    fn copy_name_skips_taken_names() {
+        assert_eq!(copy_name("farm", |_| false), "farm_copy");
+        let taken = ["farm_copy", "farm_copy2"];
+        assert_eq!(copy_name("farm", |n| taken.contains(&n)), "farm_copy3");
+    }
+
+    #[test]
+    fn group_members_sort_by_order_then_name() {
+        let m = |name: &str, order: u32| SeqMeta { name: name.into(), group: None, group_order: order };
+        let mut members = vec![m("zeta", 0), m("alpha", 2), m("beta", 0), m("gamma", 1)];
+        sort_group_members(&mut members);
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["beta", "zeta", "gamma", "alpha"]);
     }
 }
 

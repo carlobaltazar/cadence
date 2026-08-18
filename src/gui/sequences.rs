@@ -81,6 +81,31 @@ unsafe extern "system" fn sequences_wnd_proc(
             );
             populate_sequences_list(h_list);
 
+            // Row under the list: arrange a sequence inside its group, and group-level actions.
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Up",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                10, 314, 44, 26, IDC_BTN_SEQ_UP,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Down",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                58, 314, 50, 26, IDC_BTN_SEQ_DOWN,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Select All",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                112, 314, 74, 26, IDC_BTN_SELECT_ALL,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "BUTTON", "Group >>",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                190, 314, 78, 26, IDC_BTN_QUEUE_ADD_GROUP,
+            );
+
             // -- Transfer buttons (between panels) --
             create_control(
                 hwnd, hinstance, font, "BUTTON", ">>",
@@ -147,7 +172,7 @@ unsafe extern "system" fn sequences_wnd_proc(
                 214, 350, 54, 30, IDC_BTN_SET_DEFAULT,
             );
 
-            // Second row: Rename and Set Group buttons
+            // Second row: Rename, Set Group, Duplicate
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Rename",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
@@ -161,9 +186,9 @@ unsafe extern "system" fn sequences_wnd_proc(
             );
 
             create_control(
-                hwnd, hinstance, font, "BUTTON", "Select All",
+                hwnd, hinstance, font, "BUTTON", "Duplicate",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                182, 385, 86, 30, IDC_BTN_SELECT_ALL,
+                182, 385, 86, 30, IDC_BTN_DUPLICATE_SEQ,
             );
 
             // Shuffle checkbox
@@ -197,6 +222,10 @@ unsafe extern "system" fn sequences_wnd_proc(
                 x if x == IDC_BTN_SET_DEFAULT => handle_set_default(hwnd),
                 x if x == IDC_BTN_RENAME_SEQ => handle_rename_seq(hwnd),
                 x if x == IDC_BTN_SET_GROUP => handle_set_group(hwnd),
+                x if x == IDC_BTN_DUPLICATE_SEQ => handle_duplicate(hwnd),
+                x if x == IDC_BTN_SEQ_UP => handle_seq_move(hwnd, -1),
+                x if x == IDC_BTN_SEQ_DOWN => handle_seq_move(hwnd, 1),
+                x if x == IDC_BTN_QUEUE_ADD_GROUP => handle_queue_add_group(hwnd),
                 x if x == IDC_BTN_SELECT_ALL => {
                     let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
                     // Select every row; headers get filtered out by the bulk operations.
@@ -316,6 +345,113 @@ unsafe fn handle_set_group(hwnd: HWND) {
     }
 }
 
+unsafe fn handle_duplicate(hwnd: HWND) {
+    let names = get_selected_sequence_names(hwnd);
+    if !names.is_empty() {
+        *lock_or_recover(&DUPLICATE_SEQ_NAMES) = names;
+        duplicate_dialog::show_duplicate_dialog(hwnd);
+    }
+}
+
+/// Move the single selected sequence one slot up (`delta` = -1) or down (+1) inside its
+/// group, and persist the group's new order.
+unsafe fn handle_seq_move(hwnd: HWND, delta: i32) {
+    let Some(name) = get_selected_sequence_name(hwnd) else { return };
+    let group = storage::load_sequence(&name).ok().and_then(|s| s.group);
+    let mut members = storage::group_members(group.as_deref());
+    let Some(idx) = members.iter().position(|n| *n == name) else { return };
+    let target = idx as i32 + delta;
+    if target < 0 || target as usize >= members.len() {
+        return;
+    }
+    members.swap(idx, target as usize);
+    if let Err(e) = storage::set_group_order(&members) {
+        eprintln!("[Cadence] Failed to save group order: {}", e);
+    }
+    let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
+    SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
+    populate_sequences_list(h_list);
+    select_seq_row_by_name(h_list, &name);
+}
+
+/// Append every member of each selected group to the queue, in the group's saved order.
+/// A group counts as selected if its header row is (works while collapsed) or any of its
+/// sequence rows is.
+unsafe fn handle_queue_add_group(hwnd: HWND) {
+    let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
+    let count = SendMessageW(h_list, LB_GETSELCOUNT, 0, 0);
+    if count <= 0 {
+        return;
+    }
+    let mut idxs = vec![0i32; count as usize];
+    let got = SendMessageW(h_list, LB_GETSELITEMS, count as WPARAM, idxs.as_mut_ptr() as LPARAM);
+    if got <= 0 {
+        return;
+    }
+    let meta = storage::list_sequence_meta().unwrap_or_default();
+    let mut groups: Vec<Option<String>> = Vec::new();
+    {
+        let rows = lock_or_recover(&ROW_NAMES);
+        for &idx in &idxs[..got as usize] {
+            let data = SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0);
+            let group = if data == 0 {
+                match header_group_key(h_list, idx as isize) {
+                    Some(key) if key == UNGROUPED_HEADER => None,
+                    Some(key) => Some(key),
+                    None => continue,
+                }
+            } else {
+                let Some(name) = rows.get(data as usize - 1) else { continue };
+                match meta.iter().find(|m| m.name == *name) {
+                    Some(m) => m.group.clone(),
+                    None => continue,
+                }
+            };
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+    }
+    if groups.is_empty() {
+        return;
+    }
+    let mut queue = lock_or_recover(&SEQUENCE_QUEUE);
+    for group in &groups {
+        queue.extend(storage::group_members(group.as_deref()));
+    }
+    drop(queue);
+    refresh_queue_list(hwnd);
+}
+
+const UNGROUPED_HEADER: &str = "(Ungrouped)";
+
+/// Group name of a header row, i.e. its text minus the "[+] " / "[-] " prefix.
+unsafe fn header_group_key(h_list: HWND, idx: isize) -> Option<String> {
+    let len = SendMessageW(h_list, LB_GETTEXTLEN, idx as WPARAM, 0);
+    if len < 4 {
+        return None;
+    }
+    let mut buf = vec![0u16; (len + 1) as usize];
+    SendMessageW(h_list, LB_GETTEXT, idx as WPARAM, buf.as_mut_ptr() as LPARAM);
+    let text = String::from_utf16_lossy(&buf[..len as usize]);
+    text.get(4..).map(|s| s.to_string())
+}
+
+/// Select (and caret) the row showing `name`, if it is visible.
+unsafe fn select_seq_row_by_name(h_list: HWND, name: &str) {
+    let rows = lock_or_recover(&ROW_NAMES);
+    let count = SendMessageW(h_list, LB_GETCOUNT, 0, 0);
+    for idx in 0..count {
+        let data = SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0);
+        if data > 0 && rows.get(data as usize - 1).is_some_and(|n| n == name) {
+            SendMessageW(h_list, LB_SETSEL, 0, -1isize);
+            SendMessageW(h_list, LB_SETSEL, 1, idx as LPARAM);
+            SendMessageW(h_list, LB_SETCARETINDEX, idx as WPARAM, 0);
+            return;
+        }
+    }
+}
+
 unsafe fn handle_list_click(hwnd: HWND) {
     let h_list = GetDlgItem(hwnd, IDC_LIST_SEQUENCES as i32);
     // Caret = the item actually clicked; LB_GETCURSEL is not meaningful on an
@@ -326,14 +462,7 @@ unsafe fn handle_list_click(hwnd: HWND) {
     // Only act on header items (data = 0); sequence items (data = 1) are ignored
     if SendMessageW(h_list, LB_GETITEMDATA, idx as WPARAM, 0) != 0 { return; }
 
-    // Extract group key by stripping "[+] " / "[-] " prefix (4 chars)
-    let len = SendMessageW(h_list, LB_GETTEXTLEN, idx as WPARAM, 0);
-    if len < 4 { return; }
-    let mut buf = vec![0u16; (len + 1) as usize];
-    SendMessageW(h_list, LB_GETTEXT, idx as WPARAM, buf.as_mut_ptr() as LPARAM);
-    let text = String::from_utf16_lossy(&buf[..len as usize]);
-    if text.len() < 4 { return; }
-    let group_key = text[4..].to_string(); // strip "[+] " or "[-] "
+    let Some(group_key) = header_group_key(h_list, idx) else { return };
 
     {
         let mut collapsed = lock_or_recover(&COLLAPSED_GROUPS);
@@ -515,22 +644,33 @@ unsafe fn add_seq_row(h_list: HWND, display: &str, name: &str, rows: &mut Vec<St
 }
 
 unsafe fn populate_sequences_list(h_list: HWND) {
-    if let Ok(items) = storage::list_sequences_with_groups() {
+    if let Ok(items) = storage::list_sequence_meta() {
         let bindings = hotkeys::current_sequence_bindings();
         let collapsed = lock_or_recover(&COLLAPSED_GROUPS);
         let last_played = storage::last_played().name;
         let newest = storage::newest_sequence();
         let mut rows: Vec<String> = Vec::new();
 
-        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut ungrouped: Vec<String> = Vec::new();
+        // Bucket by group, then order each bucket by its saved arrangement so the list shows
+        // (and >> / Play / Group >> hand out) sequences in play order.
+        let mut grouped: BTreeMap<String, Vec<storage::SeqMeta>> = BTreeMap::new();
+        let mut ungrouped: Vec<storage::SeqMeta> = Vec::new();
 
-        for (name, group) in &items {
-            match group {
-                Some(g) => grouped.entry(g.clone()).or_default().push(name.clone()),
-                None => ungrouped.push(name.clone()),
+        for item in items {
+            match &item.group {
+                Some(g) => grouped.entry(g.clone()).or_default().push(item),
+                None => ungrouped.push(item),
             }
         }
+        for members in grouped.values_mut() {
+            storage::sort_group_members(members);
+        }
+        storage::sort_group_members(&mut ungrouped);
+        let grouped: BTreeMap<String, Vec<String>> = grouped
+            .into_iter()
+            .map(|(g, members)| (g, members.into_iter().map(|m| m.name).collect()))
+            .collect();
+        let ungrouped: Vec<String> = ungrouped.into_iter().map(|m| m.name).collect();
 
         let has_groups = !grouped.is_empty();
 
@@ -551,9 +691,9 @@ unsafe fn populate_sequences_list(h_list: HWND) {
         }
 
         if has_groups && !ungrouped.is_empty() {
-            let is_collapsed = collapsed.iter().any(|g| g == "(Ungrouped)");
+            let is_collapsed = collapsed.iter().any(|g| g == UNGROUPED_HEADER);
             let prefix = if is_collapsed { "[+]" } else { "[-]" };
-            let header = wide(&format!("{} (Ungrouped)", prefix));
+            let header = wide(&format!("{} {}", prefix, UNGROUPED_HEADER));
             let hi = SendMessageW(h_list, LB_ADDSTRING, 0, header.as_ptr() as LPARAM);
             SendMessageW(h_list, LB_SETITEMDATA, hi as WPARAM, 0isize as LPARAM);
 

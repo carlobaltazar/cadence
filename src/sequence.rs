@@ -46,6 +46,10 @@ pub struct Sequence {
     pub total_duration_micros: i64,
     #[serde(default)]
     pub group: Option<String>,
+    /// Play/display position inside its group (ties broken by name). Legacy files default to 0,
+    /// which keeps them alphabetical.
+    #[serde(default)]
+    pub group_order: u32,
 }
 
 impl Sequence {
@@ -59,6 +63,21 @@ impl Sequence {
             created_at,
             total_duration_micros,
             group: None,
+            group_order: 0,
+        }
+    }
+
+    /// A copy of this recording under a new identity. Hotkeys are not copied — a key maps
+    /// to exactly one sequence.
+    pub fn copy_as(&self, name: String, group: Option<String>, group_order: u32) -> Sequence {
+        Sequence {
+            name,
+            hotkey: None,
+            events: self.events.clone(),
+            created_at: chrono_now(),
+            total_duration_micros: self.total_duration_micros,
+            group,
+            group_order,
         }
     }
 

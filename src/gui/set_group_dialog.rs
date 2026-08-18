@@ -107,14 +107,19 @@ unsafe extern "system" fn set_group_wnd_proc(
                 let new_group = String::from_utf16_lossy(&buf[..len as usize]).trim().to_string();
 
                 let seq_filenames = lock_or_recover(&SET_GROUP_SEQ_NAMES).clone();
+                let target_group = if new_group.is_empty() { None } else { Some(new_group.clone()) };
+                // Sequences moved into a different group are appended after its current
+                // members, keeping their own relative order; unchanged ones stay put.
+                let mut next_order = storage::next_group_order(target_group.as_deref());
                 for filename in &seq_filenames {
                     match storage::load_sequence(filename) {
                         Ok(mut seq) => {
-                            seq.group = if new_group.is_empty() {
-                                None
-                            } else {
-                                Some(new_group.clone())
-                            };
+                            if seq.group == target_group {
+                                continue;
+                            }
+                            seq.group = target_group.clone();
+                            seq.group_order = next_order;
+                            next_order += 1;
                             if let Err(e) = storage::save_sequence(&seq) {
                                 eprintln!("[Cadence] Failed to save group: {}", e);
                             }
