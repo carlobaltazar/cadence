@@ -6,10 +6,10 @@
 //! The client reports raw truth only (bar states + how stale they are); all
 //! judgment calls (offline, HP-critical-sustained, death-suspected) are made
 //! server-side, so thresholds can be tuned without redeploying the fleet.
-//! The one client-side judgment is `pet` = "hungry": Pet Guard already had to
-//! wait its configured window before that word means anything, and the edge
-//! event is what makes the POST immediate. The server still decides when a
-//! sustained "hungry" becomes an alert.
+//! The client-side judgments are `pet` = "hungry" and `skill` = "idle": Pet
+//! Guard / Idle Guard already had to wait their configured windows before those
+//! words mean anything, and the edge event is what makes the POST immediate. The
+//! server still decides when a sustained "hungry"/"idle" becomes an alert.
 //! Timestamps are never sent — only relative ages — so VM clock skew is moot.
 //!
 //! The payload deliberately contains no window titles or exe paths.
@@ -57,6 +57,9 @@ struct ReportBody<'a> {
     bars_age_secs: i64,
     /// Pet Guard: "off" (disabled, or no MP/SP monitor to ride on), "ok", "hungry".
     pet: &'static str,
+    /// Idle Guard: "off" (skill pixel not armed), "ok", "idle" (no skill cooldown seen
+    /// for the configured window while a sequence plays).
+    skill: &'static str,
     events: Vec<WireEvent>,
 }
 
@@ -143,12 +146,25 @@ fn pet_wire_state(snap: &monitor::BarsSnapshot) -> &'static str {
     }
 }
 
+/// Idle Guard state on the wire. "off" unless the skill pixel slot is armed; "idle" once
+/// no cooldown colour has been seen for the configured window while playing.
+fn skill_wire_state(snap: &monitor::BarsSnapshot) -> &'static str {
+    if !snap.bars[monitor::Bar::Skill as usize].enabled {
+        "off"
+    } else if snap.skill_idle {
+        "idle"
+    } else {
+        "ok"
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 struct Edges {
     playing: bool,
     window_found: bool,
     hp_low: bool,
     pet_hungry: bool,
+    skill_idle: bool,
 }
 
 fn push(queue: &mut VecDeque<Pending>, kind: &'static str, detail: String) {
@@ -171,6 +187,7 @@ fn run(url: String, token: String, label: String) {
         window_found: true,
         hp_low: false,
         pet_hungry: false,
+        skill_idle: false,
     };
     let mut first = true;
     // Start "due" so the first heartbeat goes out on the first tick.
@@ -184,12 +201,14 @@ fn run(url: String, token: String, label: String) {
         let snap = monitor::snapshot();
         let any_bar = snap.bars.iter().any(|b| b.enabled);
         let pet = pet_wire_state(&snap);
+        let skill = skill_wire_state(&snap);
         let cur = Edges {
             playing: player::is_playing(),
             // Window presence is only knowable while the bar monitor runs.
             window_found: if any_bar { snap.window_found } else { true },
             hp_low: snap.bars[0].enabled && snap.bars[0].low,
             pet_hungry: pet == "hungry",
+            skill_idle: skill == "idle",
         };
 
         if first {
@@ -234,6 +253,27 @@ fn run(url: String, token: String, label: String) {
                     detail,
                 );
             }
+            if cur.skill_idle != prev.skill_idle {
+                let detail = if cur.skill_idle {
+                    let secs = if snap.skill_nomatch_since_ms > 0 {
+                        now_unix_ms().saturating_sub(snap.skill_nomatch_since_ms) / 1000
+                    } else {
+                        0
+                    };
+                    format!(
+                        "no skill cooldown for {}s while playing, hp {}",
+                        secs,
+                        if cur.hp_low { "low" } else { "ok" }
+                    )
+                } else {
+                    String::new()
+                };
+                push(
+                    &mut queue,
+                    if cur.skill_idle { "idle" } else { "idle_recovered" },
+                    detail,
+                );
+            }
         }
         prev = cur;
 
@@ -267,6 +307,7 @@ fn run(url: String, token: String, label: String) {
                 },
                 bars_age_secs: bars_age_secs(&snap),
                 pet,
+                skill,
                 events,
             };
             match serde_json::to_vec(&body) {
@@ -321,6 +362,7 @@ mod tests {
             bars: WireBars { hp: "ok", mp: "low", sp: "off" },
             bars_age_secs: 2,
             pet: "hungry",
+            skill: "idle",
             events: vec![WireEvent { kind: "playback_started", detail: String::new(), age_secs: 3 }],
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&body).unwrap()).unwrap();
@@ -330,6 +372,7 @@ mod tests {
         assert_eq!(v["bars"]["sp"], "off");
         assert_eq!(v["bars_age_secs"], 2);
         assert_eq!(v["pet"], "hungry");
+        assert_eq!(v["skill"], "idle");
         assert_eq!(v["events"][0]["kind"], "playback_started");
         assert_eq!(v["events"][0]["age_secs"], 3);
     }
@@ -349,6 +392,19 @@ mod tests {
         assert_eq!(pet_wire_state(&snap(true, false, false, true)), "off");
         assert_eq!(pet_wire_state(&snap(true, true, false, false)), "ok");
         assert_eq!(pet_wire_state(&snap(true, false, true, true)), "hungry");
+    }
+
+    #[test]
+    fn skill_state_is_off_unless_the_skill_pixel_is_armed() {
+        let mut s = monitor::snapshot();
+        s.bars[monitor::Bar::Skill as usize].enabled = false;
+        s.skill_idle = true;
+        assert_eq!(skill_wire_state(&s), "off");
+        s.bars[monitor::Bar::Skill as usize].enabled = true;
+        s.skill_idle = false;
+        assert_eq!(skill_wire_state(&s), "ok");
+        s.skill_idle = true;
+        assert_eq!(skill_wire_state(&s), "idle");
     }
 
     #[test]

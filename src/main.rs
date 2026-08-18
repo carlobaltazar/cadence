@@ -183,6 +183,19 @@ fn main() {
     // Pet Guard rides on the MP/SP monitors (see monitor.rs); arm it from config.
     monitor::set_pet_guard(cfg.pet_guard_enabled, cfg.pet_guard_hungry_secs);
 
+    // Idle Guard: the skill-cooldown pixel slot (observe only), same window anchor as HP.
+    monitor::set_idle_guard(cfg.idle_guard_after_secs);
+    if cfg.idle_guard_enabled && cfg.idle_guard_color != 0 {
+        monitor::set_bar(
+            monitor::Bar::Skill,
+            cfg.hp_monitor_window_class.clone(),
+            cfg.hp_monitor_window_title.clone(),
+            cfg.idle_guard_x,
+            cfg.idle_guard_y,
+            cfg.idle_guard_color,
+        );
+    }
+
     // Auto-start fleet heartbeat reporting (dashboard server), if enabled.
     report::start(&cfg);
 

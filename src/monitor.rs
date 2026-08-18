@@ -9,16 +9,18 @@ use winapi::shared::windef::HWND;
 use winapi::um::wingdi::GetPixel;
 use winapi::um::winuser::*;
 
-/// The three bars this monitor watches. All three sit on the same game window
-/// (shared anchor) and press a fixed key when their pixel drifts off-color.
+/// The pixels this monitor watches. All sit on the same game window (shared anchor).
+/// HP/MP/SP press a fixed key when their pixel drifts off-color. `Skill` is the Idle
+/// Guard's slot: it never presses anything (see the Idle Guard block below).
 #[derive(Clone, Copy)]
 pub enum Bar {
     Hp = 0,
     Mp = 1,
     Sp = 2,
+    Skill = 3,
 }
 
-const BAR_COUNT: usize = 3;
+const BAR_COUNT: usize = 4;
 const CLR_INVALID: u32 = 0xFFFFFFFF;
 const COLOR_TOLERANCE: u32 = 48; // Manhattan distance across BGR channels
 const POLL_INTERVAL_MICROS: i64 = 10_000; // ~10ms tick — detects a drop within ~10ms
@@ -27,9 +29,23 @@ const POLL_INTERVAL_MICROS: i64 = 10_000; // ~10ms tick — detects a drop withi
 // (avoids flooding the game with ~100 presses/sec).
 const FIRE_COOLDOWN: Duration = Duration::from_millis(120);
 
-// Fixed keys per bar: HP->Q, MP->W, SP->E.
-const BAR_VK: [u16; BAR_COUNT] = [0x51, 0x57, 0x45];
-const BAR_NAME: [&str; BAR_COUNT] = ["HP", "MP", "SP"];
+// Fixed keys per bar: HP->Q, MP->W, SP->E. 0 = observe only (Skill slot).
+const BAR_VK: [u16; BAR_COUNT] = [0x51, 0x57, 0x45, 0];
+const BAR_NAME: [&str; BAR_COUNT] = ["HP", "MP", "SP", "SKILL"];
+
+// --- Idle Guard ------------------------------------------------------------------------------
+// When the bag is full the game parks an item on the cursor; playback keeps pressing keys but
+// no skill fires, and the HP proxy sees nothing until the character actually dies. The guard
+// watches one pixel on a quickbar skill icon whose reference colour was sampled WHILE the skill
+// showed its cooldown overlay (the hotbar animates constantly, so plain pixel change is not a
+// usable signal). Each tick where the pixel matches that colour = "a skill was just used".
+// The `Skill` slot therefore reuses the bar machinery with the meaning inverted: `low` (off the
+// sampled colour) is the quiet state; `!low` is activity. No cooldown seen for IDLE_AFTER_MS
+// while a sequence is playing => idle. Ticks that could not sample (game window missing / not
+// foreground) and ticks while nothing is playing reset the streak: a gap must never read as idle.
+static IDLE_AFTER_MS: AtomicU64 = AtomicU64::new(60_000);
+/// Wall-clock ms when the current "no cooldown seen while playing" streak began; 0 = none.
+static SKILL_NOMATCH_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 
 // --- Pet Guard ------------------------------------------------------------------------------
 // The pet is the character's regen source; with it out, MP/SP regen so fast the "low" pixel is
@@ -72,7 +88,8 @@ impl BarState {
     }
 }
 
-static BARS: [BarState; BAR_COUNT] = [BarState::new(), BarState::new(), BarState::new()];
+static BARS: [BarState; BAR_COUNT] =
+    [BarState::new(), BarState::new(), BarState::new(), BarState::new()];
 
 /// Passive per-bar observations for the reporting thread: when the pixel was
 /// last sampled and whether it currently reads off-color ("low"). Written by
@@ -94,7 +111,7 @@ impl BarObs {
     }
 }
 
-static OBS: [BarObs; BAR_COUNT] = [BarObs::new(), BarObs::new(), BarObs::new()];
+static OBS: [BarObs; BAR_COUNT] = [BarObs::new(), BarObs::new(), BarObs::new(), BarObs::new()];
 
 /// Whether the anchored game window currently exists (regardless of focus).
 /// Meaningful only while the worker thread runs with a window anchor.
@@ -127,6 +144,11 @@ pub struct BarsSnapshot {
     pub pet_hungry: bool,
     /// Pet-toggle presses in the current episode.
     pub pet_calls: u32,
+    /// Idle Guard: the skill pixel is enabled, a sequence is playing, and no cooldown colour
+    /// has been seen for the configured window.
+    pub skill_idle: bool,
+    /// Wall-clock ms when the current no-cooldown streak began; 0 = none.
+    pub skill_nomatch_since_ms: u64,
 }
 
 /// Point-in-time view of the bar observations, for the reporting thread.
@@ -147,9 +169,14 @@ pub fn snapshot() -> BarsSnapshot {
     }
     let pet_low_since_ms = PET_LOW_SINCE_MS.load(Ordering::Acquire);
     let first_call_ms = PET_FIRST_CALL_MS.load(Ordering::Acquire);
+    let now = now_ms();
     let pet_hungry = pet_low_since_ms > 0
         && first_call_ms > 0
-        && now_ms().saturating_sub(first_call_ms) >= PET_HUNGRY_AFTER_MS.load(Ordering::Acquire);
+        && now.saturating_sub(first_call_ms) >= PET_HUNGRY_AFTER_MS.load(Ordering::Acquire);
+    let skill_nomatch_since_ms = SKILL_NOMATCH_SINCE_MS.load(Ordering::Acquire);
+    let skill_idle = bars[Bar::Skill as usize].enabled
+        && skill_nomatch_since_ms > 0
+        && now.saturating_sub(skill_nomatch_since_ms) >= IDLE_AFTER_MS.load(Ordering::Acquire);
     BarsSnapshot {
         window_found: WINDOW_FOUND.load(Ordering::Acquire),
         bars,
@@ -157,7 +184,26 @@ pub fn snapshot() -> BarsSnapshot {
         pet_low_since_ms,
         pet_hungry,
         pet_calls: PET_CALLS.load(Ordering::Acquire),
+        skill_idle,
+        skill_nomatch_since_ms,
     }
+}
+
+/// Set how long the skill pixel may go without showing its cooldown colour (while a
+/// sequence plays) before the snapshot reports `skill_idle`. Takes effect on the next tick.
+pub fn set_idle_guard(after_secs: u32) {
+    IDLE_AFTER_MS.store(u64::from(after_secs.max(5)) * 1000, Ordering::Release);
+}
+
+/// Idle Guard is armed (= the Skill pixel slot is enabled).
+pub fn idle_guard_enabled() -> bool {
+    is_active(Bar::Skill)
+}
+
+/// Forget the current no-cooldown streak. Called on every tick that did not (or could not)
+/// observe the skill pixel while playing, so gaps never accumulate into a false idle.
+fn idle_streak_reset() {
+    SKILL_NOMATCH_SINCE_MS.store(0, Ordering::Release);
 }
 
 /// Switch Pet Guard on/off and set how long MP/SP must stay low before the
@@ -267,11 +313,13 @@ fn ensure_running() {
     thread::spawn(move || {
         let timer = PrecisionTimer::new();
 
-        // Per-bar scan codes computed once.
+        // Per-bar scan codes computed once (0 for observe-only slots).
         let scans: [u16; BAR_COUNT] = {
             let mut s = [0u16; BAR_COUNT];
             for i in 0..BAR_COUNT {
-                s[i] = player::scan_code(BAR_VK[i]);
+                if BAR_VK[i] != 0 {
+                    s[i] = player::scan_code(BAR_VK[i]);
+                }
             }
             s
         };
@@ -283,6 +331,8 @@ fn ensure_running() {
         let pet_scan = player::scan_code(PET_VK);
         let mut pet_low_start: Option<Instant> = None;
         let mut pet_last_call: Option<Instant> = None;
+        // Idle Guard: whether the current streak has already been announced on the console.
+        let mut idle_announced = false;
 
         loop {
             if CANCEL.load(Ordering::Acquire) {
@@ -294,6 +344,7 @@ fn ensure_running() {
                 pet_low_start = None;
                 pet_last_call = None;
                 reset_pet_episode();
+                idle_streak_reset();
                 thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -304,19 +355,24 @@ fn ensure_running() {
             unsafe {
                 // Resolve the game window + DC ONCE per tick, then sample every
                 // enabled bar against it. Shared anchor => one GetDC for all bars.
+                // Every early-out below is a tick that observed nothing, so the
+                // Idle Guard streak is reset on each of them.
                 let (hwnd, hdc) = if use_window_anchor {
                     let hwnd = find_game_window(&class, &title);
                     WINDOW_FOUND.store(!hwnd.is_null(), Ordering::Release);
                     if hwnd.is_null() {
+                        idle_streak_reset();
                         thread::sleep(Duration::from_millis(500));
                         continue;
                     }
                     if GetForegroundWindow() != hwnd {
+                        idle_streak_reset();
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
                     let hdc = GetDC(hwnd);
                     if hdc.is_null() {
+                        idle_streak_reset();
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
@@ -324,6 +380,7 @@ fn ensure_running() {
                 } else {
                     let hdc = GetDC(std::ptr::null_mut());
                     if hdc.is_null() {
+                        idle_streak_reset();
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
@@ -358,7 +415,7 @@ fn ensure_running() {
                         } else {
                             OBS[i].low_since_ms.store(0, Ordering::Release);
                         }
-                        if low && last_fire[i].elapsed() >= FIRE_COOLDOWN {
+                        if low && BAR_VK[i] != 0 && last_fire[i].elapsed() >= FIRE_COOLDOWN {
                             // Bar is below threshold and the per-bar cooldown elapsed:
                             // fire once, then wait FIRE_COOLDOWN before the next press.
                             player::send_key_press(BAR_VK[i], scans[i]);
@@ -368,6 +425,42 @@ fn ensure_running() {
                 }
 
                 ReleaseDC(hwnd, hdc);
+
+                // --- Idle Guard ---
+                // Skill pixel matching its sampled cooldown colour (= !low) is activity. A
+                // no-match streak only accumulates while the pixel is actually observed AND a
+                // sequence is playing; anything else forgets the streak.
+                match tick_low[Bar::Skill as usize] {
+                    Some(false) => {
+                        idle_streak_reset();
+                        idle_announced = false;
+                    }
+                    Some(true) if player::is_playing() => {
+                        let now = now_ms();
+                        let _ = SKILL_NOMATCH_SINCE_MS.compare_exchange(
+                            0,
+                            now,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        let since = SKILL_NOMATCH_SINCE_MS.load(Ordering::Acquire);
+                        if !idle_announced
+                            && since > 0
+                            && now.saturating_sub(since) >= IDLE_AFTER_MS.load(Ordering::Acquire)
+                        {
+                            idle_announced = true;
+                            println!(
+                                "[Cadence] Idle guard: no skill cooldown for {}s while playing.",
+                                now.saturating_sub(since) / 1000
+                            );
+                        }
+                    }
+                    _ => {
+                        // Skill slot disabled / unreadable this tick / not playing.
+                        idle_streak_reset();
+                        idle_announced = false;
+                    }
+                }
 
                 // --- Pet Guard ---
                 // MP or SP low (whichever monitors are on) => pet not out. While HP reads low

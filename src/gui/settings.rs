@@ -18,80 +18,98 @@ const DIALOG_W: i32 = 640;
 const DIALOG_H: i32 = 560;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
-// Per-bar sampled color, indexed 0=HP, 1=MP, 2=SP.
-static SAMPLED_COLOR: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+// Per-slot sampled color, indexed 0=HP, 1=MP, 2=SP, 3=Skill (Idle Guard).
+static SAMPLED_COLOR: [AtomicU32; 4] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 // Window class/title are shared across bars (same game window).
 static SAMPLED_CLASS: Mutex<String> = Mutex::new(String::new());
 static SAMPLED_TITLE: Mutex<String> = Mutex::new(String::new());
 static PICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-// Which bar the live picker is currently capturing for (0=HP,1=MP,2=SP).
+// Which slot the live picker is currently capturing for (0=HP,1=MP,2=SP,3=Skill).
 static PICK_TARGET: AtomicU8 = AtomicU8::new(0);
 // Capture device names, index-aligned to the proximity interface combo (after "(Auto-select)").
 static PROX_DEVICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Map a bar target (0=HP,1=MP,2=SP) to its dialog control IDs:
+/// Map a pixel-slot target (0=HP,1=MP,2=SP,3=Skill) to its dialog control IDs:
 /// (edit_x, edit_y, color_label, pick_button, live_label).
 fn pick_ctrl_ids(target: u8) -> (u16, u16, u16, u16, u16) {
     match target {
         1 => (IDC_EDIT_MP_X, IDC_EDIT_MP_Y, IDC_STATIC_MP_COLOR, IDC_BTN_MP_PICK, IDC_STATIC_MP_LIVE),
         2 => (IDC_EDIT_SP_X, IDC_EDIT_SP_Y, IDC_STATIC_SP_COLOR, IDC_BTN_SP_PICK, IDC_STATIC_SP_LIVE),
+        3 => (IDC_EDIT_IDLE_X, IDC_EDIT_IDLE_Y, IDC_STATIC_IDLE_COLOR, IDC_BTN_IDLE_PICK, IDC_STATIC_IDLE_LIVE),
         _ => (IDC_EDIT_HP_X, IDC_EDIT_HP_Y, IDC_STATIC_HP_COLOR, IDC_BTN_HP_PICK, IDC_STATIC_HP_LIVE),
     }
 }
 
-const BAR_LABELS: [&str; 3] = ["HP", "MP", "SP"];
+const BAR_LABELS: [&str; 4] = ["HP", "MP", "SP", "Skill"];
 
-/// Build one monitor section (header, X/Y edits, Pick/Sample buttons, color +
-/// live labels) at vertical origin `y0`. Mirrors the hand-laid HP section.
+/// Vertical pitch of the four left-column pixel sections. Four sections (HP/MP/SP/Skill)
+/// have to fit above the OK floor inside DIALOG_H, hence the tight rows: header y0,
+/// X/Y/Pick y0+21, Sample/colour y0+48, live readout y0+74 (bottom y0+94).
+const SECTION_PITCH: i32 = 96;
+
+/// Build one pixel-monitor section (header, X/Y edits, Pick/Sample buttons, color +
+/// live labels) at vertical origin `y0`. `header_chk` != 0 makes the header a checkbox
+/// with that id (Idle Guard's on/off) instead of a centred caption; `color_w` is the
+/// width of the sampled-colour label (narrower when the row carries extra controls).
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_section_controls(
     hwnd: HWND,
     hinstance: HINSTANCE,
     font: HFONT,
-    label: &str,
+    header: &str,
+    header_chk: u16,
     y0: i32,
     edit_x: u16,
     edit_y: u16,
     pick: u16,
     sample: u16,
     color: u16,
+    color_w: i32,
     live: u16,
 ) {
-    create_control(
-        hwnd, hinstance, font, "STATIC", &format!("\u{2014} {} Monitor \u{2014}", label),
-        WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, y0, 272, 18, 0,
-    );
+    if header_chk != 0 {
+        create_control(
+            hwnd, hinstance, font, "BUTTON", header,
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0, 12, y0, 272, 18, header_chk,
+        );
+    } else {
+        create_control(
+            hwnd, hinstance, font, "STATIC", header,
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 12, y0, 272, 18, 0,
+        );
+    }
     create_control(
         hwnd, hinstance, font, "STATIC", "X:",
-        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 26, 16, 20, 0,
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 23, 16, 20, 0,
     );
     create_control(
         hwnd, hinstance, font, "EDIT", "",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0, 30, y0 + 24, 70, 22, edit_x,
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0, 30, y0 + 21, 70, 22, edit_x,
     );
     create_control(
         hwnd, hinstance, font, "STATIC", "Y:",
-        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 112, y0 + 26, 16, 20, 0,
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 112, y0 + 23, 16, 20, 0,
     );
     create_control(
         hwnd, hinstance, font, "EDIT", "",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0, 130, y0 + 24, 70, 22, edit_y,
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0, 130, y0 + 21, 70, 22, edit_y,
     );
     create_control(
         hwnd, hinstance, font, "BUTTON", "Pick",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 210, y0 + 24, 60, 22, pick,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 210, y0 + 21, 60, 22, pick,
     );
     create_control(
         hwnd, hinstance, font, "BUTTON", "Sample",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, y0 + 56, 60, 24, sample,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 12, y0 + 48, 60, 24, sample,
     );
     create_control(
         hwnd, hinstance, font, "STATIC", "(not sampled)",
-        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 80, y0 + 59, 190, 20, color,
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 80, y0 + 51, color_w, 20, color,
     );
     create_control(
         hwnd, hinstance, font, "STATIC", "",
-        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 86, 268, 20, live,
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, y0 + 74, 268, 20, live,
     );
 }
 
@@ -165,7 +183,7 @@ unsafe fn layout(hwnd: HWND) {
     }
 
     // OK floats to the bottom-centre, but never above the bottom of the TALLEST column
-    // (left: SP live readout; right: Pet Guard help line) — so a short window can't make it
+    // (left: Skill live readout; right: Pet Guard help line) — so a short window can't make it
     // overlap content. The min-track size guarantees the client can always hold the floor.
     let ok_w = scale(70, dpi);
     let ok_h = scale(28, dpi);
@@ -173,7 +191,7 @@ unsafe fn layout(hwnd: HWND) {
     if !ok.is_null() {
         let gap = scale(12, dpi);
         let mut floor = m; // fallback if neither column-bottom control can be located
-        for id in [IDC_STATIC_SP_LIVE, IDC_BTN_PROX_PLAYERS, IDC_STATIC_PET_GUARD_HELP] {
+        for id in [IDC_STATIC_IDLE_LIVE, IDC_BTN_PROX_PLAYERS, IDC_STATIC_PET_GUARD_HELP] {
             let h = GetDlgItem(hwnd, id as i32);
             if !h.is_null() {
                 let mut r: RECT = std::mem::zeroed();
@@ -289,16 +307,33 @@ unsafe extern "system" fn settings_wnd_proc(
             create_control(hwnd, hinstance, font, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 116, 272, 2, IDC_SETTINGS_DIV1);
 
-            // -- Bar monitors (HP / MP / SP), all via the shared helper so they're identical --
-            create_section_controls(hwnd, hinstance, font, "HP", 128,
+            // -- Pixel monitors (HP / MP / SP + the Idle Guard's skill pixel), all via the
+            // shared helper so they're identical --
+            let sec = |i: i32| 128 + i * SECTION_PITCH;
+            create_section_controls(hwnd, hinstance, font, "\u{2014} HP Monitor \u{2014}", 0, sec(0),
                 IDC_EDIT_HP_X, IDC_EDIT_HP_Y, IDC_BTN_HP_PICK, IDC_BTN_HP_SAMPLE,
-                IDC_STATIC_HP_COLOR, IDC_STATIC_HP_LIVE);
-            create_section_controls(hwnd, hinstance, font, "MP", 240,
+                IDC_STATIC_HP_COLOR, 190, IDC_STATIC_HP_LIVE);
+            create_section_controls(hwnd, hinstance, font, "\u{2014} MP Monitor \u{2014}", 0, sec(1),
                 IDC_EDIT_MP_X, IDC_EDIT_MP_Y, IDC_BTN_MP_PICK, IDC_BTN_MP_SAMPLE,
-                IDC_STATIC_MP_COLOR, IDC_STATIC_MP_LIVE);
-            create_section_controls(hwnd, hinstance, font, "SP", 352,
+                IDC_STATIC_MP_COLOR, 190, IDC_STATIC_MP_LIVE);
+            create_section_controls(hwnd, hinstance, font, "\u{2014} SP Monitor \u{2014}", 0, sec(2),
                 IDC_EDIT_SP_X, IDC_EDIT_SP_Y, IDC_BTN_SP_PICK, IDC_BTN_SP_SAMPLE,
-                IDC_STATIC_SP_COLOR, IDC_STATIC_SP_LIVE);
+                IDC_STATIC_SP_COLOR, 190, IDC_STATIC_SP_LIVE);
+            // Idle Guard: header is the on/off checkbox; the Sample row also holds the idle
+            // window. The pixel is sampled WHILE the skill shows its cooldown (see monitor.rs).
+            create_section_controls(hwnd, hinstance, font,
+                "Idle Guard \u{2014} skill cooldown pixel", IDC_CHK_IDLE_GUARD, sec(3),
+                IDC_EDIT_IDLE_X, IDC_EDIT_IDLE_Y, IDC_BTN_IDLE_PICK, IDC_BTN_IDLE_SAMPLE,
+                IDC_STATIC_IDLE_COLOR, 100, IDC_STATIC_IDLE_LIVE);
+            create_control(hwnd, hinstance, font, "STATIC", "Idle after:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 184, sec(3) + 51, 58, 20, 0);
+            create_control(hwnd, hinstance, font, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
+                244, sec(3) + 49, 30, 22, IDC_EDIT_IDLE_SECS);
+            create_control(hwnd, hinstance, font, "STATIC", "s",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 276, sec(3) + 51, 10, 20, 0);
+            SetWindowTextW(GetDlgItem(hwnd, IDC_STATIC_IDLE_LIVE as i32),
+                wide("Sample the pixel WHILE the skill shows its cooldown.").as_ptr());
 
             // Vertical divider between the two columns (left: hotkeys + bar monitors,
             // right: Burst + Proximity). Repurposes the old DIV2 id.
@@ -452,6 +487,13 @@ unsafe extern "system" fn settings_wnd_proc(
                 prepopulate_section(hwnd, 0, cfg.hp_monitor_x, cfg.hp_monitor_y, cfg.hp_monitor_color);
                 prepopulate_section(hwnd, 1, cfg.mp_monitor_x, cfg.mp_monitor_y, cfg.mp_monitor_color);
                 prepopulate_section(hwnd, 2, cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
+                prepopulate_section(hwnd, 3, cfg.idle_guard_x, cfg.idle_guard_y, cfg.idle_guard_color);
+                if cfg.idle_guard_enabled {
+                    SendMessageW(GetDlgItem(hwnd, IDC_CHK_IDLE_GUARD as i32), BM_SETCHECK,
+                        BST_CHECKED as WPARAM, 0);
+                }
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_IDLE_SECS as i32),
+                    wide(&cfg.idle_guard_after_secs.to_string()).as_ptr());
                 *lock_or_recover(&SAMPLED_CLASS) = cfg.hp_monitor_window_class.clone();
                 *lock_or_recover(&SAMPLED_TITLE) = cfg.hp_monitor_window_title.clone();
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_BURST_RATE as i32),
@@ -472,11 +514,14 @@ unsafe extern "system" fn settings_wnd_proc(
             if control_id == IDC_BTN_HP_PICK
                 || control_id == IDC_BTN_MP_PICK
                 || control_id == IDC_BTN_SP_PICK
+                || control_id == IDC_BTN_IDLE_PICK
             {
                 let target: u8 = if control_id == IDC_BTN_MP_PICK {
                     1
                 } else if control_id == IDC_BTN_SP_PICK {
                     2
+                } else if control_id == IDC_BTN_IDLE_PICK {
+                    3
                 } else {
                     0
                 };
@@ -503,11 +548,14 @@ unsafe extern "system" fn settings_wnd_proc(
             } else if control_id == IDC_BTN_HP_SAMPLE
                 || control_id == IDC_BTN_MP_SAMPLE
                 || control_id == IDC_BTN_SP_SAMPLE
+                || control_id == IDC_BTN_IDLE_SAMPLE
             {
                 let target: u8 = if control_id == IDC_BTN_MP_SAMPLE {
                     1
                 } else if control_id == IDC_BTN_SP_SAMPLE {
                     2
+                } else if control_id == IDC_BTN_IDLE_SAMPLE {
+                    3
                 } else {
                     0
                 };
@@ -711,6 +759,16 @@ unsafe extern "system" fn settings_wnd_proc(
                             (*ptr).config.sp_monitor_y = read_edit_i32(hwnd, IDC_EDIT_SP_Y);
                             (*ptr).config.sp_monitor_color = SAMPLED_COLOR[2].load(Ordering::Acquire);
 
+                            // Save Idle Guard (skill cooldown pixel) settings
+                            (*ptr).config.idle_guard_x = read_edit_i32(hwnd, IDC_EDIT_IDLE_X);
+                            (*ptr).config.idle_guard_y = read_edit_i32(hwnd, IDC_EDIT_IDLE_Y);
+                            (*ptr).config.idle_guard_color = SAMPLED_COLOR[3].load(Ordering::Acquire);
+                            (*ptr).config.idle_guard_enabled = SendMessageW(
+                                GetDlgItem(hwnd, IDC_CHK_IDLE_GUARD as i32), BM_GETCHECK, 0, 0,
+                            ) == BST_CHECKED as isize;
+                            (*ptr).config.idle_guard_after_secs =
+                                (read_edit_i32(hwnd, IDC_EDIT_IDLE_SECS).max(0) as u32).clamp(5, 600);
+
                             // Read Proximity settings. Arm/disarm is the toolbar "Det" checkbox,
                             // so Settings only edits key/interface/on-detect (not the enabled flag),
                             // and the server IP stays whatever's in config (empty = auto-discover).
@@ -788,10 +846,28 @@ unsafe extern "system" fn settings_wnd_proc(
                                 monitor::disable_bar(Bar::Mp);
                             }
                             if cfg.sp_monitor_enabled && cfg.sp_monitor_color != 0 {
-                                monitor::set_bar(Bar::Sp, wc, wt,
+                                monitor::set_bar(Bar::Sp, wc.clone(), wt.clone(),
                                     cfg.sp_monitor_x, cfg.sp_monitor_y, cfg.sp_monitor_color);
                             } else {
                                 monitor::disable_bar(Bar::Sp);
+                            }
+
+                            // Idle Guard: threshold + the observe-only Skill pixel slot.
+                            monitor::set_idle_guard(cfg.idle_guard_after_secs);
+                            if cfg.idle_guard_enabled && cfg.idle_guard_color != 0 {
+                                monitor::set_bar(Bar::Skill, wc, wt,
+                                    cfg.idle_guard_x, cfg.idle_guard_y, cfg.idle_guard_color);
+                            } else {
+                                monitor::disable_bar(Bar::Skill);
+                            }
+                            if cfg.idle_guard_enabled && cfg.idle_guard_color == 0 {
+                                let msg = wide(
+                                    "Idle Guard is on, but no skill pixel has been sampled.\n\
+                                     Pick a pixel on a quickbar skill icon and press INSERT (or Sample) \
+                                     WHILE the skill shows its cooldown, then press OK again.",
+                                );
+                                let title = wide("Idle Guard");
+                                MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
                             }
 
                             // Pet Guard: toggle + hungry threshold, applied live to the monitor thread.
