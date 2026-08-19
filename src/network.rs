@@ -118,14 +118,35 @@ fn execute_command(line: &str) -> String {
         return play_names_as_queue(queue, None);
     }
 
-    // PLAY_LIST <label> <name> <name> …: the sender expanded a saved queue / group into sequence
-    // names; load them into this host's queue (so the Items window, loop/shuffle, resume and
-    // last-played all see a normal queue) and play. Names are sanitized file stems, so
-    // whitespace-separated is unambiguous.
-    if let Some(rest) = trimmed.strip_prefix("PLAY_LIST ") {
-        let Some((label, names)) = parse_play_list(rest) else {
-            return "ERR empty_list\n".to_string();
+    // PLAY_SAVED <name> [seq seq …] / PLAY_GROUP <name> [seq seq …]: play THIS host's saved queue
+    // / group of that name (the operator set it up on this VM); the trailing names are the
+    // sender's expansion, used only when this host has no such name. Either way the list becomes
+    // this host's queue (Items window, loop/shuffle, resume, last-played all see a normal queue)
+    // labelled with the name. Names are sanitized file stems, so whitespace-split is unambiguous.
+    if let Some(rest) = trimmed.strip_prefix("PLAY_SAVED ") {
+        let Some((name, fallback)) = parse_name_list(rest) else {
+            return "ERR empty_name\n".to_string();
         };
+        let local = storage::load_saved_queue(&name).map(|q| q.items).unwrap_or_default();
+        return play_named_list(name, local, fallback);
+    }
+    if let Some(rest) = trimmed.strip_prefix("PLAY_GROUP ") {
+        let Some((name, fallback)) = parse_name_list(rest) else {
+            return "ERR empty_name\n".to_string();
+        };
+        let local = storage::group_members(Some(&name));
+        return play_named_list(name, local, fallback);
+    }
+
+    // PLAY_LIST <label> <name> <name> …: v3.10.0 form — the sender's expansion only. Kept so a
+    // newer host still understands an older sender.
+    if let Some(rest) = trimmed.strip_prefix("PLAY_LIST ") {
+        let Some((label, names)) = parse_name_list(rest) else {
+            return "ERR empty_name\n".to_string();
+        };
+        if names.is_empty() {
+            return "ERR empty_list\n".to_string();
+        }
         return play_names_as_queue(names, Some(label));
     }
 
@@ -175,15 +196,20 @@ fn play_names_as_queue(names: Vec<String>, label: Option<String>) -> String {
     "OK\n".to_string()
 }
 
-/// `<label> <name> <name> …` → (label, names); None unless there is a label and ≥1 name.
-fn parse_play_list(rest: &str) -> Option<(String, Vec<String>)> {
-    let mut parts = rest.split_whitespace();
-    let label = parts.next()?.to_string();
-    let names: Vec<String> = parts.map(str::to_string).collect();
+/// Host-local list first, sender's fallback second; nothing either side → not_found.
+fn play_named_list(name: String, local: Vec<String>, fallback: Vec<String>) -> String {
+    let names = if !local.is_empty() { local } else { fallback };
     if names.is_empty() {
-        return None;
+        return "ERR not_found\n".to_string();
     }
-    Some((label, names))
+    play_names_as_queue(names, Some(name))
+}
+
+/// `<name> [seq seq …]` → (name, seqs); None only when there is no name at all.
+fn parse_name_list(rest: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = rest.split_whitespace();
+    let name = parts.next()?.to_string();
+    Some((name, parts.map(str::to_string).collect()))
 }
 
 pub fn send_command(
@@ -245,13 +271,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn play_list_parses_label_and_names() {
+    fn name_list_parses_with_and_without_names() {
         assert_eq!(
-            parse_play_list("night a b a"),
+            parse_name_list("night a b a"),
             Some(("night".to_string(), vec!["a".to_string(), "b".to_string(), "a".to_string()]))
         );
-        assert_eq!(parse_play_list("  night   x "), Some(("night".to_string(), vec!["x".to_string()])));
-        assert_eq!(parse_play_list("night"), None);
-        assert_eq!(parse_play_list(""), None);
+        assert_eq!(parse_name_list("  night   x "), Some(("night".to_string(), vec!["x".to_string()])));
+        assert_eq!(parse_name_list("up"), Some(("up".to_string(), Vec::new())));
+        assert_eq!(parse_name_list(""), None);
     }
 }

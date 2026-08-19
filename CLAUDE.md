@@ -101,10 +101,12 @@ them from the client layout with `AdjustWindowRectEx` (see `settings::outer_size
 shipped Settings with an invisible OK — every change was lost to the X button).
 
 **Remote protocol** (`network.rs`): newline commands over TCP with optional password —
-`PLAY <name>`, `PLAY_QUEUE` (host's own queue), `PLAY_LIST <label> <name> <name>…` (replaces the
-host's queue with the list, labels it, plays; names are file stems so whitespace-split is safe),
-`STOP` → `OK`/`ERR <reason>`. Remote hotkey bindings (`RemoteBinding.target`: sequence / queue /
-group) are expanded on the **sender** (`RemoteBinding::command`) so hosts only need the sequences.
+`PLAY <name>`, `PLAY_QUEUE` (host's own queue), `PLAY_SAVED <name> [seqs…]` / `PLAY_GROUP <name>
+[seqs…]` (the **host's own** saved queue / group of that name wins; the trailing names are the
+sender's expansion, used only if the host lacks the name; the list replaces the host's queue,
+labelled, and plays), `PLAY_LIST <label> <seqs…>` (v3.10.0 sender-expansion form, kept), `STOP` →
+`OK`/`ERR <reason>`. Names are file stems, so whitespace-split is safe. Remote hotkey bindings
+(`RemoteBinding.target`: sequence / queue / group) build these in `RemoteBinding::command`.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
 is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets.

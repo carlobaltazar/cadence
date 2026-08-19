@@ -289,8 +289,8 @@ fn main() {
                     let index = msg.lParam as usize;
                     if let Some(binding) = hotkeys::remote_binding_at(index) {
                         let cfg = config::cached_config();
-                        // Saved queues / groups are expanded HERE, on the sender: hosts only need
-                        // the sequences, not this machine's queue files or group metadata.
+                        // Hosts resolve a saved queue / group BY NAME from their own files; this
+                        // machine's expansion (if it has one) rides along as a fallback.
                         let cmd = binding.command(|target, name| match target {
                             sequence::BindingTarget::Queue => storage::load_saved_queue(name)
                                 .map(|q| q.items)
@@ -298,13 +298,6 @@ fn main() {
                             sequence::BindingTarget::Group => storage::group_members(Some(name)),
                             sequence::BindingTarget::Sequence => Vec::new(),
                         });
-                        let Some(cmd) = cmd else {
-                            eprintln!(
-                                "[Cadence] Remote hotkey: {} '{}' is empty or missing, nothing sent.",
-                                binding.target.label(), binding.sequence_name
-                            );
-                            continue;
-                        };
                         if !cfg.remote_hosts.is_empty() {
                             let port = cfg.remote_port;
                             let pw = if cfg.remote_password.is_empty() {

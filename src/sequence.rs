@@ -65,19 +65,21 @@ pub struct RemoteBinding {
 }
 
 impl RemoteBinding {
-    /// The wire command this binding sends. `resolve` expands a saved queue / group name into
-    /// sequence names (injected so the mapping is testable without touching disk); an empty
-    /// expansion yields `None` (nothing to send).
-    pub fn command(&self, resolve: impl Fn(BindingTarget, &str) -> Vec<String>) -> Option<String> {
-        match self.target {
-            BindingTarget::Sequence => Some(format!("PLAY {}", self.sequence_name)),
-            BindingTarget::Queue | BindingTarget::Group => {
-                let names = resolve(self.target, &self.sequence_name);
-                if names.is_empty() {
-                    return None;
-                }
-                Some(format!("PLAY_LIST {} {}", self.sequence_name, names.join(" ")))
-            }
+    /// The wire command this binding sends. Saved queues / groups are resolved BY NAME on the
+    /// host (its own `up` wins); the sender's expansion — `resolve`, injected so the mapping is
+    /// testable without touching disk — rides along as a fallback for hosts that lack the name,
+    /// and may be empty. Always sends something, so a missing local name is never silent.
+    pub fn command(&self, resolve: impl Fn(BindingTarget, &str) -> Vec<String>) -> String {
+        let verb = match self.target {
+            BindingTarget::Sequence => return format!("PLAY {}", self.sequence_name),
+            BindingTarget::Queue => "PLAY_SAVED",
+            BindingTarget::Group => "PLAY_GROUP",
+        };
+        let names = resolve(self.target, &self.sequence_name);
+        if names.is_empty() {
+            format!("{} {}", verb, self.sequence_name)
+        } else {
+            format!("{} {} {}", verb, self.sequence_name, names.join(" "))
         }
     }
 }
@@ -245,10 +247,12 @@ mod tests {
         let mk = |target, name: &str| RemoteBinding {
             modifiers: 2, vk_code: 0x51, sequence_name: name.to_string(), target,
         };
-        assert_eq!(mk(BindingTarget::Sequence, "farm").command(resolve).as_deref(), Some("PLAY farm"));
-        assert_eq!(mk(BindingTarget::Queue, "night").command(resolve).as_deref(), Some("PLAY_LIST night a b a"));
-        assert_eq!(mk(BindingTarget::Group, "buffs").command(resolve).as_deref(), Some("PLAY_LIST buffs x"));
-        assert_eq!(mk(BindingTarget::Group, "empty").command(resolve), None);
+        assert_eq!(mk(BindingTarget::Sequence, "farm").command(resolve), "PLAY farm");
+        assert_eq!(mk(BindingTarget::Queue, "night").command(resolve), "PLAY_SAVED night a b a");
+        assert_eq!(mk(BindingTarget::Group, "buffs").command(resolve), "PLAY_GROUP buffs x");
+        // Sender has no such queue/group: still sent, by name only — the host resolves it.
+        assert_eq!(mk(BindingTarget::Queue, "up").command(resolve), "PLAY_SAVED up");
+        assert_eq!(mk(BindingTarget::Group, "empty").command(resolve), "PLAY_GROUP empty");
         // Legacy config without a target field still parses as a sequence binding.
         let legacy: RemoteBinding =
             serde_json::from_str(r#"{"modifiers":4,"vk_code":82,"sequence_name":"buff_ht"}"#).unwrap();
