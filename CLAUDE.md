@@ -24,6 +24,15 @@ cd /mnt/d/Dev/Ran_services/ranitask
 Two `dead_code` warnings (`hwnd_main`, `low_since_ms`) are pre-existing. Don't launch the exe from
 WSL to "verify" — it may already be running for the game; GUI checks are done by the user.
 
+Tests are `#[cfg(test)] mod tests` inside each module and cover pure helpers only; the house style is
+to split the decision out of the I/O so it's testable without `%APPDATA%`/Win32 (`copy_name(exists)`,
+`resume::parse_marker`, `network::parse_name_list`, `RemoteBinding::command(resolve)`) — follow
+that for new logic rather than skipping tests.
+
+`.gitattributes` is `text=auto eol=lf`, but many working-copy files are CRLF (`storage.rs`,
+`network.rs`, `settings.rs`, `remote.rs`, …). Preserve each file's existing line endings when
+editing; the "CRLF will be replaced by LF" warnings on commit are harmless.
+
 `build.rs` embeds `assets/cadence.manifest` (Per-Monitor-V2 DPI — required, or pixel sampling breaks
 on >100% scaling) and derives the exe's FILEVERSION from `Cargo.toml`.
 
@@ -38,8 +47,12 @@ inside a feature commit. Since v3.9.0 clients do **not** auto-install: the perio
 "vX available" in the toolbar title; installing is Settings › Update (a human action). Never
 reintroduce a modal prompt or an unattended restart — both got fleet characters killed.
 
+The GitHub repo must stay **public**: `update.rs` reads the releases API and downloads assets
+unauthenticated, so a private repo silently blinds every VM's updater (and they can't fetch a fix).
+If it ever has to go private, ship a different update channel first.
+
 Commit trailer: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`. `NEXT_TASK_PLAN.md` is an
-untracked scratch plan; leave it alone unless asked.
+untracked scratch plan; leave it alone unless asked. `README.md` is download-only user text.
 
 ## Architecture (the parts that span files)
 
@@ -100,6 +113,12 @@ them from the client layout with `AdjustWindowRectEx` (see `settings::outer_size
 `WM_GETMINMAXINFO` min-track in step, or a bottom-pinned OK ends up below the client edge (v3.8.0
 shipped Settings with an invisible OK — every change was lost to the X button).
 
+**Hotkeys — two storage models.** Local play hotkeys live *per sequence file* (`Sequence.hotkey`,
+rebuilt by `gui::refresh_bindings` → `hotkeys::set_sequence_bindings`, no modifiers, ignored for
+injected input). Remote hotkeys live in `config.remote_bindings` (`RemoteBinding`, modifier+key,
+fire on injected input too so a played sequence can trigger the fleet) and are index-aligned with
+the hook's list (`hotkeys::set_remote_bindings` after any change; the hook posts the index).
+
 **Remote protocol** (`network.rs`): newline commands over TCP with optional password —
 `PLAY <name>`, `PLAY_QUEUE` (host's own queue), `PLAY_SAVED <name> [seqs…]` / `PLAY_GROUP <name>
 [seqs…]` (the **host's own** saved queue / group of that name wins; the trailing names are the
@@ -109,4 +128,8 @@ labelled, and plays), `PLAY_LIST <label> <seqs…>` (v3.10.0 sender-expansion fo
 (`RemoteBinding.target`: sequence / queue / group) build these in `RemoteBinding::command`.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
-is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets.
+is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets. `NET_MSG_BASE` is
+server-build-dependent (RAN Portal: 988 until mid-2026, **994** since the 2026-08 patch); when
+`DROP_PC=0` with game data flowing, the console's "Paste me this line to recalibrate" candidates
+line is the calibration source — DROP_PC is the candidate whose opcode+1 is frequent, base =
+opcode − 2023.

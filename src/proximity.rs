@@ -164,12 +164,19 @@ fn notify_hit() {
 
 // --- RAN protocol constants (calibrated against the C:\RAN Portal server, base 977) ----------
 const NET_MSG_COMPRESS: u32 = 170; // fixed envelope opcode, not region-shifted
-// Region/build opcode base. RAN Portal (51.79.253.42) uses a custom base of 988 -> DROP_PC=3011,
-// confirmed by DROP_CROW(3012, frequent) and DROP_OUT(3015) lining up. (The public 143.14.88.19
-// server used 977 -> DROP_PC=3000.) If you point Cadence at a different server, this may change.
-const NET_MSG_BASE: u32 = 988;
+// Region/build opcode base. Server-build-dependent: a server patch can shift it, and a different
+// server almost certainly uses another value. History:
+//   - 143.14.88.19 (public):        977 -> DROP_PC=3000
+//   - RAN Portal (51.79.253.42):    988 -> DROP_PC=3011 (until the mid-2026 patch)
+//   - RAN Portal, 2026-08 patch:    994 -> DROP_PC=3017 — confirmed from field diagnostics:
+//     3017 carried a clan-decorated player name while DROP_CROW(3018) and DROP_OUT(3021) were
+//     among the most frequent opcodes, the same triple that confirmed 988 originally.
+// If DROP_PC goes quiet again, the console prints the name-carrying candidate line ("Paste me
+// this line to recalibrate"): DROP_PC is the candidate whose opcode+1 is frequent in
+// Opcodes(top); then base = opcode - 2023.
+const NET_MSG_BASE: u32 = 994;
 pub(crate) const NET_MSG_GCTRL: u32 = NET_MSG_BASE + 1900;
-const DROP_PC: u32 = NET_MSG_GCTRL + 123; // 3011 — a player entered view
+const DROP_PC: u32 = NET_MSG_GCTRL + 123; // 3017 — a player entered view
 const ENVELOPE_HEADER: usize = 12; // [dwSize:u32][nType=170:u32][bCompress:u32]
 
 // --- DROP_PC tail fields (staff detection) ----------------------------------------------------
@@ -740,7 +747,8 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
     let mut inner: u64 = 0;
     let mut droppc: u64 = 0;
     let mut op_hist: HashMap<u32, u64> = HashMap::new();
-    let mut name_ops: HashMap<u32, String> = HashMap::new();
+    // opcode -> (sample name, offset it was found at inside the message, message length)
+    let mut name_ops: HashMap<u32, (String, usize, usize)> = HashMap::new();
 
     loop {
         if CANCEL.load(Ordering::Acquire) {
@@ -789,9 +797,23 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                 v.sort_by(|a, b| b.1.cmp(&a.1));
                 let top: Vec<String> = v.iter().take(10).map(|(op, c)| format!("{}:{}", op, c)).collect();
                 dlog(&format!("   -> Game data flowing but no DROP_PC={} yet (base may differ on this server). Opcodes(top)=[{}].", DROP_PC, top.join(" ")));
-                let names: Vec<String> = name_ops.iter().take(12).map(|(op, nm)| format!("{}='{}'", op, nm)).collect();
+                // A DROP_PC candidate is "likely" when the name sits right after the 8-byte
+                // inner header (payload+4 = message offset 12) inside a ~1.6KB char block.
+                // Likely-first, then by opcode: HashMap order is nondeterministic, so an
+                // unsorted .take(12) could rotate the real candidate out of the printed line.
+                let likely = |v: &(String, usize, usize)| v.1 == 12 && v.2 >= 1000;
+                let mut cand: Vec<_> = name_ops.iter().collect();
+                cand.sort_by_key(|(op, v)| (!likely(v), **op));
+                let names: Vec<String> = cand
+                    .iter()
+                    .take(12)
+                    .map(|(op, v)| {
+                        let mark = if likely(v) { " <-likely" } else { "" };
+                        format!("{}='{}'@{}/{}{}", op, v.0, v.1, v.2, mark)
+                    })
+                    .collect();
                 if !names.is_empty() {
-                    dlog(&format!("   -> Name-carrying opcodes (DROP_PC candidates): [{}]. Paste me this line to recalibrate.", names.join(" ")));
+                    dlog(&format!("   -> Name-carrying opcodes (DROP_PC candidates, name@off/msglen): [{}]. Paste me this line to recalibrate.", names.join(" ")));
                 }
             }
         }
@@ -842,8 +864,8 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                 // Record an example name for any opcode whose payload carries one — this is how we
                 // identify DROP_PC on a server whose opcode base we don't know yet.
                 if !name_ops.contains_key(&op) {
-                    if let Some(nm) = scan_name(msg) {
-                        name_ops.insert(op, nm);
+                    if let Some((nm, off)) = scan_name(msg) {
+                        name_ops.insert(op, (nm, off, msg.len()));
                     }
                 }
                 if op == DROP_PC {
@@ -968,7 +990,7 @@ pub(crate) fn fmt_ip(ip: u32) -> String {
 
 /// Find a printable, null-terminated name-like string within the first bytes of an inner
 /// message payload. Used to identify player/vendor-spawn opcodes on an uncalibrated server.
-fn scan_name(msg: &[u8]) -> Option<String> {
+fn scan_name(msg: &[u8]) -> Option<(String, usize)> {
     let hi = msg.len().min(48);
     let mut i = 8; // skip [dwSize][nType]
     while i < hi {
@@ -979,7 +1001,7 @@ fn scan_name(msg: &[u8]) -> Option<String> {
         if j < msg.len() && msg[j] == 0 && j - i >= 3 {
             let s = &msg[i..j];
             if s.iter().any(|c| c.is_ascii_alphabetic()) {
-                return Some(String::from_utf8_lossy(s).into_owned());
+                return Some((String::from_utf8_lossy(s).into_owned(), i));
             }
         }
         i += 1;

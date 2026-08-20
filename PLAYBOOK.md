@@ -45,6 +45,9 @@ Reuse it whenever you need to detect a network-visible game event.
    Solve the base from confirmed opcodes: e.g. `DROP_PC(3011)/DROP_CROW(3012)/DROP_OUT(3015)` line
    up only for base **988** on RAN Portal (public `143.14.88.19` used **977** → `DROP_PC=3000`).
    The `+1 = DROP_CROW must be frequent` rule disambiguates false candidates.
+   A server patch can shift the base: RAN Portal moved **988 → 994** in 2026-08
+   (`DROP_PC=3017/DROP_CROW=3018/DROP_OUT=3021`), pinned by exactly this rule from the console's
+   candidate line. Current value lives in `src/proximity.rs` `NET_MSG_BASE`; `base = DROP_PC - 2023`.
 
 7. **Validate offline then live.** Replay saved captures (deterministic), then confirm live with a
    stats line. Success = the event fires with the right name and no false positives.

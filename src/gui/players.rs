@@ -20,7 +20,9 @@ use winapi::um::wingdi::{
 use winapi::um::winuser::*;
 
 static PLAYERS_HWND: AtomicIsize = AtomicIsize::new(0);
-static LAST_RENDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+// Previously rendered rows; None = repaint forced (a view/filter change must repaint even
+// when the new render is empty, else the listbox keeps the other view's rows).
+static LAST_RENDER: Mutex<Option<Vec<String>>> = Mutex::new(None);
 // Player name for each rendered row, in display order — so a selection maps back to a name.
 static ROW_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 // Which list is shown: false = this session, true = all-time (persistent).
@@ -388,6 +390,17 @@ fn collect_filtered() -> Vec<proximity::DetectedPlayer> {
     players
 }
 
+/// Decide whether the listbox needs repainting and record the new render. `None` (set by
+/// `force_refresh`) always repaints — critically, even when `lines` is empty, which is how a
+/// view switch to an empty session list clears the rows of the previous view.
+fn take_render(last: &mut Option<Vec<String>>, lines: &[String]) -> bool {
+    if last.as_deref() == Some(lines) {
+        return false;
+    }
+    *last = Some(lines.to_vec());
+    true
+}
+
 unsafe fn refresh_list(hwnd: HWND) {
     let permanent = VIEW_PERMANENT.load(Ordering::Acquire);
     let full = if permanent {
@@ -409,12 +422,8 @@ unsafe fn refresh_list(hwnd: HWND) {
         names.push(p.name.clone());
     }
 
-    {
-        let mut last = LAST_RENDER.lock().unwrap();
-        if *last == lines {
-            return;
-        }
-        *last = lines.clone();
+    if !take_render(&mut LAST_RENDER.lock().unwrap(), &lines) {
+        return;
     }
 
     let list = GetDlgItem(hwnd, IDC_LIST_PLAYERS as i32);
@@ -445,7 +454,7 @@ unsafe fn refresh_list(hwnd: HWND) {
 }
 
 unsafe fn force_refresh(hwnd: HWND) {
-    LAST_RENDER.lock().unwrap().clear();
+    *LAST_RENDER.lock().unwrap() = None;
     refresh_list(hwnd);
 }
 
@@ -914,7 +923,7 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                 552, 416, 80, 26, IDC_BTN_PLAYER_CLOSE,
             );
 
-            *LAST_RENDER.lock().unwrap() = Vec::new();
+            *LAST_RENDER.lock().unwrap() = None;
             refresh_list(hwnd);
             layout(hwnd); // size the stretchable controls to the initial client area
             SetTimer(hwnd, TIMER_PLAYERS, 1500, None);
@@ -1006,5 +1015,21 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
             0
         }
         _ => DefWindowProcW(hwnd, msg, w_param, l_param),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_render;
+
+    #[test]
+    fn forced_render_repaints_even_when_empty() {
+        let mut last = None; // the force_refresh state, e.g. right after a view switch
+        assert!(take_render(&mut last, &[]), "empty render must still clear the listbox");
+        assert_eq!(last, Some(Vec::new()));
+        assert!(!take_render(&mut last, &[]), "unchanged render skips the repaint");
+        let rows = vec!["row".to_string()];
+        assert!(take_render(&mut last, &rows));
+        assert!(!take_render(&mut last, &rows));
     }
 }
