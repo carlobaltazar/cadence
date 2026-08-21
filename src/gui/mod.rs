@@ -142,6 +142,11 @@ pub(crate) const IDC_STATIC_IDLE_COLOR: u16 = 261;
 pub(crate) const IDC_STATIC_IDLE_LIVE: u16 = 262;
 pub(crate) const IDC_CHK_IDLE_GUARD: u16 = 263;
 pub(crate) const IDC_EDIT_IDLE_SECS: u16 = 264;
+pub(crate) const IDC_SETTINGS_DIV5: u16 = 265;
+pub(crate) const IDC_CHK_REPORT: u16 = 266;
+pub(crate) const IDC_EDIT_REPORT_TOKEN: u16 = 267;
+pub(crate) const IDC_EDIT_REPORT_LABEL: u16 = 268;
+pub(crate) const IDC_STATIC_REPORT_HELP: u16 = 269;
 
 // Players (detected/ignore) dialog controls
 pub(crate) const IDC_LIST_PLAYERS: u16 = 901;

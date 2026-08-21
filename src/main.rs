@@ -192,8 +192,9 @@ fn main() {
         );
     }
 
-    // Auto-start fleet heartbeat reporting (dashboard server), if enabled.
-    report::start(&cfg);
+    // Fleet heartbeat reporting (dashboard server); the thread itself honors
+    // the report_enabled flag live, so Settings can toggle it without a restart.
+    report::start();
 
     // Load the proximity ignore list into the live detector unconditionally, so it mirrors
     // config even when detection starts disabled (keeps the Settings save from wiping it).

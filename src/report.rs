@@ -14,8 +14,7 @@
 //!
 //! The payload deliberately contains no window titles or exe paths.
 
-use crate::config::AppConfig;
-use crate::{monitor, player, recorder, update};
+use crate::{config, monitor, player, recorder, update};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,19 +68,22 @@ struct Pending {
     at: Instant,
 }
 
-pub fn start(cfg: &AppConfig) {
-    if !cfg.report_enabled || cfg.report_url.is_empty() {
-        return;
-    }
+/// Spawn the reporting thread (idempotent). The thread reads report_* from
+/// `config::cached_config` every tick, so Settings changes (enable toggle, a
+/// freshly pasted personal token, label) apply within seconds — no restart.
+pub fn start() {
     if RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
     CANCEL.store(false, Ordering::Release);
-    let url = cfg.report_url.clone();
-    let token = cfg.report_token.clone();
-    let label = cfg.report_label.clone();
-    thread::spawn(move || run(url, token, label));
+    thread::spawn(run);
     println!("[Cadence] Fleet reporting started.");
+}
+
+/// Tokens arrive by copy-paste from Discord DMs; strip every kind of stray
+/// whitespace (leading, trailing, and a wrap-inserted newline in the middle).
+pub fn normalize_token(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Signal the reporting thread to send a final `shutdown` event and stop.
@@ -178,7 +180,7 @@ fn push(queue: &mut VecDeque<Pending>, kind: &'static str, detail: String) {
     });
 }
 
-fn run(url: String, token: String, label: String) {
+fn run() {
     let agent_id = machine_name();
     let version = update::current_version();
     let mut queue: VecDeque<Pending> = VecDeque::new();
@@ -197,6 +199,20 @@ fn run(url: String, token: String, label: String) {
 
     loop {
         let stopping = CANCEL.load(Ordering::Acquire);
+
+        // Live config: the operator can enable reporting or paste a new token in
+        // Settings at any time. While opted out, idle without hoarding edge events
+        // and re-arm `first` so re-enabling announces itself with a startup event.
+        let cfg = config::cached_config();
+        if !cfg.report_enabled || cfg.report_url.is_empty() {
+            if stopping {
+                break;
+            }
+            queue.clear();
+            first = true;
+            thread::sleep(TICK);
+            continue;
+        }
 
         let snap = monitor::snapshot();
         let any_bar = snap.bars.iter().any(|b| b.enabled);
@@ -295,7 +311,7 @@ fn run(url: String, token: String, label: String) {
                 .collect();
             let body = ReportBody {
                 agent_id: &agent_id,
-                label: &label,
+                label: &cfg.report_label,
                 version,
                 playing: cur.playing,
                 recording: recorder::is_recording(),
@@ -311,7 +327,7 @@ fn run(url: String, token: String, label: String) {
                 events,
             };
             match serde_json::to_vec(&body) {
-                Ok(json) => match update::https_post_json(&url, &token, &json) {
+                Ok(json) => match update::https_post_json(&cfg.report_url, &cfg.report_token, &json) {
                     Ok((200, _)) => {
                         queue.clear();
                         last_ok = Instant::now();
@@ -405,6 +421,14 @@ mod tests {
         assert_eq!(skill_wire_state(&s), "ok");
         s.skill_idle = true;
         assert_eq!(skill_wire_state(&s), "idle");
+    }
+
+    #[test]
+    fn normalize_token_strips_all_whitespace() {
+        assert_eq!(normalize_token("  abc123  "), "abc123");
+        assert_eq!(normalize_token("abc\r\n123\n"), "abc123");
+        assert_eq!(normalize_token("abc 123"), "abc123");
+        assert_eq!(normalize_token(""), "");
     }
 
     #[test]

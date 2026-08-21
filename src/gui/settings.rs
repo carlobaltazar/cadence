@@ -1,5 +1,5 @@
 use crate::win32_helpers::{wide, create_control, register_and_create_dialog, populate_key_combo, lock_or_recover, dpi_for_window, scale, scaled_font, BURST_KEY_OPTIONS, KEY_OPTIONS, REMOTE_KEY_OPTIONS};
-use crate::{burst, config, hotkeys, proximity};
+use crate::{burst, config, hotkeys, proximity, report};
 use super::*;
 use super::toolbar::ToolbarControls;
 use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
@@ -12,12 +12,19 @@ use winapi::um::winuser::*;
 const GA_ROOT: u32 = 2;
 
 // Dialog design size (96-DPI units, CLIENT area). Two columns — left: hotkeys + the four
-// pixel sections, right: Burst Q + Proximity + Pet Guard. The window is created from this
-// client size via AdjustWindowRectEx (see `outer_size`) — never guess an outer height: v3.8.0
-// added a section and the fixed 560-px outer height silently pushed OK below the client edge.
+// pixel sections, right: Burst Q + Proximity + Pet Guard + Fleet Dashboard. The window is
+// created from this client size via AdjustWindowRectEx (see `outer_size`) — never guess an
+// outer height: v3.8.0 added a section and the fixed 560-px outer height silently pushed OK
+// below the client edge.
 const DIALOG_W: i32 = 640;
-/// Bottom of the last left-column section (Idle Guard's live readout) + gap + OK + margin.
-const DIALOG_CLIENT_H: i32 = SECTIONS_TOP + 3 * SECTION_PITCH + SECTION_H + OK_GAP + OK_H + MARGIN;
+/// Bottom of the last left-column section (Idle Guard's live readout).
+const LEFT_BOTTOM: i32 = SECTIONS_TOP + 3 * SECTION_PITCH + SECTION_H;
+/// Bottom of the right column (the Fleet Dashboard help line at y 578, h 32).
+const RIGHT_BOTTOM: i32 = 610;
+/// The client height follows the TALLER column — deriving it from one column is
+/// exactly how v3.8.0 lost its OK button.
+const CONTENT_BOTTOM: i32 = if LEFT_BOTTOM > RIGHT_BOTTOM { LEFT_BOTTOM } else { RIGHT_BOTTOM };
+const DIALOG_CLIENT_H: i32 = CONTENT_BOTTOM + OK_GAP + OK_H + MARGIN;
 const MARGIN: i32 = 12;
 const OK_GAP: i32 = 12;
 const OK_W: i32 = 70;
@@ -227,7 +234,10 @@ unsafe fn layout(hwnd: HWND) {
 
     // Only the RIGHT column follows the window's right edge; the left column (hotkeys +
     // bar monitors) and the vertical divider keep their created widths.
-    for id in [IDC_SETTINGS_DIV3, IDC_SETTINGS_DIV4, IDC_EDIT_PROX_WATCH] {
+    for id in [
+        IDC_SETTINGS_DIV3, IDC_SETTINGS_DIV4, IDC_EDIT_PROX_WATCH,
+        IDC_SETTINGS_DIV5, IDC_EDIT_REPORT_TOKEN, IDC_EDIT_REPORT_LABEL, IDC_STATIC_REPORT_HELP,
+    ] {
         stretch_to_right(hwnd, id, right, dpi, false);
     }
     // Right-column combos that span to the right edge.
@@ -246,7 +256,7 @@ unsafe fn layout(hwnd: HWND) {
     if !ok.is_null() {
         let gap = scale(OK_GAP, dpi);
         let mut floor = m; // fallback if neither column-bottom control can be located
-        for id in [IDC_STATIC_IDLE_LIVE, IDC_BTN_PROX_PLAYERS, IDC_STATIC_PET_GUARD_HELP] {
+        for id in [IDC_STATIC_IDLE_LIVE, IDC_BTN_PROX_PLAYERS, IDC_STATIC_REPORT_HELP] {
             let h = GetDlgItem(hwnd, id as i32);
             if !h.is_null() {
                 let mut r: RECT = std::mem::zeroed();
@@ -537,6 +547,30 @@ unsafe extern "system" fn settings_wnd_proc(
                 "Needs the MP or SP monitor on. Pauses while HP reads low.",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 426, 272, 34, IDC_STATIC_PET_GUARD_HELP);
 
+            // -- Fleet Dashboard (right column, below Pet Guard) --
+            // Heartbeats to the fleet monitor server. The token identifies WHOSE fleet this
+            // machine belongs to; each operator pastes the personal token their dashboard
+            // admin issued (plain edit, not ES_PASSWORD — a paste must be verifiable).
+            create_control(hwnd, hinstance, font, "STATIC", "",
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 332, 466, 272, 2, IDC_SETTINGS_DIV5);
+            create_control(hwnd, hinstance, font, "STATIC", "\u{2014} Fleet Dashboard \u{2014}",
+                WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 332, 474, 272, 18, 0);
+            create_control(hwnd, hinstance, font, "BUTTON", "Report to fleet dashboard",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0, 332, 498, 272, 20, IDC_CHK_REPORT);
+            create_control(hwnd, hinstance, font, "STATIC", "Token:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 526, 46, 20, 0);
+            create_control(hwnd, hinstance, font, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32, 0,
+                384, 522, 220, 22, IDC_EDIT_REPORT_TOKEN);
+            create_control(hwnd, hinstance, font, "STATIC", "Label:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 554, 46, 20, 0);
+            create_control(hwnd, hinstance, font, "EDIT", "",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL as u32, 0,
+                384, 550, 220, 22, IDC_EDIT_REPORT_LABEL);
+            create_control(hwnd, hinstance, font, "STATIC",
+                "Paste your personal token from the dashboard admin. Blank label = machine name.",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 332, 578, 272, 32, IDC_STATIC_REPORT_HELP);
+
             // OK button (re-pinned to the window bottom by layout()).
             create_control(hwnd, hinstance, font, "BUTTON", "OK",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0, 285, 470, OK_W, OK_H, IDC_BTN_SETTINGS_OK);
@@ -566,6 +600,14 @@ unsafe extern "system" fn settings_wnd_proc(
                 }
                 SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_PET_GUARD_SECS as i32),
                     wide(&cfg.pet_guard_hungry_secs.to_string()).as_ptr());
+                if cfg.report_enabled {
+                    SendMessageW(GetDlgItem(hwnd, IDC_CHK_REPORT as i32), BM_SETCHECK,
+                        BST_CHECKED as WPARAM, 0);
+                }
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_REPORT_TOKEN as i32),
+                    wide(&cfg.report_token).as_ptr());
+                SetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_REPORT_LABEL as i32),
+                    wide(&cfg.report_label).as_ptr());
             }
 
             layout(hwnd); // size the width-following controls + OK to the initial client area
@@ -965,6 +1007,29 @@ unsafe extern "system" fn settings_wnd_proc(
                                 MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
                             }
 
+                            // Fleet Dashboard: enable toggle + personal token + label. The
+                            // reporting thread re-reads config every tick, so these apply live.
+                            let report_on = SendMessageW(
+                                GetDlgItem(hwnd, IDC_CHK_REPORT as i32), BM_GETCHECK, 0, 0,
+                            ) == BST_CHECKED as isize;
+                            let mut tbuf = vec![0u16; 256];
+                            let tlen = GetWindowTextW(
+                                GetDlgItem(hwnd, IDC_EDIT_REPORT_TOKEN as i32),
+                                tbuf.as_mut_ptr(), tbuf.len() as i32,
+                            ) as usize;
+                            // Labels can be non-ASCII character names: read via UTF-16, not
+                            // the numeric-edit byte trick.
+                            let mut lbuf = vec![0u16; 128];
+                            let llen = GetWindowTextW(
+                                GetDlgItem(hwnd, IDC_EDIT_REPORT_LABEL as i32),
+                                lbuf.as_mut_ptr(), lbuf.len() as i32,
+                            ) as usize;
+                            (*ptr).config.report_enabled = report_on;
+                            (*ptr).config.report_token =
+                                report::normalize_token(&String::from_utf16_lossy(&tbuf[..tlen]));
+                            (*ptr).config.report_label =
+                                String::from_utf16_lossy(&lbuf[..llen]).trim().to_string();
+
                             // Apply Proximity changes immediately. start() itself waits for any
                             // running capture to stop, so this reliably restarts detection.
                             proximity::set_reaction((*ptr).config.proximity_sequence.clone());
@@ -988,6 +1053,10 @@ unsafe extern "system" fn settings_wnd_proc(
                             if let Err(e) = config::save_config(&(*ptr).config) {
                                 eprintln!("[Cadence] Config save failed: {}", e);
                             }
+                            // No-op if the reporting thread is already alive (it picks the
+                            // saved values up within a tick); spawns it if reporting was
+                            // disabled at boot and just got turned on.
+                            report::start();
                         }
                         // If burst was running and the user changed the rate,
                         // the change takes effect on next toggle. Mention this
