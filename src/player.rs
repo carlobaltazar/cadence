@@ -104,6 +104,24 @@ pub fn stop_and_wait(timeout_ms: u64) -> bool {
     true
 }
 
+/// Free the player for a new playback: cancel any current run and wait (up to
+/// `timeout_ms`) for the playback thread to fully exit — including its
+/// held-input release sweep. Unlike `stop_and_wait` (which reports "was
+/// something playing"), this returns whether the player is actually idle now,
+/// so a caller about to start a new playback can trust `true` to mean the
+/// backstop guard in `play_*` won't no-op it.
+pub fn take_over(timeout_ms: u64) -> bool {
+    if !is_playing() {
+        return true;
+    }
+    cancel_playback();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while is_playing() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !is_playing()
+}
+
 /// Virtual-screen origin and span, used to normalize absolute mouse coords.
 fn vscreen() -> (i32, i32, i32, i32) {
     unsafe {
@@ -181,6 +199,91 @@ fn perform_event(event_type: &InputEventType, vs: (i32, i32, i32, i32)) {
     }
 }
 
+/// Tracks which keys/mouse buttons a playback pass currently holds down, so a
+/// cancelled pass can release them instead of leaving the game with a stuck
+/// Shift/W. Pure state machine: feed every performed event to `observe`, ask
+/// `releases` for the synthetic up-events. Keys are identified by vk alone —
+/// recordings contain OS auto-repeat, so a second down for a held vk is not a
+/// second hold.
+#[derive(Default)]
+struct HeldInputs {
+    /// `(vk_code, scan_code, extended)` of each held key, in press order. The
+    /// raw recorded `extended` flag is kept; `fix_extended` is applied at
+    /// dispatch, same as the down that opened it.
+    keys: Vec<(u16, u16, bool)>,
+    buttons: Vec<MouseButton>,
+}
+
+impl HeldInputs {
+    fn observe(&mut self, event: &InputEventType) {
+        match event {
+            InputEventType::KeyPress { vk_code, scan_code, pressed, extended } => {
+                if *pressed {
+                    if !self.keys.iter().any(|(vk, _, _)| vk == vk_code) {
+                        self.keys.push((*vk_code, *scan_code, *extended));
+                    }
+                } else {
+                    self.keys.retain(|(vk, _, _)| vk != vk_code);
+                }
+            }
+            InputEventType::MouseButton { button, pressed } => {
+                if *pressed {
+                    if !self.buttons.contains(button) {
+                        self.buttons.push(button.clone());
+                    }
+                } else {
+                    self.buttons.retain(|b| b != button);
+                }
+            }
+            InputEventType::MouseMove { .. } | InputEventType::MouseWheel { .. } => {}
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.buttons.is_empty()
+    }
+
+    /// Up-events for everything still held, most-recent press first (unwind
+    /// modifiers the way a human would).
+    fn releases(&self) -> Vec<InputEventType> {
+        let keys = self.keys.iter().rev().map(|&(vk_code, scan_code, extended)| {
+            InputEventType::KeyPress { vk_code, scan_code, pressed: false, extended }
+        });
+        let buttons = self.buttons.iter().rev().map(|button| InputEventType::MouseButton {
+            button: button.clone(),
+            pressed: false,
+        });
+        keys.chain(buttons).collect()
+    }
+}
+
+/// Dispatch all of `held`'s release events as ONE SendInput call under
+/// INPUT_LOCK, so monitor/burst/pet presses can't interleave and the next
+/// playback can't start mid-sweep.
+fn release_held(held: &HeldInputs) {
+    if held.is_empty() {
+        return;
+    }
+    let mut inputs: Vec<INPUT> = Vec::new();
+    for event in held.releases() {
+        match event {
+            InputEventType::KeyPress { vk_code, scan_code, extended, .. } => {
+                let mut flags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+                if fix_extended(vk_code, extended) {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                inputs.push(make_kbd(vk_code, scan_code, flags));
+            }
+            InputEventType::MouseButton { ref button, .. } => {
+                let (flags, mouse_data) = mouse_button_flags(button, false);
+                inputs.push(make_mouse(flags, 0, 0, mouse_data));
+            }
+            _ => {}
+        }
+    }
+    dispatch(&mut inputs);
+}
+
 /// Shared playback runner for both single-sequence and queue playback. A single
 /// sequence is just a queue of one, so both entry points funnel through here.
 /// Honors CANCEL, LOOP_MODE, and SHUFFLE_MODE, and zeroes the leading delay
@@ -208,6 +311,9 @@ fn run_playback_opts(sequences: Vec<Vec<InputEvent>>, force_once: bool) {
 
         let mut order: Vec<usize> = (0..total_sequences).collect();
         let mut cancelled = false;
+        // Held state persists across loop-mode passes: an unbalanced pass gets
+        // its ups matched by the next pass or swept at cancel.
+        let mut held = HeldInputs::default();
 
         loop {
             // Shuffle order each cycle if shuffle mode is on
@@ -239,10 +345,18 @@ fn run_playback_opts(sequences: Vec<Vec<InputEvent>>, force_once: bool) {
                         acc_micros = 0;
                     } else {
                         acc_micros += event.delay_micros;
-                        timer.wait_until_ticks(anchor + timer.micros_to_ticks(acc_micros));
+                        if timer.wait_until_ticks_cancellable(
+                            anchor + timer.micros_to_ticks(acc_micros),
+                            &CANCEL,
+                        ) {
+                            println!("[Cadence] Playback cancelled.");
+                            cancelled = true;
+                            break;
+                        }
                     }
 
                     perform_event(&event.event_type, vs);
+                    held.observe(&event.event_type);
                 }
                 if cancelled {
                     break;
@@ -254,6 +368,11 @@ fn run_playback_opts(sequences: Vec<Vec<InputEvent>>, force_once: bool) {
             }
         }
 
+        // Sweep BEFORE clearing PLAYING: take_over/stop_and_wait return on
+        // PLAYING == false, so whatever starts next sees a clean key state.
+        if cancelled {
+            release_held(&held);
+        }
         println!("[Cadence] Playback finished.");
         PLAYING.store(false, Ordering::Release);
     });
@@ -362,4 +481,86 @@ pub fn send_key_press(vk: u16, scan_code: u16) {
 /// Synthesized presses ship scan codes so games reading raw input see them.
 pub fn scan_code(vk: u16) -> u16 {
     unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeldInputs;
+    use crate::sequence::{InputEventType, MouseButton};
+
+    fn key(vk: u16, pressed: bool) -> InputEventType {
+        InputEventType::KeyPress { vk_code: vk, scan_code: vk + 100, pressed, extended: false }
+    }
+
+    fn button(b: MouseButton, pressed: bool) -> InputEventType {
+        InputEventType::MouseButton { button: b, pressed }
+    }
+
+    #[test]
+    fn balanced_pass_holds_nothing() {
+        let mut h = HeldInputs::default();
+        for e in [key(0x57, true), key(0x57, false), button(MouseButton::Left, true), button(MouseButton::Left, false)] {
+            h.observe(&e);
+        }
+        assert!(h.is_empty());
+        assert!(h.releases().is_empty());
+    }
+
+    #[test]
+    fn held_key_releases_with_same_identity() {
+        let mut h = HeldInputs::default();
+        h.observe(&InputEventType::KeyPress { vk_code: 0x27, scan_code: 0x4D, pressed: true, extended: true });
+        assert_eq!(
+            h.releases(),
+            vec![InputEventType::KeyPress { vk_code: 0x27, scan_code: 0x4D, pressed: false, extended: true }]
+        );
+    }
+
+    #[test]
+    fn auto_repeat_downs_are_one_hold() {
+        let mut h = HeldInputs::default();
+        for _ in 0..3 {
+            h.observe(&key(0x57, true));
+        }
+        assert_eq!(h.releases().len(), 1);
+        h.observe(&key(0x57, false));
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn releases_unwind_in_reverse_press_order() {
+        let mut h = HeldInputs::default();
+        h.observe(&key(0x41, true)); // A
+        h.observe(&key(0xA0, true)); // Shift
+        let ups = h.releases();
+        assert_eq!(ups.len(), 2);
+        assert_eq!(ups[0], key(0xA0, false));
+        assert_eq!(ups[1], key(0x41, false));
+    }
+
+    #[test]
+    fn mouse_buttons_tracked_distinctly() {
+        let mut h = HeldInputs::default();
+        h.observe(&button(MouseButton::X1, true));
+        h.observe(&button(MouseButton::X2, true));
+        h.observe(&button(MouseButton::X1, false));
+        assert_eq!(h.releases(), vec![button(MouseButton::X2, false)]);
+    }
+
+    #[test]
+    fn moves_and_wheel_are_ignored() {
+        let mut h = HeldInputs::default();
+        h.observe(&InputEventType::MouseMove { x: 10, y: 20 });
+        h.observe(&InputEventType::MouseWheel { delta: -120 });
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn interleaved_holds_release_only_whats_down() {
+        let mut h = HeldInputs::default();
+        h.observe(&key(0x41, true));
+        h.observe(&key(0x42, true));
+        h.observe(&key(0x41, false));
+        assert_eq!(h.releases(), vec![key(0x42, false)]);
+    }
 }

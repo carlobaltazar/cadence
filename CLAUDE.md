@@ -124,7 +124,9 @@ the hook's list (`hotkeys::set_remote_bindings` after any change; the hook posts
 [seqs…]` (the **host's own** saved queue / group of that name wins; the trailing names are the
 sender's expansion, used only if the host lacks the name; the list replaces the host's queue,
 labelled, and plays), `PLAY_LIST <label> <seqs…>` (v3.10.0 sender-expansion form, kept), `STOP` →
-`OK`/`ERR <reason>`. Names are file stems, so whitespace-split is safe. Remote hotkey bindings
+`OK`/`ERR <reason>`. Play commands stop any current playback first (override, so the fleet stays
+coordinated; `ERR stop_timeout` if the old run won't die), and a cancelled run releases any
+keys/buttons it left held. Names are file stems, so whitespace-split is safe. Remote hotkey bindings
 (`RemoteBinding.target`: sequence / queue / group) build these in `RemoteBinding::command`.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)

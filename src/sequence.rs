@@ -7,7 +7,7 @@ pub struct InputEvent {
     pub event_type: InputEventType,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum InputEventType {
     MouseMove { x: i32, y: i32 },
     MouseButton { button: MouseButton, pressed: bool },
@@ -15,7 +15,7 @@ pub enum InputEventType {
     KeyPress { vk_code: u16, scan_code: u16, pressed: bool, extended: bool },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
     Right,

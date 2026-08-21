@@ -97,6 +97,12 @@ fn handle_client(mut stream: TcpStream, expected_password: &Option<String>) {
     let _ = stream.write_all(response.as_bytes());
 }
 
+/// How long a remote play command waits for the current playback to stop
+/// before giving up. Must stay well under the sender's 5s read timeout (set
+/// in `send_command`) or the sender reports a failure for a command that
+/// actually succeeded.
+const TAKEOVER_TIMEOUT_MS: u64 = 3_000;
+
 fn execute_command(line: &str) -> String {
     let trimmed = line.trim();
 
@@ -155,30 +161,29 @@ fn execute_command(line: &str) -> String {
         if seq_name.is_empty() {
             return "ERR empty_name\n".to_string();
         }
-        if player::is_playing() {
-            return "ERR already_playing\n".to_string();
+        // Load before taking over, so a bad name can't stop a healthy playback.
+        let Ok(seq) = storage::load_sequence(seq_name) else {
+            return "ERR not_found\n".to_string();
+        };
+        if !player::take_over(TAKEOVER_TIMEOUT_MS) {
+            return "ERR stop_timeout\n".to_string();
         }
-        match storage::load_sequence(seq_name) {
-            Ok(seq) => {
-                player::set_source(player::PlaybackSource::Sequence(seq_name.to_string()));
-                player::play_sequence(seq.events);
-                "OK\n".to_string()
-            }
-            Err(_) => "ERR not_found\n".to_string(),
-        }
+        player::set_source(player::PlaybackSource::Sequence(seq_name.to_string()));
+        player::play_sequence(seq.events);
+        "OK\n".to_string()
     } else {
         "ERR unknown_command\n".to_string()
     }
 }
 
-/// Load every named sequence and play them as one queue pass. With `label` the list REPLACES
-/// this host's queue first (a saved queue / group arrived by PLAY_LIST); without it the host's
-/// own queue is being played and is left alone. Missing sequences are skipped like a local
-/// Play Queue; only an entirely unloadable list is an error.
+/// Load every named sequence and play them as one queue pass, stopping any current playback
+/// first (a new fleet command overrides whatever is running, so clients with different
+/// sequence timings stay coordinated). With `label` the list REPLACES this host's queue first
+/// (a saved queue / group arrived by PLAY_LIST); without it the host's own queue is being
+/// played and is left alone. Missing sequences are skipped like a local Play Queue; only an
+/// entirely unloadable list is an error — and errors are decided BEFORE the takeover, so a
+/// bad command never stops a healthy playback.
 fn play_names_as_queue(names: Vec<String>, label: Option<String>) -> String {
-    if player::is_playing() {
-        return "ERR already_playing\n".to_string();
-    }
     let mut event_lists = Vec::new();
     for name in &names {
         if let Ok(seq) = storage::load_sequence(name) {
@@ -187,6 +192,9 @@ fn play_names_as_queue(names: Vec<String>, label: Option<String>) -> String {
     }
     if event_lists.is_empty() {
         return "ERR load_failed\n".to_string();
+    }
+    if !player::take_over(TAKEOVER_TIMEOUT_MS) {
+        return "ERR stop_timeout\n".to_string();
     }
     if label.is_some() {
         gui::set_queue(names.clone(), label);
