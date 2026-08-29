@@ -103,7 +103,7 @@ fn handle_client(mut stream: TcpStream, expected_password: &Option<String>) {
 /// actually succeeded.
 const TAKEOVER_TIMEOUT_MS: u64 = 3_000;
 
-fn execute_command(line: &str) -> String {
+pub(crate) fn execute_command(line: &str) -> String {
     let trimmed = line.trim();
 
     if recorder::is_recording() {

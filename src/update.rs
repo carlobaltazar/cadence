@@ -318,9 +318,20 @@ fn split_url(url: &str) -> Result<(String, String), String> {
     }
 }
 
-/// HTTPS GET returning (status, body). Redirects are followed (WinHTTP's default), which the
-/// release asset URL relies on — github.com hands off to objects.githubusercontent.com.
-fn https_get(url: &str) -> Result<(u32, Vec<u8>), String> {
+/// Shared WinHTTP request core: one HTTPS request, returning (status, body).
+/// `extra_headers` is pre-joined "Name: value\r\n" lines (may be empty),
+/// `recv_timeout_ms` is the WinHTTP receive timeout — raise it past the server's
+/// hold time for long-polls — and `max_response` caps how much body is read.
+/// Redirects are followed (WinHTTP's default), which the release asset URL relies
+/// on — github.com hands off to objects.githubusercontent.com.
+fn https_request(
+    method: &str,
+    url: &str,
+    extra_headers: &str,
+    body: Option<&[u8]>,
+    recv_timeout_ms: c_int,
+    max_response: usize,
+) -> Result<(u32, Vec<u8>), String> {
     let (host, path) = split_url(url)?;
     // GitHub's API rejects requests with no User-Agent.
     let agent = wide(&format!("Cadence/{}", VERSION));
@@ -337,7 +348,7 @@ fn https_get(url: &str) -> Result<(u32, Vec<u8>), String> {
         }
         // resolve / connect / send / receive, in ms. Generous enough for a slow link, short
         // enough that a dead network doesn't hold the worker thread for minutes.
-        WinHttpSetTimeouts(session.0, 10_000, 10_000, 20_000, 60_000 as c_int);
+        WinHttpSetTimeouts(session.0, 10_000, 10_000, 20_000, recv_timeout_ms);
 
         let conn = Handle(WinHttpConnect(
             session.0,
@@ -351,99 +362,7 @@ fn https_get(url: &str) -> Result<(u32, Vec<u8>), String> {
 
         let req = Handle(WinHttpOpenRequest(
             conn.0,
-            wide("GET").as_ptr(),
-            wide(&path).as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            WINHTTP_FLAG_SECURE,
-        ));
-        if req.0.is_null() {
-            return Err("WinHttpOpenRequest failed".into());
-        }
-
-        let headers = wide("Accept: application/vnd.github+json\r\n");
-        if WinHttpSendRequest(req.0, headers.as_ptr(), u32::MAX, std::ptr::null_mut(), 0, 0, 0) == 0 {
-            return Err(format!("Request to {} failed (offline?)", host));
-        }
-        if WinHttpReceiveResponse(req.0, std::ptr::null_mut()) == 0 {
-            return Err(format!("No response from {}", host));
-        }
-
-        let mut status: DWORD = 0;
-        let mut len = std::mem::size_of::<DWORD>() as DWORD;
-        if WinHttpQueryHeaders(
-            req.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            std::ptr::null(),
-            &mut status as *mut _ as LPVOID,
-            &mut len,
-            std::ptr::null_mut(),
-        ) == 0
-        {
-            return Err("Can't read the HTTP status".into());
-        }
-
-        let mut body: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let mut avail: DWORD = 0;
-            if WinHttpQueryDataAvailable(req.0, &mut avail) == 0 {
-                return Err("Transfer interrupted".into());
-            }
-            if avail == 0 {
-                break;
-            }
-            let want = (avail as usize).min(chunk.len()) as DWORD;
-            let mut read: DWORD = 0;
-            if WinHttpReadData(req.0, chunk.as_mut_ptr() as LPVOID, want, &mut read) == 0 {
-                return Err("Read failed mid-transfer".into());
-            }
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read as usize]);
-            if body.len() > MAX_EXE_BYTES {
-                return Err("Response is implausibly large — aborted.".into());
-            }
-        }
-        Ok((status, body))
-    }
-}
-
-/// HTTPS POST of a JSON body, returning (status, response body). Same WinHTTP plumbing as
-/// `https_get`; used by `report.rs` to push heartbeats to the fleet dashboard. The response
-/// read is capped small — the dashboard replies `{"ok":true}`, never anything sizable.
-pub(crate) fn https_post_json(url: &str, token: &str, body: &[u8]) -> Result<(u32, Vec<u8>), String> {
-    const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-    let (host, path) = split_url(url)?;
-    let agent = wide(&format!("Cadence/{}", VERSION));
-    unsafe {
-        let session = Handle(WinHttpOpen(
-            agent.as_ptr(),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        ));
-        if session.0.is_null() {
-            return Err("WinHttpOpen failed (no network stack?)".into());
-        }
-        WinHttpSetTimeouts(session.0, 10_000, 10_000, 20_000, 30_000 as c_int);
-
-        let conn = Handle(WinHttpConnect(
-            session.0,
-            wide(&host).as_ptr(),
-            INTERNET_DEFAULT_HTTPS_PORT,
-            0,
-        ));
-        if conn.0.is_null() {
-            return Err(format!("Can't reach {}", host));
-        }
-
-        let req = Handle(WinHttpOpenRequest(
-            conn.0,
-            wide("POST").as_ptr(),
+            wide(method).as_ptr(),
             wide(&path).as_ptr(),
             std::ptr::null(),
             std::ptr::null(),
@@ -455,20 +374,17 @@ pub(crate) fn https_post_json(url: &str, token: &str, body: &[u8]) -> Result<(u3
         }
 
         // Headers and body must stay alive across WinHttpSendRequest; they do, as locals.
-        let headers = wide(&format!(
-            "Content-Type: application/json\r\nX-Auth-Token: {}\r\n",
-            token
-        ));
-        if WinHttpSendRequest(
-            req.0,
-            headers.as_ptr(),
-            u32::MAX,
-            body.as_ptr() as LPVOID,
-            body.len() as DWORD,
-            body.len() as DWORD,
-            0,
-        ) == 0
-        {
+        let headers = wide(extra_headers);
+        let (hdr_ptr, hdr_len) = if extra_headers.is_empty() {
+            (std::ptr::null(), 0)
+        } else {
+            (headers.as_ptr(), u32::MAX)
+        };
+        let (body_ptr, body_len) = match body {
+            Some(b) => (b.as_ptr() as LPVOID, b.len() as DWORD),
+            None => (std::ptr::null_mut(), 0),
+        };
+        if WinHttpSendRequest(req.0, hdr_ptr, hdr_len, body_ptr, body_len, body_len, 0) == 0 {
             return Err(format!("Request to {} failed (offline?)", host));
         }
         if WinHttpReceiveResponse(req.0, std::ptr::null_mut()) == 0 {
@@ -490,7 +406,7 @@ pub(crate) fn https_post_json(url: &str, token: &str, body: &[u8]) -> Result<(u3
         }
 
         let mut resp: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; 8 * 1024];
+        let mut chunk = vec![0u8; 64 * 1024];
         loop {
             let mut avail: DWORD = 0;
             if WinHttpQueryDataAvailable(req.0, &mut avail) == 0 {
@@ -508,12 +424,53 @@ pub(crate) fn https_post_json(url: &str, token: &str, body: &[u8]) -> Result<(u3
                 break;
             }
             resp.extend_from_slice(&chunk[..read as usize]);
-            if resp.len() > MAX_RESPONSE_BYTES {
-                break; // whatever this is, it isn't the dashboard's ack — stop reading
+            if resp.len() > max_response {
+                return Err("Response is implausibly large — aborted.".into());
             }
         }
         Ok((status, resp))
     }
+}
+
+/// HTTPS GET returning (status, body); used for the GitHub release check and the
+/// installer download.
+fn https_get(url: &str) -> Result<(u32, Vec<u8>), String> {
+    https_request(
+        "GET",
+        url,
+        "Accept: application/vnd.github+json\r\n",
+        None,
+        60_000,
+        MAX_EXE_BYTES,
+    )
+}
+
+/// HTTPS POST of a JSON body, returning (status, response body); used by `report.rs`
+/// to push heartbeats to the fleet dashboard. The response read is capped small —
+/// the dashboard replies `{"ok":true}`, never anything sizable.
+pub(crate) fn https_post_json(url: &str, token: &str, body: &[u8]) -> Result<(u32, Vec<u8>), String> {
+    let headers = format!(
+        "Content-Type: application/json\r\nX-Auth-Token: {}\r\n",
+        token
+    );
+    https_request("POST", url, &headers, Some(body), 30_000, 64 * 1024)
+}
+
+/// JSON POST with a caller-chosen receive timeout and no auth header; the party
+/// long-poll uses this with a timeout comfortably past the server's 25s hold.
+pub(crate) fn https_post_json_timeout(
+    url: &str,
+    body: &[u8],
+    recv_timeout_ms: c_int,
+) -> Result<(u32, Vec<u8>), String> {
+    https_request(
+        "POST",
+        url,
+        "Content-Type: application/json\r\n",
+        Some(body),
+        recv_timeout_ms,
+        64 * 1024,
+    )
 }
 
 // ---------------------------------------------------------------------------------------------

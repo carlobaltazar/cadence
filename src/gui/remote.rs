@@ -1,8 +1,8 @@
 use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, remote_vk_name};
-use crate::{config, hotkeys, network};
+use crate::{config, hotkeys, network, party};
 use super::*;
 use super::toolbar::ToolbarControls;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::Mutex;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -12,6 +12,12 @@ static REMOTE_HWND: AtomicIsize = AtomicIsize::new(0);
 
 // Result from the last send operation (polled by timer)
 static SEND_RESULT: Mutex<Option<String>> = Mutex::new(None);
+
+// Party UI bookkeeping: the member list repaints only when the snapshot's
+// generation moves, and the status static is rewritten only when the poll
+// thread's line changes — so handler-written hints survive quiet timer ticks.
+static PARTY_GEN_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+static PARTY_STATUS_SEEN: Mutex<String> = Mutex::new(String::new());
 
 pub unsafe fn show_remote_dialog(parent: HWND) {
     let existing = REMOTE_HWND.load(Ordering::Acquire) as HWND;
@@ -33,7 +39,7 @@ pub unsafe fn show_remote_dialog(parent: HWND) {
         remote_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 360, 530,
+        sx, sy, 360, 712,
         parent, hinstance,
     );
     REMOTE_HWND.store(hwnd as isize, Ordering::Release);
@@ -255,6 +261,78 @@ unsafe extern "system" fn remote_wnd_proc(
                 80, 462, 70, 26, IDC_BTN_REMOVE_BINDING,
             );
 
+            // ---- Party (internet) section ----
+            create_control(
+                hwnd, hinstance, font, "STATIC", "-- Party (Internet) --",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 494, 320, 16, 0,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Room:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 514, 38, 20, 0,
+            );
+            let h_room = create_control(
+                hwnd, hinstance, font, "EDIT", &cfg.party_room,
+                WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
+                52, 512, 110, 22, IDC_EDIT_PARTY_ROOM,
+            );
+            SendMessageW(h_room, EM_SETLIMITTEXT as u32, 32, 0);
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Key:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                170, 514, 28, 20, 0,
+            );
+            let h_key = create_control(
+                hwnd, hinstance, font, "EDIT", &cfg.party_passkey,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_PASSWORD as u32, 0,
+                200, 512, 142, 22, IDC_EDIT_PARTY_KEY,
+            );
+            SendMessageW(h_key, EM_SETLIMITTEXT as u32, 64, 0);
+
+            let h_psend = create_control(
+                hwnd, hinstance, font, "BUTTON", "Send",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+                12, 540, 56, 22, IDC_CHK_PARTY_SEND,
+            );
+            if cfg.party_send {
+                SendMessageW(h_psend, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+            }
+            let h_precv = create_control(
+                hwnd, hinstance, font, "BUTTON", "Receive",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+                72, 540, 74, 22, IDC_CHK_PARTY_RECV,
+            );
+            if cfg.party_receive {
+                SendMessageW(h_precv, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+            }
+
+            let toggle_text = if cfg.party_enabled { "Disconnect" } else { "Connect" };
+            create_control(
+                hwnd, hinstance, font, "BUTTON", toggle_text,
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                240, 538, 102, 26, IDC_BTN_PARTY_TOGGLE,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "STATIC", "",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 570, 330, 18, IDC_STATIC_PARTY_STATUS,
+            );
+
+            create_control(
+                hwnd, hinstance, font, "LISTBOX", "",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+                WS_EX_CLIENTEDGE as u32,
+                12, 592, 330, 76, IDC_LIST_PARTY_MEMBERS,
+            );
+
+            // Force the first timer tick to paint the party list and status.
+            PARTY_GEN_SEEN.store(u64::MAX, Ordering::Release);
+            *lock_or_recover(&PARTY_STATUS_SEEN) = "\u{0}".to_string();
+
             populate_bindings_list(hwnd, &cfg);
 
             // Start polling timer
@@ -285,6 +363,29 @@ unsafe extern "system" fn remote_wnd_proc(
                     let h_send_status = GetDlgItem(hwnd, IDC_STATIC_SEND_STATUS as i32);
                     set_window_text(h_send_status, &msg);
                 }
+
+                // Party status: only rewrite when the poll thread's line changed,
+                // so hints written by the button handlers aren't clobbered.
+                let line = party::status_line();
+                {
+                    let mut seen = lock_or_recover(&PARTY_STATUS_SEEN);
+                    if *seen != line {
+                        *seen = line.clone();
+                        let h_pstatus = GetDlgItem(hwnd, IDC_STATIC_PARTY_STATUS as i32);
+                        set_window_text(h_pstatus, &line);
+                    }
+                }
+
+                // Party member list: repaint only on a new snapshot generation.
+                let (gen, rows) = party::members_snapshot();
+                if gen != PARTY_GEN_SEEN.swap(gen, Ordering::AcqRel) {
+                    let h_list = GetDlgItem(hwnd, IDC_LIST_PARTY_MEMBERS as i32);
+                    SendMessageW(h_list, LB_RESETCONTENT, 0, 0);
+                    for m in &rows {
+                        let row = wide(&party::format_member(m));
+                        SendMessageW(h_list, LB_ADDSTRING, 0, row.as_ptr() as LPARAM);
+                    }
+                }
             }
             0
         }
@@ -302,6 +403,8 @@ unsafe extern "system" fn remote_wnd_proc(
                     add_binding::show_add_binding_dialog(hwnd);
                 }
                 x if x == IDC_BTN_REMOVE_BINDING => handle_remove_binding(hwnd),
+                x if x == IDC_BTN_PARTY_TOGGLE => handle_party_toggle(hwnd),
+                x if x == IDC_CHK_PARTY_SEND || x == IDC_CHK_PARTY_RECV => handle_party_roles(hwnd),
                 _ => {}
             }
             0
@@ -404,6 +507,56 @@ unsafe fn handle_remove_host(hwnd: HWND) {
     });
 }
 
+unsafe fn party_checked(hwnd: HWND, id: u16) -> bool {
+    SendMessageW(GetDlgItem(hwnd, id as i32), BM_GETCHECK, 0, 0) == BST_CHECKED as isize
+}
+
+unsafe fn handle_party_toggle(hwnd: HWND) {
+    let parent = GetParent(hwnd);
+    let ptr = GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut ToolbarControls;
+    let enabled = if !ptr.is_null() {
+        (*ptr).config.party_enabled
+    } else {
+        config::load_config().party_enabled
+    };
+    let h_btn = GetDlgItem(hwnd, IDC_BTN_PARTY_TOGGLE as i32);
+    let h_status = GetDlgItem(hwnd, IDC_STATIC_PARTY_STATUS as i32);
+    if enabled {
+        save_remote_config(hwnd, |cfg| cfg.party_enabled = false);
+        set_window_text(h_btn, "Connect");
+        set_window_text(h_status, "Disconnected");
+        return;
+    }
+    let room = get_edit_text(hwnd, IDC_EDIT_PARTY_ROOM).trim().to_string();
+    let key = get_edit_text(hwnd, IDC_EDIT_PARTY_KEY).trim().to_string();
+    if room.is_empty() || key.is_empty() {
+        set_window_text(h_status, "Enter a room name and passkey");
+        return;
+    }
+    let send = party_checked(hwnd, IDC_CHK_PARTY_SEND);
+    let recv = party_checked(hwnd, IDC_CHK_PARTY_RECV);
+    save_remote_config(hwnd, |cfg| {
+        cfg.party_room = room;
+        cfg.party_passkey = key;
+        cfg.party_send = send;
+        cfg.party_receive = recv;
+        cfg.party_enabled = true;
+    });
+    set_window_text(h_btn, "Disconnect");
+    set_window_text(h_status, "Connecting...");
+}
+
+/// Role checkboxes save immediately; the poll thread picks them up on its next
+/// cycle (within one poll round-trip).
+unsafe fn handle_party_roles(hwnd: HWND) {
+    let send = party_checked(hwnd, IDC_CHK_PARTY_SEND);
+    let recv = party_checked(hwnd, IDC_CHK_PARTY_RECV);
+    save_remote_config(hwnd, |cfg| {
+        cfg.party_send = send;
+        cfg.party_receive = recv;
+    });
+}
+
 unsafe fn do_send(hwnd: HWND, command: &str) {
     let port = get_edit_text_u16(hwnd, IDC_EDIT_SEND_PORT).unwrap_or(9847);
     let password = get_edit_text(hwnd, IDC_EDIT_SEND_PASSWORD);
@@ -417,13 +570,23 @@ unsafe fn do_send(hwnd: HWND, command: &str) {
         config::load_config().remote_hosts
     };
 
-    if hosts.is_empty() {
-        let h_status = GetDlgItem(hwnd, IDC_STATIC_SEND_STATUS as i32);
-        set_window_text(h_status, "Add at least one host");
+    let party_on = party::sender_active();
+    let h_status = GetDlgItem(hwnd, IDC_STATIC_SEND_STATUS as i32);
+    if hosts.is_empty() && !party_on {
+        set_window_text(h_status, "Add a host or connect to a party as sender");
         return;
     }
 
-    let h_status = GetDlgItem(hwnd, IDC_STATIC_SEND_STATUS as i32);
+    // Party leg: the same wire command goes to the room; per-member results show
+    // up in the party member list, not in SEND_RESULT.
+    if party_on {
+        party::send(command);
+    }
+    if hosts.is_empty() {
+        set_window_text(h_status, "Sent to party");
+        return;
+    }
+
     let count = hosts.len();
     set_window_text(h_status, &format!("Sending to {} host(s)...", count));
 

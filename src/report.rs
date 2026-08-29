@@ -93,7 +93,7 @@ pub fn stop() {
     CANCEL.store(true, Ordering::Release);
 }
 
-fn machine_name() -> String {
+pub(crate) fn machine_name() -> String {
     unsafe {
         let mut buf = [0u16; 64];
         let mut len = buf.len() as u32;

@@ -7,6 +7,7 @@ mod hotkeys;
 mod mapcoord;
 mod monitor;
 mod network;
+mod party;
 mod pet_cycle;
 mod player;
 mod proximity;
@@ -196,6 +197,10 @@ fn main() {
     // the report_enabled flag live, so Settings can toggle it without a restart.
     report::start();
 
+    // Party relay (internet co-play); the thread idles until party_enabled with a
+    // room + passkey, and re-reads config live like the reporter.
+    party::start();
+
     // Load the proximity ignore list into the live detector unconditionally, so it mirrors
     // config even when detection starts disabled (keeps the Settings save from wiping it).
     proximity::set_ignored(cfg.proximity_ignore.clone());
@@ -316,6 +321,11 @@ fn main() {
                                 });
                             }
                         }
+                        // Same command rides to the party room when this machine
+                        // is a connected sender (internet co-play).
+                        if party::sender_active() {
+                            party::send(&cmd);
+                        }
                     }
                 }
                 _ => {}
@@ -331,6 +341,7 @@ fn main() {
 
     // Cleanup
     report::stop();
+    party::stop();
     proximity::stop();
     burst::stop();
     monitor::stop_all();

@@ -62,7 +62,8 @@ arms the background subsystems from config, then runs the Win32 message loop. Ho
 as `WM_APP_HOTKEY` thread messages and dispatched to `gui::handle_*` in that loop. Subsystems each
 own a thread + statics and expose `start/stop/set_*` + `is_*`/`snapshot()` accessors:
 `monitor` (pixel bars), `pet_cycle`, `burst`, `proximity` (Npcap packet sniffer), `network` (TCP
-remote control), `report` (dashboard heartbeat), `update` (GitHub poll).
+remote control), `report` (dashboard heartbeat), `party` (internet co-play relay), `update`
+(GitHub poll).
 
 **Data on disk** (`%APPDATA%\ranify2\`, path still uses the old name): `config.json` (`AppConfig`,
 every field `#[serde(default)]`-tolerant so old files load), `sequences/<sanitized>.json` (one file
@@ -128,6 +129,15 @@ labelled, and plays), `PLAY_LIST <label> <seqs…>` (v3.10.0 sender-expansion fo
 coordinated; `ERR stop_timeout` if the old run won't die), and a cancelled run releases any
 keys/buttons it left held. Names are file stems, so whitespace-split is safe. Remote hotkey bindings
 (`RemoteBinding.target`: sequence / queue / group) build these in `RemoteBinding::command`.
+
+**Party** (`party.rs`): the same wire commands relayed over the internet through the fleet server
+(`POST {party_url}/api/party/poll` long-poll ~25s hold / `/api/party/send`; implicit rooms keyed by
+`party_room`+`party_passkey`, identity = computer name, display name = `report_label`). One worker
+thread like `report.rs` (idempotent `start()`, re-reads `cached_config()` each cycle); receivers run
+commands through `network::execute_command`, ack the result on the next poll, and the Remote dialog's
+Party section (IDs 730–736) shows status + member list. Remote hotkeys and the dialog's Send buttons
+also broadcast to the room when `party::sender_active()`. Server side lives in
+`../cadence-server/src/party.rs` (in-memory rooms, evaporate when empty).
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
 is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets. `NET_MSG_BASE` is

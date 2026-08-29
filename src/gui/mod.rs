@@ -228,6 +228,15 @@ pub(crate) const IDC_BTN_SEND_QUEUE: u16 = 716;
 pub(crate) const IDC_BTN_SEND_STOP: u16 = 717;
 pub(crate) const IDC_STATIC_SEND_STATUS: u16 = 718;
 
+// Party (internet co-play) controls in the Remote dialog
+pub(crate) const IDC_EDIT_PARTY_ROOM: u16 = 730;
+pub(crate) const IDC_EDIT_PARTY_KEY: u16 = 731;
+pub(crate) const IDC_CHK_PARTY_SEND: u16 = 732;
+pub(crate) const IDC_CHK_PARTY_RECV: u16 = 733;
+pub(crate) const IDC_BTN_PARTY_TOGGLE: u16 = 734;
+pub(crate) const IDC_STATIC_PARTY_STATUS: u16 = 735;
+pub(crate) const IDC_LIST_PARTY_MEMBERS: u16 = 736;
+
 // Remote hotkey binding controls
 pub(crate) const IDC_LIST_REMOTE_BINDINGS: u16 = 801;
 pub(crate) const IDC_BTN_ADD_BINDING: u16 = 802;

@@ -142,6 +142,25 @@ pub struct AppConfig {
     /// (e.g. the character name). Empty = machine name only.
     #[serde(default)]
     pub report_label: String,
+    /// Party: join a named room on the fleet server and coordinate playback with
+    /// members elsewhere on the internet. This is the persisted Connect state, so a
+    /// connected machine reconnects on its own after a restart.
+    #[serde(default)]
+    pub party_enabled: bool,
+    /// Origin of the party relay (no path); normally the fleet dashboard server.
+    #[serde(default = "default_party_url")]
+    pub party_url: String,
+    #[serde(default)]
+    pub party_room: String,
+    #[serde(default)]
+    pub party_passkey: String,
+    /// Sender role: remote hotkeys and the Remote dialog's Send buttons broadcast
+    /// to the room.
+    #[serde(default)]
+    pub party_send: bool,
+    /// Receiver role: commands from the room's senders play here.
+    #[serde(default = "default_true")]
+    pub party_receive: bool,
 }
 
 fn default_remote_port() -> u16 { 9847 }
@@ -160,6 +179,7 @@ fn default_update_interval_mins() -> u32 { 30 }
 fn default_update_auto_confirm_secs() -> u32 { 60 }
 fn default_report_url() -> String { "https://147-182-215-152.sslip.io/api/report".to_string() }
 fn default_report_token() -> String { "ccdea6d580af677289951e42c88f7b34763eeb0f1ced6534".to_string() }
+fn default_party_url() -> String { "https://147-182-215-152.sslip.io".to_string() }
 fn default_proximity_watch() -> Vec<String> {
     crate::proximity::DEFAULT_WATCH.iter().map(|s| s.to_string()).collect()
 }
@@ -223,6 +243,12 @@ impl Default for AppConfig {
             report_url: default_report_url(),
             report_token: default_report_token(),
             report_label: String::new(),
+            party_enabled: false,
+            party_url: default_party_url(),
+            party_room: String::new(),
+            party_passkey: String::new(),
+            party_send: false,
+            party_receive: true,
         }
     }
 }
