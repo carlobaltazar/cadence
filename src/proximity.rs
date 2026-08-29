@@ -23,7 +23,7 @@ use winapi::um::processenv::GetStdHandle;
 use winapi::um::sysinfoapi::{GetLocalTime, GetSystemDirectoryW};
 use winapi::um::wincon::SetConsoleTitleW;
 use winapi::um::winbase::STD_OUTPUT_HANDLE;
-use winapi::um::winuser::{MapVirtualKeyW, PostMessageW, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC};
+use winapi::um::winuser::{MapVirtualKeyW, MessageBeep, PostMessageW, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MB_ICONEXCLAMATION};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
@@ -86,6 +86,7 @@ fn one() -> u32 { 1 }
 
 /// Everything parsed from one DROP_PC (SDROP_CHAR) payload. Fields are Option/empty when the
 /// value failed a sanity check (short/garbled message), so a bad read never poisons the record.
+#[derive(Default)]
 pub struct PcInfo {
     pub name: String,
     pub level: Option<u16>,
@@ -116,6 +117,14 @@ static SESSION: Mutex<Vec<DetectedPlayer>> = Mutex::new(Vec::new());
 static PERMANENT: Mutex<Vec<DetectedPlayer>> = Mutex::new(Vec::new());
 static PERM_DIRTY: AtomicBool = AtomicBool::new(false);
 static IGNORE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// Marked players ring the alarm (fleet event + local beep) whenever they are seen — in every
+// capture mode, without disarming, independent of the ignore list (ignore only suppresses the
+// one-shot trigger reaction). Persisted as config.proximity_marked, like the ignore list.
+static MARKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+// name (lowercased) -> unix secs of the last alarm; tiny, scanned linearly.
+static ALARM_LAST: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+const MARK_ALARM_COOLDOWN_SECS: i64 = 300;
 
 // Watch-list trigger. With TRIGGER_WATCH set, a player entering view only fires the reaction when
 // they look like staff — either the char block says the account is a GM, or one of the WATCH
@@ -330,6 +339,58 @@ fn is_ignored(name: &str) -> bool {
     IGNORE.lock().unwrap().iter().any(|n| n == name)
 }
 
+fn is_marked(name: &str) -> bool {
+    MARKED.lock().unwrap().iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Whether a fresh alarm is due given when this name last alarmed.
+fn cooldown_ok(last: Option<i64>, now: i64) -> bool {
+    last.map_or(true, |t| now - t >= MARK_ALARM_COOLDOWN_SECS)
+}
+
+/// Check-and-stamp: true at most once per name per cooldown window.
+fn mark_alarm_due(name: &str, now: i64) -> bool {
+    let key = name.to_ascii_lowercase();
+    let mut last = ALARM_LAST.lock().unwrap();
+    match last.iter_mut().find(|(n, _)| *n == key) {
+        Some((_, t)) => {
+            if cooldown_ok(Some(*t), now) {
+                *t = now;
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            last.push((key, now));
+            true
+        }
+    }
+}
+
+/// Three alert beeps off-thread — the capture thread must never sleep.
+fn alarm_beep() {
+    std::thread::spawn(|| {
+        for _ in 0..3 {
+            unsafe {
+                MessageBeep(MB_ICONEXCLAMATION);
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
+
+/// Fleet-event detail for a marked sighting (the server truncates at 200 chars).
+fn mark_detail(info: &PcInfo) -> String {
+    let lvl = info.level.map(|l| format!(" Lv{}", l)).unwrap_or_default();
+    let guild = if info.guild.is_empty() {
+        String::new()
+    } else {
+        format!(", guild {}", info.guild)
+    };
+    format!("{}{}{}{}{}", info.name, lvl, guild, staff_marks(info), where_at(info))
+}
+
 /// Stamp the reason a player tripped the alert onto their record, so "why did this fire?" is
 /// answerable from the Players list and the export long after the log has rolled over.
 fn record_reason(name: &str, why: &str) {
@@ -510,6 +571,28 @@ pub fn toggle_ignore(name: &str) -> bool {
         false
     } else {
         ig.push(name.to_string());
+        true
+    }
+}
+
+/// Names currently marked for the alarm (Discord push + local beep on sight).
+pub fn marked_players() -> Vec<String> {
+    MARKED.lock().unwrap().clone()
+}
+
+/// Replace the marked list (called on startup from config, and by the Players UI).
+pub fn set_marked(names: Vec<String>) {
+    *MARKED.lock().unwrap() = names;
+}
+
+/// Flip a name's marked state; returns the new state (true = now marked).
+pub fn toggle_mark(name: &str) -> bool {
+    let mut mk = MARKED.lock().unwrap();
+    if let Some(pos) = mk.iter().position(|n| n.eq_ignore_ascii_case(name)) {
+        mk.remove(pos);
+        false
+    } else {
+        mk.push(name.to_string());
         true
     }
 }
@@ -873,6 +956,16 @@ fn capture_loop(vk: u16, iface: &str, server_ip: &str, cooldown_ms: u64) -> Resu
                     let info = parse_pc(&msg[8..]);
                     let name = info.name.clone();
                     record_detection(&info);
+                    // Marked-player alarm: fires in every mode (scan included), never
+                    // disarms, independent of the ignore list; own per-name cooldown.
+                    if is_marked(&name) && mark_alarm_due(&name, now_unix()) {
+                        dlog(&format!(
+                            "[t+{:.1}s] *** MARKED PLAYER: {}{} *** (alarm; capture continues)",
+                            start.elapsed().as_secs_f32(), name, where_at(&info)
+                        ));
+                        alarm_beep();
+                        crate::report::push_event("player_detected", mark_detail(&info));
+                    }
                     let scan = SCAN_ONLY.load(Ordering::Acquire);
                     let lvl_s = info.level.map(|l| format!(" Lv{}", l)).unwrap_or_default();
                     // Badge / account level go in every line so unknown staff names are easy to
@@ -1613,6 +1706,25 @@ fn cstr(p: *const c_char) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mark_cooldown_boundaries() {
+        assert!(cooldown_ok(None, 1000));
+        assert!(!cooldown_ok(Some(1000), 1000 + MARK_ALARM_COOLDOWN_SECS - 1));
+        assert!(cooldown_ok(Some(1000), 1000 + MARK_ALARM_COOLDOWN_SECS));
+    }
+
+    #[test]
+    fn mark_detail_renders_known_fields_and_omits_empty() {
+        let mut info = PcInfo::default();
+        info.name = "BadGuy".to_string();
+        info.level = Some(120);
+        info.guild = "Foo".to_string();
+        assert_eq!(mark_detail(&info), "BadGuy Lv120, guild Foo");
+        let mut bare = PcInfo::default();
+        bare.name = "Solo".to_string();
+        assert_eq!(mark_detail(&bare), "Solo");
+    }
 
     // A real compressed DROP_PC envelope body (LZO1X) captured from real_market.txt, and the
     // player name it must decode to. Guards the LZO port + framing against regressions.

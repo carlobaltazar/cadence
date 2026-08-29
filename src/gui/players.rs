@@ -49,7 +49,7 @@ const ANY_LABEL: &str = "(Any)";
 
 // Column layout: (width, right_aligned). Shared by the header and every row so they line up.
 const COLS: &[(usize, bool)] = &[
-    (1, false),  // ignore marker
+    (2, false),  // flags: '!' marked (alarm), '*' ignored
     (13, false), // name
     (3, true),   // level
     (9, false),  // class
@@ -278,7 +278,12 @@ fn header_line() -> String {
     ])
 }
 
-fn row_line(p: &proximity::DetectedPlayer, ignored: bool) -> String {
+/// 2-char flag cell: col 0 = '!' marked (alarm), col 1 = '*' ignored.
+fn flag_cell(ignored: bool, marked: bool) -> String {
+    format!("{}{}", if marked { '!' } else { ' ' }, if ignored { '*' } else { ' ' })
+}
+
+fn row_line(p: &proximity::DetectedPlayer, ignored: bool, marked: bool) -> String {
     let (cls, gen) = p.class.map(class_name).unwrap_or(("-", ""));
     let sch = p.school.map(school_name).unwrap_or("-").to_string();
     let lv = p.level.map(|l| l.to_string()).unwrap_or_else(|| "-".into());
@@ -292,7 +297,7 @@ fn row_line(p: &proximity::DetectedPlayer, ignored: bool) -> String {
     let seen = if p.seen_str.is_empty() { "-".into() } else { p.seen_str.clone() };
     let nick = if p.nick.is_empty() { "-".into() } else { p.nick.clone() };
     line(&[
-        if ignored { "*".into() } else { " ".into() },
+        flag_cell(ignored, marked),
         p.name.clone(), lv, cls.into(), gen.into(), sch, map, guild, nick, tag_display(p), hp, pos,
         seen, p.why.clone(),
     ])
@@ -414,11 +419,16 @@ unsafe fn refresh_list(hwnd: HWND) {
 
     let players = collect_filtered();
     let ignored = proximity::ignored_players();
+    let marked = proximity::marked_players();
 
     let mut lines: Vec<String> = Vec::with_capacity(players.len());
     let mut names: Vec<String> = Vec::with_capacity(players.len());
     for p in &players {
-        lines.push(row_line(p, ignored.iter().any(|n| n == &p.name)));
+        lines.push(row_line(
+            p,
+            ignored.iter().any(|n| n == &p.name),
+            marked.iter().any(|n| n.eq_ignore_ascii_case(&p.name)),
+        ));
         names.push(p.name.clone());
     }
 
@@ -598,9 +608,10 @@ unsafe fn export_xlsx(hwnd: HWND) {
     let headers = [
         "Name", "Level", "Class", "Gender", "School", "Map", "Guild", "Nick", "Tag",
         "HP Now", "HP Max", "Map X/Y", "World X", "World Z", "Sightings", "Seen", "Ignored",
-        "Why It Fired",
+        "Marked", "Why It Fired",
     ];
     let ignored = proximity::ignored_players();
+    let marked = proximity::marked_players();
     let num_or_dash = |v: Option<u16>| match v {
         Some(n) => xlsx::Cell::Num(n as f64),
         None => xlsx::Cell::Str("-".into()),
@@ -615,6 +626,7 @@ unsafe fn export_xlsx(hwnd: HWND) {
         let sch = p.school.map(school_name).unwrap_or("-");
         let seen = if p.seen_str.is_empty() { "-".to_string() } else { p.seen_str.clone() };
         let is_ignored = ignored.iter().any(|n| n == &p.name);
+        let is_marked = marked.iter().any(|n| n.eq_ignore_ascii_case(&p.name));
         rows.push(vec![
             xlsx::Cell::Str(p.name.clone()),
             num_or_dash(p.level),
@@ -633,6 +645,7 @@ unsafe fn export_xlsx(hwnd: HWND) {
             xlsx::Cell::Num(p.count as f64),
             xlsx::Cell::Str(seen),
             xlsx::Cell::Str(if is_ignored { "yes".into() } else { String::new() }),
+            xlsx::Cell::Str(if is_marked { "yes".into() } else { String::new() }),
             xlsx::Cell::Str(p.why.clone()),
         ]);
     }
@@ -680,12 +693,16 @@ unsafe fn layout(hwnd: HWND) {
     MoveWindow(list, m, list_top, content_w, list_h, TRUE);
     SendMessageW(list, LB_SETHORIZONTALEXTENT, scale(860, dpi) as WPARAM, 0);
 
-    // Bottom row: three actions left-aligned; Export + Close pinned to the right edge.
-    let (tw, dw, cwid, exw, clw) =
-        (scale(140, dpi), scale(80, dpi), scale(130, dpi), scale(90, dpi), scale(80, dpi));
+    // Bottom row: four actions left-aligned; Export + Close pinned to the right edge.
+    let (tw, mkw, dw, cwid, exw, clw) = (
+        scale(140, dpi), scale(110, dpi), scale(80, dpi), scale(130, dpi),
+        scale(90, dpi), scale(80, dpi),
+    );
     let mut x = m;
     MoveWindow(GetDlgItem(hwnd, IDC_BTN_PLAYER_TOGGLE as i32), x, btn_y, tw, btn_h, TRUE);
     x += tw + gap;
+    MoveWindow(GetDlgItem(hwnd, IDC_BTN_PLAYER_MARK as i32), x, btn_y, mkw, btn_h, TRUE);
+    x += mkw + gap;
     MoveWindow(GetDlgItem(hwnd, IDC_BTN_PLAYER_DELETE as i32), x, btn_y, dw, btn_h, TRUE);
     x += dw + gap;
     MoveWindow(GetDlgItem(hwnd, IDC_BTN_PLAYER_CLEAR as i32), x, btn_y, cwid, btn_h, TRUE);
@@ -718,6 +735,23 @@ unsafe fn persist_ignore() {
     let mut c = config::cached_config();
     c.proximity_ignore = proximity::ignored_players();
     let _ = config::save_config(&c);
+}
+
+unsafe fn persist_marked() {
+    let mut c = config::cached_config();
+    c.proximity_marked = proximity::marked_players();
+    let _ = config::save_config(&c);
+}
+
+/// Flip the alarm mark on the selected row and persist + repaint.
+unsafe fn toggle_selected_mark(hwnd: HWND) {
+    if let Some(name) = selected_name(hwnd) {
+        if !name.is_empty() {
+            proximity::toggle_mark(&name);
+            persist_marked();
+            force_refresh(hwnd);
+        }
+    }
 }
 
 unsafe fn apply_scan(hwnd: HWND) {
@@ -903,9 +937,14 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                 12, 416, 140, 26, IDC_BTN_PLAYER_TOGGLE,
             );
             create_control(
+                hwnd, hinstance, font, "BUTTON", "Mark / Unmark",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                158, 416, 110, 26, IDC_BTN_PLAYER_MARK,
+            );
+            create_control(
                 hwnd, hinstance, font, "BUTTON", "Delete",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                158, 416, 80, 26, IDC_BTN_PLAYER_DELETE,
+                274, 416, 80, 26, IDC_BTN_PLAYER_DELETE,
             );
             create_control(
                 hwnd, hinstance, font, "BUTTON", clear_label(),
@@ -962,6 +1001,11 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                 force_refresh(hwnd);
                 return 0;
             }
+            // Double-click a row = flip its alarm mark (same as the button).
+            if id == IDC_LIST_PLAYERS && code == LBN_DBLCLK as u16 {
+                toggle_selected_mark(hwnd);
+                return 0;
+            }
             if id == IDC_BTN_PLAYER_TOGGLE {
                 if let Some(name) = selected_name(hwnd) {
                     if !name.is_empty() {
@@ -970,6 +1014,8 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                         force_refresh(hwnd);
                     }
                 }
+            } else if id == IDC_BTN_PLAYER_MARK {
+                toggle_selected_mark(hwnd);
             } else if id == IDC_BTN_PLAYER_DELETE {
                 if let Some(name) = selected_name(hwnd) {
                     proximity::delete_player(VIEW_PERMANENT.load(Ordering::Acquire), &name);
@@ -1002,7 +1048,7 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
         WM_GETMINMAXINFO => {
             let dpi = dpi_for_window(hwnd);
             let mmi = &mut *(l_param as *mut MINMAXINFO);
-            mmi.ptMinTrackSize.x = scale(620, dpi);
+            mmi.ptMinTrackSize.x = scale(700, dpi);
             mmi.ptMinTrackSize.y = scale(380, dpi);
             0
         }
@@ -1020,7 +1066,7 @@ unsafe extern "system" fn players_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
 
 #[cfg(test)]
 mod tests {
-    use super::take_render;
+    use super::{flag_cell, take_render};
 
     #[test]
     fn forced_render_repaints_even_when_empty() {
@@ -1031,5 +1077,13 @@ mod tests {
         let rows = vec!["row".to_string()];
         assert!(take_render(&mut last, &rows));
         assert!(!take_render(&mut last, &rows));
+    }
+
+    #[test]
+    fn flag_cell_combinations() {
+        assert_eq!(flag_cell(false, false), "  ");
+        assert_eq!(flag_cell(true, false), " *");
+        assert_eq!(flag_cell(false, true), "! ");
+        assert_eq!(flag_cell(true, true), "!*");
     }
 }

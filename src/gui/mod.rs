@@ -164,6 +164,7 @@ pub(crate) const IDC_CMB_PLAYER_SCHOOL: u16 = 913; // filter: school
 pub(crate) const IDC_CMB_PLAYER_MAP: u16 = 914;    // filter: map (populated from data)
 pub(crate) const IDC_CMB_PLAYER_GUILD: u16 = 915;  // filter: guild (populated from data)
 pub(crate) const IDC_BTN_PLAYER_EXPORT: u16 = 906; // export current view to .xlsx
+pub(crate) const IDC_BTN_PLAYER_MARK: u16 = 916; // mark/unmark for the proximity alarm
 
 // Save dialog controls
 pub(crate) const IDC_EDIT_SEQ_NAME: u16 = 301;

@@ -145,3 +145,9 @@ server-build-dependent (RAN Portal: 988 until mid-2026, **994** since the 2026-0
 `DROP_PC=0` with game data flowing, the console's "Paste me this line to recalibrate" candidates
 line is the calibration source — DROP_PC is the candidate whose opcode+1 is frequent, base =
 opcode − 2023.
+
+**Marked-player alarm**: names in `config.proximity_marked` (toggled in the Players window via
+Mark/Unmark or double-click; `!` flag in column 0) ring an alarm on every sighting — 3 beeps +
+`report::push_event("player_detected", …)` which the server pushes to the owner's Discord webhook
+(server-side 300s debounce per detail). Alarm-only: fires in scan mode too, never disarms, and is
+independent of the ignore list; client cooldown 300s per name (`mark_alarm_due`).

@@ -100,6 +100,10 @@ pub struct AppConfig {
     pub proximity_cooldown_ms: u64,
     #[serde(default)]
     pub proximity_ignore: Vec<String>,
+    /// Names that ring the marked-player alarm (fleet/Discord push + local beep) whenever the
+    /// detector sees them. Alarm-only and independent of the ignore list.
+    #[serde(default)]
+    pub proximity_marked: Vec<String>,
     /// Reaction sequence to play on detection. Empty = press the proximity key instead.
     #[serde(default)]
     pub proximity_sequence: String,
@@ -230,6 +234,7 @@ impl Default for AppConfig {
             proximity_server_ip: default_proximity_server_ip(),
             proximity_cooldown_ms: default_proximity_cooldown(),
             proximity_ignore: Vec::new(),
+            proximity_marked: Vec::new(),
             proximity_sequence: String::new(),
             proximity_watch_only: false,
             proximity_watch: default_proximity_watch(),

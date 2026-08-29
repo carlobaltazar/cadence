@@ -18,6 +18,7 @@ use crate::{config, monitor, player, recorder, update};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,22 @@ const BACKOFF: [u64; 3] = [5, 15, 60];
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
+
+// Cross-thread event inbox: other modules (proximity's marked-player alarm) queue
+// fleet events here and the reporting thread drains it every tick. Capped so a
+// machine with reporting broken can't hoard alarms forever.
+static INBOX: Mutex<Vec<(&'static str, String, Instant)>> = Mutex::new(Vec::new());
+const INBOX_CAP: usize = 32;
+
+/// Queue an event for the next report; safe from any thread. The timestamp is
+/// taken now so age_secs stays honest however long the drain takes.
+pub fn push_event(kind: &'static str, detail: String) {
+    let mut ib = INBOX.lock().unwrap();
+    if ib.len() >= INBOX_CAP {
+        ib.remove(0);
+    }
+    ib.push((kind, detail, Instant::now()));
+}
 
 #[derive(Serialize)]
 struct WireEvent {
@@ -209,6 +226,7 @@ fn run() {
                 break;
             }
             queue.clear();
+            INBOX.lock().unwrap().clear();
             first = true;
             thread::sleep(TICK);
             continue;
@@ -292,6 +310,14 @@ fn run() {
             }
         }
         prev = cur;
+
+        // Events posted by other threads keep their original timestamps.
+        for (kind, detail, at) in INBOX.lock().unwrap().drain(..) {
+            if queue.len() >= QUEUE_CAP {
+                queue.pop_front();
+            }
+            queue.push_back(Pending { kind, detail, at });
+        }
 
         if stopping {
             push(&mut queue, "shutdown", String::new());
