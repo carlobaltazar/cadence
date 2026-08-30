@@ -10,12 +10,12 @@
 //! loop — the server holds the request up to 25s and answers instantly when a
 //! command arrives, so delivery latency is network round-trip, not poll interval.
 
-use crate::{config, network, report, update};
+use crate::{config, network, player, report, update};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Must out-wait the server's 25s hold with margin.
 const POLL_RECV_TIMEOUT_MS: i32 = 40_000;
@@ -32,6 +32,18 @@ static GEN: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static LAST_SEND: Mutex<String> = Mutex::new(String::new());
 static MEMBERS: Mutex<Vec<MemberSnap>> = Mutex::new(Vec::new());
+/// Set when THIS machine started the room's auto-loop, so it can re-assert the
+/// loop after a server restart: (cmd, gap_secs, when it was set — a fresh start
+/// gets a grace window before "auto missing" is read as "someone stopped it").
+/// In-memory only on purpose: it dies with the process, and a restarted client
+/// can no longer prove it still owns the loop (no zombie re-asserts).
+static AUTO_WANTED: Mutex<Option<(String, u32, Instant)>> = Mutex::new(None);
+/// The room's auto-loop as of the last poll, for the UI:
+/// (cmd, round, next-fire deadline).
+static AUTO_SNAP: Mutex<Option<(String, u64, Instant)>> = Mutex::new(None);
+/// Seconds a freshly-set AUTO_WANTED is trusted even when the poll shows no
+/// auto — our own start POST may still be in flight.
+const AUTO_GRACE_SECS: u64 = 10;
 
 #[derive(Clone, PartialEq)]
 pub struct MemberSnap {
@@ -48,6 +60,10 @@ struct Ack {
     seq: u64,
     ok: bool,
     detail: String,
+    /// One-pass duration of the run this ack started; the server schedules the
+    /// next auto-loop round off the longest member's report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pass_micros: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -83,11 +99,24 @@ struct WireMember {
 }
 
 #[derive(Deserialize)]
+struct WireAuto {
+    cmd: String,
+    #[serde(default)]
+    round: u64,
+    #[serde(default)]
+    next_in_secs: i64,
+    #[serde(default)]
+    started_by: String,
+}
+
+#[derive(Deserialize)]
 struct PollResp {
     seq: u64,
     cmd: Option<String>,
     #[serde(default)]
     members: Vec<WireMember>,
+    #[serde(default)]
+    auto: Option<WireAuto>,
 }
 
 /// Spawn the party thread (idempotent). It idles cheaply until the config says
@@ -154,16 +183,90 @@ pub fn send(cmd: &str) {
     });
 }
 
+/// Whether the room currently has an auto-loop (as of the last poll). Drives
+/// the Remote dialog's Start/Stop-auto button text.
+pub fn auto_active() -> bool {
+    AUTO_SNAP.lock().unwrap().is_some()
+}
+
+/// Start (or replace) the room's server-hosted auto-loop: the server re-fires
+/// `PLAY <name>` every round at the longest member's reported duration plus a
+/// small margin plus `gap_secs` of rest. The loop lives on the room, so every
+/// machine (this one included) can go AFK and rounds keep firing.
+pub fn start_auto(name: &str, gap_secs: u32) {
+    post_auto(Some((format!("PLAY {}", name.trim()), gap_secs)));
+}
+
+/// Stop the auto-loop: future rounds only, running playback is untouched (the
+/// Send-Stop button remains the panic path — and does NOT stop the loop).
+pub fn stop_auto() {
+    post_auto(None);
+}
+
+/// Fire-and-forget POST for auto start (`Some((cmd, gap))`) or stop (`None`);
+/// updates AUTO_WANTED ownership and the LAST_SEND note from the outcome.
+fn post_auto(start: Option<(String, u32)>) {
+    if !sender_active() {
+        return;
+    }
+    let cfg = config::cached_config();
+    thread::spawn(move || {
+        let agent_id = report::machine_name();
+        let mut body = serde_json::json!({
+            "room": cfg.party_room.trim(),
+            "passkey": cfg.party_passkey.trim(),
+            "agent_id": agent_id,
+            "member": display_name(&cfg.report_label, &agent_id),
+        });
+        match &start {
+            Some((cmd, gap)) => {
+                body["cmd"] = serde_json::json!(cmd);
+                body["auto_start"] = serde_json::json!(true);
+                body["auto_gap_secs"] = serde_json::json!(gap);
+            }
+            None => body["auto_stop"] = serde_json::json!(true),
+        }
+        let url = api_url(&cfg.party_url, "/api/party/send");
+        let json = serde_json::to_vec(&body).unwrap_or_default();
+        let note = match update::https_post_json_timeout(&url, &json, SEND_RECV_TIMEOUT_MS) {
+            Ok((200, _)) => match start {
+                Some((cmd, gap)) => {
+                    *AUTO_WANTED.lock().unwrap() = Some((cmd, gap, Instant::now()));
+                    "auto started".to_string()
+                }
+                None => {
+                    *AUTO_WANTED.lock().unwrap() = None;
+                    *AUTO_SNAP.lock().unwrap() = None;
+                    "auto stopped".to_string()
+                }
+            },
+            Ok((403, _)) => "auto failed: wrong passkey".to_string(),
+            Ok((status, _)) => format!("auto failed (HTTP {})", status),
+            Err(e) => format!("auto failed ({})", e),
+        };
+        *LAST_SEND.lock().unwrap() = note;
+    });
+}
+
 /// One line for the Remote dialog's status static.
 pub fn status_line() -> String {
     let conn = STATUS.lock().unwrap().clone();
     let sent = LAST_SEND.lock().unwrap().clone();
-    match (conn.is_empty(), sent.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => conn,
-        (true, false) => sent,
-        (false, false) => format!("{} · {}", conn, sent),
-    }
+    let auto = AUTO_SNAP.lock().unwrap().as_ref().map(|(cmd, round, deadline)| {
+        format_auto(cmd, *round, deadline.saturating_duration_since(Instant::now()).as_secs())
+    });
+    let parts: Vec<String> = [Some(conn), auto, Some(sent)]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.join(" · ")
+}
+
+/// Status-line fragment for an active auto-loop; the dialog's timer repaints
+/// every 500ms, so the countdown runs live between polls.
+fn format_auto(cmd: &str, round: u64, secs_left: u64) -> String {
+    format!("Auto: {} r{}, next {}s", cmd, round, secs_left)
 }
 
 /// Member rows for the dialog, plus a generation stamp: repaint only when it moves.
@@ -196,6 +299,69 @@ pub fn format_member(m: &MemberSnap) -> String {
 fn advance(last_seq: u64, resp_seq: u64, cmd: Option<String>) -> (u64, Option<String>) {
     let run = if resp_seq == last_seq { None } else { cmd };
     (resp_seq, run)
+}
+
+#[derive(PartialEq, Debug)]
+enum AutoAction {
+    Keep,
+    ClearWanted,
+    Reassert,
+}
+
+/// What to do with this machine's auto-loop ownership after a poll.
+/// `started_by_me`: whether the room's auto (if any) names this machine.
+/// `backwards`: the response seq was lower than ours before adoption — the
+/// server-restart signature, meaning the room was rebuilt and a loop we own
+/// must be re-asserted. Auto missing WITHOUT that signature means another
+/// sender stopped or replaced it: drop ownership so a stopped loop never comes
+/// back as a zombie. The grace window covers a just-sent start whose POST the
+/// poll may have raced.
+fn auto_reconcile(
+    wanted: bool,
+    wanted_age_secs: u64,
+    started_by_me: Option<bool>,
+    backwards: bool,
+) -> AutoAction {
+    match (wanted, started_by_me) {
+        (false, _) => AutoAction::Keep,
+        (true, Some(true)) => AutoAction::Keep,
+        (true, Some(false)) => AutoAction::ClearWanted,
+        (true, None) if backwards => AutoAction::Reassert,
+        (true, None) if wanted_age_secs < AUTO_GRACE_SECS => AutoAction::Keep,
+        (true, None) => AutoAction::ClearWanted,
+    }
+}
+
+fn set_auto_snap(auto: Option<&WireAuto>) {
+    *AUTO_SNAP.lock().unwrap() = auto.map(|a| {
+        let deadline = Instant::now() + Duration::from_secs(a.next_in_secs.max(0) as u64);
+        (a.cmd.clone(), a.round, deadline)
+    });
+}
+
+/// Apply auto_reconcile to the statics after a successful poll; a Reassert
+/// refreshes the grace stamp first so the next poll doesn't race the re-POST.
+fn reconcile_auto(auto: Option<&WireAuto>, agent_id: &str, backwards: bool) {
+    let resend = {
+        let mut wanted = AUTO_WANTED.lock().unwrap();
+        let Some((cmd, gap, at)) = wanted.clone() else { return };
+        let started_by_me = auto.map(|a| a.started_by == agent_id);
+        match auto_reconcile(true, at.elapsed().as_secs(), started_by_me, backwards) {
+            AutoAction::Keep => None,
+            AutoAction::ClearWanted => {
+                *wanted = None;
+                None
+            }
+            AutoAction::Reassert => {
+                *wanted = Some((cmd.clone(), gap, Instant::now()));
+                Some((cmd, gap))
+            }
+        }
+    };
+    if let Some((cmd, gap)) = resend {
+        println!("[Cadence] Party auto-loop re-asserted after server restart: {}", cmd);
+        post_auto(Some((cmd, gap)));
+    }
 }
 
 fn api_url(origin: &str, path: &str) -> String {
@@ -254,6 +420,10 @@ fn run() {
                 set_members(Vec::new());
                 set_status("");
                 LAST_SEND.lock().unwrap().clear();
+                // Disconnecting is a user action, not an outage: drop the room's
+                // auto view and any ownership claim.
+                *AUTO_SNAP.lock().unwrap() = None;
+                *AUTO_WANTED.lock().unwrap() = None;
                 last_seq = 0;
                 pending_ack = None;
                 failures = 0;
@@ -302,6 +472,9 @@ fn run() {
                             .collect(),
                     );
                     set_status(&format!("Connected — {} member(s) online", online));
+                    let backwards = pr.seq < last_seq;
+                    set_auto_snap(pr.auto.as_ref());
+                    reconcile_auto(pr.auto.as_ref(), &agent_id, backwards);
                     let (next, cmd) = advance(last_seq, pr.seq, pr.cmd);
                     last_seq = next;
                     if let Some(cmd) = cmd {
@@ -309,10 +482,18 @@ fn run() {
                         // stop-and-override takeover, local name resolution.
                         let result = network::execute_command(&cmd).trim().to_string();
                         println!("[Cadence] Party command: {} -> {}", cmd, result);
+                        let ok = result.starts_with("OK");
                         pending_ack = Some(Ack {
                             seq: next,
-                            ok: result.starts_with("OK"),
+                            ok,
                             detail: result,
+                            // execute_command returns right after playback
+                            // starts, so the player's pass duration is live.
+                            pass_micros: if ok {
+                                player::progress().map(|(_, p)| p).filter(|p| *p > 0)
+                            } else {
+                                None
+                            },
                         });
                     }
                     // No sleep: the server's 25s hold paces this loop.
@@ -328,6 +509,7 @@ fn run() {
             Ok((403, _)) => {
                 CONNECTED.store(false, Ordering::Release);
                 set_members(Vec::new());
+                *AUTO_SNAP.lock().unwrap() = None;
                 set_status("Wrong passkey");
                 // Slow retry so a corrected passkey heals without reconnect ceremony.
                 sleep_cancellable(15);
@@ -349,6 +531,7 @@ fn run() {
         }
     }
     CONNECTED.store(false, Ordering::Release);
+    *AUTO_SNAP.lock().unwrap() = None;
     RUNNING.store(false, Ordering::Release);
 }
 
@@ -395,7 +578,12 @@ mod tests {
             send: true,
             recv: true,
             last_seq: 4,
-            last_result: Some(Ack { seq: 4, ok: true, detail: "OK".into() }),
+            last_result: Some(Ack {
+                seq: 4,
+                ok: true,
+                detail: "OK".into(),
+                pass_micros: Some(140_000_000),
+            }),
         };
         let v: serde_json::Value =
             serde_json::from_slice(&serde_json::to_vec(&body).unwrap()).unwrap();
@@ -403,6 +591,10 @@ mod tests {
         assert_eq!(v["recv"], true);
         assert_eq!(v["last_seq"], 4);
         assert_eq!(v["last_result"]["ok"], true);
+        assert_eq!(v["last_result"]["pass_micros"], 140_000_000);
+        // Without a duration the key is omitted entirely (old-server friendly).
+        let bare = serde_json::to_value(Ack { seq: 1, ok: false, detail: "ERR x".into(), pass_micros: None }).unwrap();
+        assert!(bare.get("pass_micros").is_none());
 
         let idle: PollResp = serde_json::from_str(
             r#"{"seq":5,"cmd":null,"members":[{"agent_id":"PC","name":"Al","send":false,"recv":true,"online":true,"last_result":null}]}"#,
@@ -416,6 +608,41 @@ mod tests {
         let hit: PollResp =
             serde_json::from_str(r#"{"seq":6,"cmd":"PLAY raid1","members":[]}"#).unwrap();
         assert_eq!(hit.cmd.as_deref(), Some("PLAY raid1"));
+        assert!(hit.auto.is_none()); // absent and null both mean no auto
+
+        let with_auto: PollResp = serde_json::from_str(
+            r#"{"seq":7,"cmd":null,"members":[],"auto":{"cmd":"PLAY 3f3","round":12,"gap_secs":3,"next_in_secs":41,"started_by":"PC9"}}"#,
+        )
+        .unwrap();
+        let a = with_auto.auto.unwrap();
+        assert_eq!((a.cmd.as_str(), a.round, a.next_in_secs, a.started_by.as_str()), ("PLAY 3f3", 12, 41, "PC9"));
+        let null_auto: PollResp =
+            serde_json::from_str(r#"{"seq":7,"cmd":null,"members":[],"auto":null}"#).unwrap();
+        assert!(null_auto.auto.is_none());
+    }
+
+    #[test]
+    fn auto_reconcile_matrix() {
+        use AutoAction::*;
+        // Not an owner: nothing to do regardless of what the room shows.
+        assert_eq!(auto_reconcile(false, 999, None, true), Keep);
+        assert_eq!(auto_reconcile(false, 999, Some(false), false), Keep);
+        // Our loop is running: keep ownership.
+        assert_eq!(auto_reconcile(true, 999, Some(true), false), Keep);
+        // Another sender replaced it: they own re-assert now.
+        assert_eq!(auto_reconcile(true, 999, Some(false), false), ClearWanted);
+        // Server restarted (seq went backwards) and the loop is gone: re-assert.
+        assert_eq!(auto_reconcile(true, 999, None, true), Reassert);
+        // Loop gone without a restart signature: someone stopped it — no zombie.
+        assert_eq!(auto_reconcile(true, AUTO_GRACE_SECS, None, false), ClearWanted);
+        // ...unless our own start was just sent and the poll raced it.
+        assert_eq!(auto_reconcile(true, AUTO_GRACE_SECS - 1, None, false), Keep);
+    }
+
+    #[test]
+    fn auto_status_renders() {
+        assert_eq!(format_auto("PLAY 3f3", 12, 41), "Auto: PLAY 3f3 r12, next 41s");
+        assert_eq!(format_auto("PLAY x", 1, 0), "Auto: PLAY x r1, next 0s");
     }
 
     #[test]

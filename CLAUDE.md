@@ -135,9 +135,19 @@ keys/buttons it left held. Names are file stems, so whitespace-split is safe. Re
 `party_room`+`party_passkey`, identity = computer name, display name = `report_label`). One worker
 thread like `report.rs` (idempotent `start()`, re-reads `cached_config()` each cycle); receivers run
 commands through `network::execute_command`, ack the result on the next poll, and the Remote dialog's
-Party section (IDs 730–736) shows status + member list. Remote hotkeys and the dialog's Send buttons
+Party section (IDs 730–739) shows status + member list. Remote hotkeys and the dialog's Send buttons
 also broadcast to the room when `party::sender_active()`. Server side lives in
 `../cadence-server/src/party.rs` (in-memory rooms, evaporate when empty).
+
+**Party auto-loop.** Rounds are hosted on the server Room, not on any machine: a sender's
+"Start auto" (Remote dialog, IDs 737–739) stores `PLAY <name>` + a rest-gap on the room and fires
+round 1; each receiver's ack carries `pass_micros` (from `player::progress()`, only when OK) and the
+server re-fires at `max(pass) + 2s margin + gap` — so differently-timed role sequences restart in
+sync every round with nobody at the keyboard. Ownership/re-assert intent is the in-memory
+`AUTO_WANTED` static (never persisted — a persisted claim is the zombie-loop path): `auto_reconcile`
+re-asserts only on the server-restart signature (resp seq < ours) and drops the claim when another
+sender stopped/replaced the loop. `config.party_auto_name`/`party_auto_gap_secs` are UI prefill
+only. "Stop auto" stops future rounds; the Send-Stop panic button does NOT stop the loop.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
 is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets. `NET_MSG_BASE` is

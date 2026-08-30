@@ -165,6 +165,14 @@ pub struct AppConfig {
     /// Receiver role: commands from the room's senders play here.
     #[serde(default = "default_true")]
     pub party_receive: bool,
+    /// Last auto-loop sequence name / extra gap entered in the Remote dialog.
+    /// UI prefill only — deliberately NOT used to re-assert a loop after a
+    /// client restart (that ownership claim is in-memory in party.rs, so a
+    /// loop someone stopped can never come back as a zombie).
+    #[serde(default)]
+    pub party_auto_name: String,
+    #[serde(default)]
+    pub party_auto_gap_secs: u32,
 }
 
 fn default_remote_port() -> u16 { 9847 }
@@ -254,6 +262,8 @@ impl Default for AppConfig {
             party_passkey: String::new(),
             party_send: false,
             party_receive: true,
+            party_auto_name: String::new(),
+            party_auto_gap_secs: 0,
         }
     }
 }

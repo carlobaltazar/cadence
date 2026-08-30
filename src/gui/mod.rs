@@ -237,6 +237,9 @@ pub(crate) const IDC_CHK_PARTY_RECV: u16 = 733;
 pub(crate) const IDC_BTN_PARTY_TOGGLE: u16 = 734;
 pub(crate) const IDC_STATIC_PARTY_STATUS: u16 = 735;
 pub(crate) const IDC_LIST_PARTY_MEMBERS: u16 = 736;
+pub(crate) const IDC_EDIT_PARTY_AUTO_NAME: u16 = 737;
+pub(crate) const IDC_EDIT_PARTY_AUTO_GAP: u16 = 738;
+pub(crate) const IDC_BTN_PARTY_AUTO: u16 = 739;
 
 // Remote hotkey binding controls
 pub(crate) const IDC_LIST_REMOTE_BINDINGS: u16 = 801;

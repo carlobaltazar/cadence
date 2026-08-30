@@ -2,7 +2,7 @@ use crate::win32_helpers::{wide, create_control, register_and_create_dialog, loc
 use crate::{config, hotkeys, network, party};
 use super::*;
 use super::toolbar::ToolbarControls;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Mutex;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -18,6 +18,9 @@ static SEND_RESULT: Mutex<Option<String>> = Mutex::new(None);
 // thread's line changes — so handler-written hints survive quiet timer ticks.
 static PARTY_GEN_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
 static PARTY_STATUS_SEEN: Mutex<String> = Mutex::new(String::new());
+/// Last auto_active() the timer saw, so the Start/Stop-auto button text is
+/// rewritten only when it flips.
+static PARTY_AUTO_ON_SEEN: AtomicBool = AtomicBool::new(false);
 
 pub unsafe fn show_remote_dialog(parent: HWND) {
     let existing = REMOTE_HWND.load(Ordering::Acquire) as HWND;
@@ -39,7 +42,7 @@ pub unsafe fn show_remote_dialog(parent: HWND) {
         remote_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 360, 712,
+        sx, sy, 360, 744,
         parent, hinstance,
     );
     REMOTE_HWND.store(hwnd as isize, Ordering::Release);
@@ -329,6 +332,38 @@ unsafe extern "system" fn remote_wnd_proc(
                 12, 592, 330, 76, IDC_LIST_PARTY_MEMBERS,
             );
 
+            // Auto-loop row: the server re-fires "PLAY <name>" for the whole
+            // room each round (longest member's duration + margin + gap).
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Auto:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                12, 676, 34, 20, 0,
+            );
+            let h_auto_name = create_control(
+                hwnd, hinstance, font, "EDIT", &cfg.party_auto_name,
+                WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
+                52, 674, 120, 22, IDC_EDIT_PARTY_AUTO_NAME,
+            );
+            SendMessageW(h_auto_name, EM_SETLIMITTEXT as u32, 64, 0);
+            create_control(
+                hwnd, hinstance, font, "STATIC", "Gap s:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
+                178, 676, 40, 20, 0,
+            );
+            let h_auto_gap = create_control(
+                hwnd, hinstance, font, "EDIT", &cfg.party_auto_gap_secs.to_string(),
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
+                220, 674, 34, 22, IDC_EDIT_PARTY_AUTO_GAP,
+            );
+            SendMessageW(h_auto_gap, EM_SETLIMITTEXT as u32, 4, 0);
+            let auto_on = party::auto_active();
+            create_control(
+                hwnd, hinstance, font, "BUTTON", if auto_on { "Stop auto" } else { "Start auto" },
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
+                260, 672, 82, 26, IDC_BTN_PARTY_AUTO,
+            );
+            PARTY_AUTO_ON_SEEN.store(auto_on, Ordering::Release);
+
             // Force the first timer tick to paint the party list and status.
             PARTY_GEN_SEEN.store(u64::MAX, Ordering::Release);
             *lock_or_recover(&PARTY_STATUS_SEEN) = "\u{0}".to_string();
@@ -386,6 +421,13 @@ unsafe extern "system" fn remote_wnd_proc(
                         SendMessageW(h_list, LB_ADDSTRING, 0, row.as_ptr() as LPARAM);
                     }
                 }
+
+                // Start/Stop-auto button text follows the room's auto state.
+                let auto_on = party::auto_active();
+                if auto_on != PARTY_AUTO_ON_SEEN.swap(auto_on, Ordering::AcqRel) {
+                    let h_auto = GetDlgItem(hwnd, IDC_BTN_PARTY_AUTO as i32);
+                    set_window_text(h_auto, if auto_on { "Stop auto" } else { "Start auto" });
+                }
             }
             0
         }
@@ -405,6 +447,7 @@ unsafe extern "system" fn remote_wnd_proc(
                 x if x == IDC_BTN_REMOVE_BINDING => handle_remove_binding(hwnd),
                 x if x == IDC_BTN_PARTY_TOGGLE => handle_party_toggle(hwnd),
                 x if x == IDC_CHK_PARTY_SEND || x == IDC_CHK_PARTY_RECV => handle_party_roles(hwnd),
+                x if x == IDC_BTN_PARTY_AUTO => handle_party_auto(hwnd),
                 _ => {}
             }
             0
@@ -555,6 +598,33 @@ unsafe fn handle_party_roles(hwnd: HWND) {
         cfg.party_send = send;
         cfg.party_receive = recv;
     });
+}
+
+/// Start or stop the room's server-hosted auto-loop. Name and gap are saved as
+/// UI prefill only; ownership and re-assert intent live in party.rs statics.
+unsafe fn handle_party_auto(hwnd: HWND) {
+    let h_status = GetDlgItem(hwnd, IDC_STATIC_PARTY_STATUS as i32);
+    if party::auto_active() {
+        party::stop_auto();
+        set_window_text(h_status, "Stopping auto...");
+        return;
+    }
+    if !party::sender_active() {
+        set_window_text(h_status, "Connect with Send checked to start auto");
+        return;
+    }
+    let name = get_edit_text(hwnd, IDC_EDIT_PARTY_AUTO_NAME).trim().to_string();
+    if name.is_empty() {
+        set_window_text(h_status, "Enter a sequence name for auto");
+        return;
+    }
+    let gap: u32 = get_edit_text(hwnd, IDC_EDIT_PARTY_AUTO_GAP).trim().parse().unwrap_or(0);
+    party::start_auto(&name, gap);
+    save_remote_config(hwnd, |cfg| {
+        cfg.party_auto_name = name;
+        cfg.party_auto_gap_secs = gap;
+    });
+    set_window_text(h_status, "Starting auto...");
 }
 
 unsafe fn do_send(hwnd: HWND, command: &str) {
