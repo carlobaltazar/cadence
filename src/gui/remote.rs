@@ -43,9 +43,26 @@ pub unsafe fn show_remote_dialog(parent: HWND) {
         remote_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 360, 776,
+        sx, sy, 360, 720,
         parent, hinstance,
     );
+    // Keep the whole window inside the monitor's work area: opened below the
+    // toolbar, a tall dialog used to hang off the bottom of the screen and
+    // hide its lowest rows (the Auto kind/Shuffle row).
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(mon, &mut mi) != 0 {
+        let mut rc: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rc);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let x = rc.left.min(mi.rcWork.right - w).max(mi.rcWork.left);
+        let y = rc.top.min(mi.rcWork.bottom - h).max(mi.rcWork.top);
+        if x != rc.left || y != rc.top {
+            SetWindowPos(hwnd, std::ptr::null_mut(), x, y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     REMOTE_HWND.store(hwnd as isize, Ordering::Release);
 }
 
@@ -147,7 +164,7 @@ unsafe extern "system" fn remote_wnd_proc(
                 hwnd, hinstance, font, "LISTBOX", "",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY as u32,
                 WS_EX_CLIENTEDGE as u32,
-                12, 132, 330, 70, IDC_LIST_SEND_HOSTS,
+                12, 132, 330, 54, IDC_LIST_SEND_HOSTS,
             );
             for host in &cfg.remote_hosts {
                 let whost = wide(host);
@@ -158,32 +175,32 @@ unsafe extern "system" fn remote_wnd_proc(
             let h_add_host = create_control(
                 hwnd, hinstance, font, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
-                12, 206, 220, 22, IDC_EDIT_ADD_HOST,
+                12, 190, 220, 22, IDC_EDIT_ADD_HOST,
             );
             SendMessageW(h_add_host, EM_SETLIMITTEXT as u32, 64, 0);
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "+",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                236, 206, 28, 22, IDC_BTN_ADD_HOST,
+                236, 190, 28, 22, IDC_BTN_ADD_HOST,
             );
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "-",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                268, 206, 28, 22, IDC_BTN_REMOVE_HOST,
+                268, 190, 28, 22, IDC_BTN_REMOVE_HOST,
             );
 
             // Send port
             create_control(
                 hwnd, hinstance, font, "STATIC", "Port:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 236, 32, 20, 0,
+                12, 220, 32, 20, 0,
             );
             let h_sport = create_control(
                 hwnd, hinstance, font, "EDIT", &cfg.remote_port.to_string(),
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
-                46, 234, 56, 22, IDC_EDIT_SEND_PORT,
+                46, 218, 56, 22, IDC_EDIT_SEND_PORT,
             );
             SendMessageW(h_sport, EM_SETLIMITTEXT as u32, 5, 0);
 
@@ -191,12 +208,12 @@ unsafe extern "system" fn remote_wnd_proc(
             create_control(
                 hwnd, hinstance, font, "STATIC", "Pw:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                112, 236, 22, 20, 0,
+                112, 220, 22, 20, 0,
             );
             let h_spw = create_control(
                 hwnd, hinstance, font, "EDIT", &cfg.remote_password,
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_PASSWORD as u32, 0,
-                136, 234, 80, 22, IDC_EDIT_SEND_PASSWORD,
+                136, 218, 80, 22, IDC_EDIT_SEND_PASSWORD,
             );
             SendMessageW(h_spw, EM_SETLIMITTEXT as u32, 64, 0);
 
@@ -204,12 +221,12 @@ unsafe extern "system" fn remote_wnd_proc(
             create_control(
                 hwnd, hinstance, font, "STATIC", "Code:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 264, 34, 20, 0,
+                12, 248, 34, 20, 0,
             );
             let h_code = create_control(
                 hwnd, hinstance, font, "EDIT", "",
                 WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
-                46, 262, 296, 22, IDC_EDIT_SEND_CODE,
+                46, 246, 296, 22, IDC_EDIT_SEND_CODE,
             );
             SendMessageW(h_code, EM_SETLIMITTEXT as u32, 128, 0);
 
@@ -217,89 +234,89 @@ unsafe extern "system" fn remote_wnd_proc(
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Send Play",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                12, 292, 80, 28, IDC_BTN_SEND_PLAY,
+                12, 276, 80, 28, IDC_BTN_SEND_PLAY,
             );
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Send Queue",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                100, 292, 90, 28, IDC_BTN_SEND_QUEUE,
+                100, 276, 90, 28, IDC_BTN_SEND_QUEUE,
             );
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Send Stop",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                198, 292, 80, 28, IDC_BTN_SEND_STOP,
+                198, 276, 80, 28, IDC_BTN_SEND_STOP,
             );
 
             // Sender status
             create_control(
                 hwnd, hinstance, font, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 326, 330, 18, IDC_STATIC_SEND_STATUS,
+                12, 310, 330, 18, IDC_STATIC_SEND_STATUS,
             );
 
             // ---- Remote Hotkeys section ----
             create_control(
                 hwnd, hinstance, font, "STATIC", "-- Remote Hotkeys --",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 350, 320, 16, 0,
+                12, 334, 320, 16, 0,
             );
 
             create_control(
                 hwnd, hinstance, font, "LISTBOX", "",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY as u32,
                 WS_EX_CLIENTEDGE as u32,
-                12, 368, 330, 90, IDC_LIST_REMOTE_BINDINGS,
+                12, 352, 330, 70, IDC_LIST_REMOTE_BINDINGS,
             );
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Add",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                12, 462, 60, 26, IDC_BTN_ADD_BINDING,
+                12, 426, 60, 26, IDC_BTN_ADD_BINDING,
             );
 
             create_control(
                 hwnd, hinstance, font, "BUTTON", "Remove",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                80, 462, 70, 26, IDC_BTN_REMOVE_BINDING,
+                80, 426, 70, 26, IDC_BTN_REMOVE_BINDING,
             );
 
             // ---- Party (internet) section ----
             create_control(
                 hwnd, hinstance, font, "STATIC", "-- Party (Internet) --",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 494, 320, 16, 0,
+                12, 458, 320, 16, 0,
             );
 
             create_control(
                 hwnd, hinstance, font, "STATIC", "Room:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 514, 38, 20, 0,
+                12, 478, 38, 20, 0,
             );
             let h_room = create_control(
                 hwnd, hinstance, font, "EDIT", &cfg.party_room,
                 WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
-                52, 512, 110, 22, IDC_EDIT_PARTY_ROOM,
+                52, 476, 110, 22, IDC_EDIT_PARTY_ROOM,
             );
             SendMessageW(h_room, EM_SETLIMITTEXT as u32, 32, 0);
 
             create_control(
                 hwnd, hinstance, font, "STATIC", "Key:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                170, 514, 28, 20, 0,
+                170, 478, 28, 20, 0,
             );
             let h_key = create_control(
                 hwnd, hinstance, font, "EDIT", &cfg.party_passkey,
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_PASSWORD as u32, 0,
-                200, 512, 142, 22, IDC_EDIT_PARTY_KEY,
+                200, 476, 142, 22, IDC_EDIT_PARTY_KEY,
             );
             SendMessageW(h_key, EM_SETLIMITTEXT as u32, 64, 0);
 
             let h_psend = create_control(
                 hwnd, hinstance, font, "BUTTON", "Send",
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
-                12, 540, 56, 22, IDC_CHK_PARTY_SEND,
+                12, 504, 56, 22, IDC_CHK_PARTY_SEND,
             );
             if cfg.party_send {
                 SendMessageW(h_psend, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
@@ -307,7 +324,7 @@ unsafe extern "system" fn remote_wnd_proc(
             let h_precv = create_control(
                 hwnd, hinstance, font, "BUTTON", "Receive",
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
-                72, 540, 74, 22, IDC_CHK_PARTY_RECV,
+                72, 504, 74, 22, IDC_CHK_PARTY_RECV,
             );
             if cfg.party_receive {
                 SendMessageW(h_precv, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
@@ -317,20 +334,20 @@ unsafe extern "system" fn remote_wnd_proc(
             create_control(
                 hwnd, hinstance, font, "BUTTON", toggle_text,
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                240, 538, 102, 26, IDC_BTN_PARTY_TOGGLE,
+                240, 502, 102, 26, IDC_BTN_PARTY_TOGGLE,
             );
 
             create_control(
                 hwnd, hinstance, font, "STATIC", "",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 570, 330, 18, IDC_STATIC_PARTY_STATUS,
+                12, 534, 330, 18, IDC_STATIC_PARTY_STATUS,
             );
 
             create_control(
                 hwnd, hinstance, font, "LISTBOX", "",
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL,
                 WS_EX_CLIENTEDGE as u32,
-                12, 592, 330, 76, IDC_LIST_PARTY_MEMBERS,
+                12, 556, 330, 56, IDC_LIST_PARTY_MEMBERS,
             );
 
             // Auto-loop row: the server re-fires "PLAY <name>" for the whole
@@ -338,30 +355,30 @@ unsafe extern "system" fn remote_wnd_proc(
             create_control(
                 hwnd, hinstance, font, "STATIC", "Auto:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                12, 676, 34, 20, 0,
+                12, 620, 34, 20, 0,
             );
             let h_auto_name = create_control(
                 hwnd, hinstance, font, "EDIT", &cfg.party_auto_name,
                 WS_CHILD | WS_VISIBLE | WS_BORDER, 0,
-                52, 674, 120, 22, IDC_EDIT_PARTY_AUTO_NAME,
+                52, 618, 120, 22, IDC_EDIT_PARTY_AUTO_NAME,
             );
             SendMessageW(h_auto_name, EM_SETLIMITTEXT as u32, 64, 0);
             create_control(
                 hwnd, hinstance, font, "STATIC", "Gap s:",
                 WS_CHILD | WS_VISIBLE | SS_LEFT, 0,
-                178, 676, 40, 20, 0,
+                178, 620, 40, 20, 0,
             );
             let h_auto_gap = create_control(
                 hwnd, hinstance, font, "EDIT", &cfg.party_auto_gap_secs.to_string(),
                 WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32, 0,
-                220, 674, 34, 22, IDC_EDIT_PARTY_AUTO_GAP,
+                220, 618, 34, 22, IDC_EDIT_PARTY_AUTO_GAP,
             );
             SendMessageW(h_auto_gap, EM_SETLIMITTEXT as u32, 4, 0);
             let auto_on = party::auto_active();
             create_control(
                 hwnd, hinstance, font, "BUTTON", if auto_on { "Stop auto" } else { "Start auto" },
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 0,
-                260, 672, 82, 26, IDC_BTN_PARTY_AUTO,
+                260, 616, 82, 26, IDC_BTN_PARTY_AUTO,
             );
             PARTY_AUTO_ON_SEEN.store(auto_on, Ordering::Release);
 
@@ -370,7 +387,7 @@ unsafe extern "system" fn remote_wnd_proc(
             let h_auto_kind = create_control(
                 hwnd, hinstance, font, "COMBOBOX", "",
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
-                52, 702, 90, 200, IDC_COMBO_PARTY_AUTO_KIND,
+                52, 646, 90, 200, IDC_COMBO_PARTY_AUTO_KIND,
             );
             for kind in BindingTarget::ALL {
                 SendMessageW(h_auto_kind, CB_ADDSTRING, 0, wide(kind.label()).as_ptr() as LPARAM);
@@ -383,7 +400,7 @@ unsafe extern "system" fn remote_wnd_proc(
             let h_shuffle = create_control(
                 hwnd, hinstance, font, "BUTTON", "Shuffle",
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
-                150, 704, 70, 22, IDC_CHK_PARTY_AUTO_SHUFFLE,
+                150, 648, 70, 22, IDC_CHK_PARTY_AUTO_SHUFFLE,
             );
             if cfg.party_auto_shuffle {
                 SendMessageW(h_shuffle, BM_SETCHECK, BST_CHECKED as WPARAM, 0);

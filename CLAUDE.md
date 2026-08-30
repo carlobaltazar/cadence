@@ -140,7 +140,9 @@ also broadcast to the room when `party::sender_active()`. Server side lives in
 `../cadence-server/src/party.rs` (in-memory rooms, evaporate when empty).
 
 **Party auto-loop.** Rounds are hosted on the server Room, not on any machine: a sender's
-"Start auto" (Remote dialog, IDs 737–741; dialog is 776 tall) resolves the name per the kind combo
+"Start auto" (Remote dialog, IDs 737–741; dialog is 720 tall and clamps itself into the monitor
+work area on open — do not let it grow past ~728 or 1366×768 screens hide the bottom rows)
+resolves the name per the kind combo
 (sequence / saved queue / group, reusing `BindingTarget`) into a FROZEN playlist of `PLAY <item>`
 commands (`auto_cmds` on the wire, ≤128) + a rest-gap + shuffle flag, and the server fires one item
 per round — in order, or shuffled with no back-to-back repeat (server-side xorshift64, no rand
