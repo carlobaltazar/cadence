@@ -320,7 +320,9 @@ pub fn handle_play_toggle() {
 
 /// Party-auto hotkey: toggle the room's auto-loop from the saved Remote-dialog
 /// prefill. Only the recording gate — toggling auto WHILE playing is
-/// legitimate (the next round overrides anyway).
+/// legitimate (the next round overrides anyway). A press that can't start
+/// anything beeps once (single beep, distinct from the 3-beep marked alarm)
+/// so it's distinguishable from a working one with every window closed.
 pub fn handle_party_auto_hotkey() {
     if recorder::is_recording() {
         return;
@@ -329,9 +331,17 @@ pub fn handle_party_auto_hotkey() {
         party::stop_auto();
         return;
     }
+    let beep = || unsafe {
+        winapi::um::winuser::MessageBeep(winapi::um::winuser::MB_ICONEXCLAMATION);
+    };
+    if !party::sender_active() {
+        beep();
+        return;
+    }
     let cfg = config::cached_config();
     let name = cfg.party_auto_name.trim().to_string();
     if name.is_empty() {
+        beep();
         return;
     }
     if let Err(e) = party::start_auto(
@@ -341,6 +351,7 @@ pub fn handle_party_auto_hotkey() {
         cfg.party_auto_shuffle,
     ) {
         eprintln!("[Cadence] Party auto hotkey: {}", e);
+        beep();
     }
 }
 

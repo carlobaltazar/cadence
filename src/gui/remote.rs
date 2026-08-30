@@ -478,6 +478,9 @@ unsafe extern "system" fn remote_wnd_proc(
             0
         }
         WM_CLOSE => {
+            // Whatever is typed in the Auto row survives the close, so the
+            // party-auto hotkey works without ever clicking Start auto.
+            persist_auto_prefill(hwnd);
             KillTimer(hwnd, TIMER_REMOTE);
             DestroyWindow(hwnd);
             REMOTE_HWND.store(0, Ordering::Release);
@@ -651,12 +654,7 @@ unsafe fn handle_party_auto(hwnd: HWND) {
     match party::start_auto(target, &name, gap, shuffle) {
         Err(e) => set_window_text(h_status, &format!("Auto: {}", e)),
         Ok(n) => {
-            save_remote_config(hwnd, |cfg| {
-                cfg.party_auto_name = name;
-                cfg.party_auto_gap_secs = gap;
-                cfg.party_auto_target = target;
-                cfg.party_auto_shuffle = shuffle;
-            });
+            persist_auto_prefill(hwnd);
             let hint = if n > 1 {
                 format!("Starting auto ({} items)...", n)
             } else {
@@ -665,6 +663,23 @@ unsafe fn handle_party_auto(hwnd: HWND) {
             set_window_text(h_status, &hint);
         }
     }
+}
+
+/// Read the Auto row (name/kind/gap/shuffle) and persist it as prefill, so the
+/// party-auto hotkey works without ever clicking Start auto.
+unsafe fn persist_auto_prefill(hwnd: HWND) {
+    let name = get_edit_text(hwnd, IDC_EDIT_PARTY_AUTO_NAME).trim().to_string();
+    let gap: u32 = get_edit_text(hwnd, IDC_EDIT_PARTY_AUTO_GAP).trim().parse().unwrap_or(0);
+    let kind_idx = SendMessageW(GetDlgItem(hwnd, IDC_COMBO_PARTY_AUTO_KIND as i32), CB_GETCURSEL, 0, 0);
+    let target = BindingTarget::ALL.get(kind_idx.max(0) as usize).copied().unwrap_or_default();
+    let shuffle = SendMessageW(GetDlgItem(hwnd, IDC_CHK_PARTY_AUTO_SHUFFLE as i32), BM_GETCHECK, 0, 0)
+        == BST_CHECKED as isize;
+    save_remote_config(hwnd, |cfg| {
+        cfg.party_auto_name = name;
+        cfg.party_auto_gap_secs = gap;
+        cfg.party_auto_target = target;
+        cfg.party_auto_shuffle = shuffle;
+    });
 }
 
 unsafe fn do_send(hwnd: HWND, command: &str) {
