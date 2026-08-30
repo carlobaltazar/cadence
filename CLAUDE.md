@@ -140,14 +140,20 @@ also broadcast to the room when `party::sender_active()`. Server side lives in
 `../cadence-server/src/party.rs` (in-memory rooms, evaporate when empty).
 
 **Party auto-loop.** Rounds are hosted on the server Room, not on any machine: a sender's
-"Start auto" (Remote dialog, IDs 737–739) stores `PLAY <name>` + a rest-gap on the room and fires
-round 1; each receiver's ack carries `pass_micros` (from `player::progress()`, only when OK) and the
+"Start auto" (Remote dialog, IDs 737–741; dialog is 776 tall) resolves the name per the kind combo
+(sequence / saved queue / group, reusing `BindingTarget`) into a FROZEN playlist of `PLAY <item>`
+commands (`auto_cmds` on the wire, ≤128) + a rest-gap + shuffle flag, and the server fires one item
+per round — in order, or shuffled with no back-to-back repeat (server-side xorshift64, no rand
+dep). Each receiver's ack carries `pass_micros` (from `player::progress()`, only when OK) and the
 server re-fires at `max(pass) + 2s margin + gap` — so differently-timed role sequences restart in
 sync every round with nobody at the keyboard. Ownership/re-assert intent is the in-memory
 `AUTO_WANTED` static (never persisted — a persisted claim is the zombie-loop path): `auto_reconcile`
-re-asserts only on the server-restart signature (resp seq < ours) and drops the claim when another
-sender stopped/replaced the loop. `config.party_auto_name`/`party_auto_gap_secs` are UI prefill
-only. "Stop auto" stops future rounds; the Send-Stop panic button does NOT stop the loop.
+re-asserts the frozen playlist only on the server-restart signature (resp seq < ours) and drops the
+claim when another sender stopped/replaced the loop. `config.party_auto_name`/`gap_secs`/`target`/
+`shuffle` are UI prefill only; `party_auto_vk` is the fifth fixed hotkey (`HOTKEY_PARTY_AUTO`,
+default unset, Settings combo id 270) that toggles the loop from the prefill with every window
+closed — toolbar badge shows `[Party Auto]`. "Stop auto" stops future rounds; the Send-Stop panic
+button does NOT stop the loop.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
 is documented in `PLAYBOOK.md`; read that before touching opcodes/offsets. `NET_MSG_BASE` is

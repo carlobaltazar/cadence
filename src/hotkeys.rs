@@ -11,6 +11,7 @@ pub const HOTKEY_TOGGLE_RECORD: i32 = 1;
 pub const HOTKEY_PLAY_STOP: i32 = 2;
 pub const HOTKEY_PLAY_QUEUE: i32 = 3;
 pub const HOTKEY_BURST_TOGGLE: i32 = 4;
+pub const HOTKEY_PARTY_AUTO: i32 = 5;
 pub const HOTKEY_PLAY_SEQUENCE: i32 = 100;
 pub const HOTKEY_REMOTE_SEND: i32 = 200;
 
@@ -27,6 +28,7 @@ struct HotkeySet {
     stop_vk: u16,
     queue_vk: Option<u16>,
     burst_vk: Option<u16>,
+    party_auto_vk: Option<u16>,
     sequence_bindings: Vec<(u16, String)>, // (vk_code, sequence_name)
     remote_bindings: Vec<RemoteBinding>, // index-aligned with config.remote_bindings
 }
@@ -38,6 +40,7 @@ impl HotkeySet {
             stop_vk,
             queue_vk: None,
             burst_vk: None,
+            party_auto_vk: None,
             sequence_bindings: Vec::new(),
             remote_bindings: Vec::new(),
         }
@@ -121,6 +124,14 @@ pub fn current_burst_vk() -> Option<u16> {
     with_set(|set| set.burst_vk)
 }
 
+pub fn set_party_auto_vk(vk: Option<u16>) {
+    with_set(|set| set.party_auto_vk = vk);
+}
+
+pub fn current_party_auto_vk() -> Option<u16> {
+    with_set(|set| set.party_auto_vk)
+}
+
 /// Rebuild sequence bindings from loaded sequences.
 pub fn set_sequence_bindings(bindings: Vec<(u16, String)>) {
     with_set(|set| set.sequence_bindings = bindings);
@@ -156,6 +167,7 @@ pub fn is_hotkey_vk(vk: u16) -> bool {
             || vk == set.stop_vk
             || set.queue_vk == Some(vk)
             || set.burst_vk == Some(vk)
+            || set.party_auto_vk == Some(vk)
             || set.sequence_bindings.iter().any(|(v, _)| *v == vk)
     })
 }
@@ -228,6 +240,8 @@ unsafe extern "system" fn hotkey_hook_proc(
                     PostThreadMessageW(thread_id, WM_APP_HOTKEY, HOTKEY_PLAY_QUEUE as WPARAM, 0);
                 } else if set.burst_vk == Some(vk) {
                     PostThreadMessageW(thread_id, WM_APP_HOTKEY, HOTKEY_BURST_TOGGLE as WPARAM, 0);
+                } else if set.party_auto_vk == Some(vk) {
+                    PostThreadMessageW(thread_id, WM_APP_HOTKEY, HOTKEY_PARTY_AUTO as WPARAM, 0);
                 } else {
                     for (bound_vk, _) in &set.sequence_bindings {
                         if vk == *bound_vk {

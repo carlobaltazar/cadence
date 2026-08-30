@@ -1,4 +1,5 @@
 use crate::win32_helpers::{wide, create_control, register_and_create_dialog, lock_or_recover, dpi_for_window, scaled_font, remote_vk_name};
+use crate::sequence::BindingTarget;
 use crate::{config, hotkeys, network, party};
 use super::*;
 use super::toolbar::ToolbarControls;
@@ -42,7 +43,7 @@ pub unsafe fn show_remote_dialog(parent: HWND) {
         remote_wnd_proc,
         WS_EX_TOOLWINDOW as u32,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        sx, sy, 360, 744,
+        sx, sy, 360, 776,
         parent, hinstance,
     );
     REMOTE_HWND.store(hwnd as isize, Ordering::Release);
@@ -364,6 +365,30 @@ unsafe extern "system" fn remote_wnd_proc(
             );
             PARTY_AUTO_ON_SEEN.store(auto_on, Ordering::Release);
 
+            // What the auto name refers to: a saved queue / group rotates one
+            // item per round, in order or shuffled.
+            let h_auto_kind = create_control(
+                hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                52, 702, 90, 200, IDC_COMBO_PARTY_AUTO_KIND,
+            );
+            for kind in BindingTarget::ALL {
+                SendMessageW(h_auto_kind, CB_ADDSTRING, 0, wide(kind.label()).as_ptr() as LPARAM);
+            }
+            let kind_sel = BindingTarget::ALL
+                .iter()
+                .position(|k| *k == cfg.party_auto_target)
+                .unwrap_or(0);
+            SendMessageW(h_auto_kind, CB_SETCURSEL, kind_sel as WPARAM, 0);
+            let h_shuffle = create_control(
+                hwnd, hinstance, font, "BUTTON", "Shuffle",
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX as u32, 0,
+                150, 704, 70, 22, IDC_CHK_PARTY_AUTO_SHUFFLE,
+            );
+            if cfg.party_auto_shuffle {
+                SendMessageW(h_shuffle, BM_SETCHECK, BST_CHECKED as WPARAM, 0);
+            }
+
             // Force the first timer tick to paint the party list and status.
             PARTY_GEN_SEEN.store(u64::MAX, Ordering::Release);
             *lock_or_recover(&PARTY_STATUS_SEEN) = "\u{0}".to_string();
@@ -615,16 +640,31 @@ unsafe fn handle_party_auto(hwnd: HWND) {
     }
     let name = get_edit_text(hwnd, IDC_EDIT_PARTY_AUTO_NAME).trim().to_string();
     if name.is_empty() {
-        set_window_text(h_status, "Enter a sequence name for auto");
+        set_window_text(h_status, "Enter a name for auto");
         return;
     }
     let gap: u32 = get_edit_text(hwnd, IDC_EDIT_PARTY_AUTO_GAP).trim().parse().unwrap_or(0);
-    party::start_auto(&name, gap);
-    save_remote_config(hwnd, |cfg| {
-        cfg.party_auto_name = name;
-        cfg.party_auto_gap_secs = gap;
-    });
-    set_window_text(h_status, "Starting auto...");
+    let kind_idx = SendMessageW(GetDlgItem(hwnd, IDC_COMBO_PARTY_AUTO_KIND as i32), CB_GETCURSEL, 0, 0);
+    let target = BindingTarget::ALL.get(kind_idx.max(0) as usize).copied().unwrap_or_default();
+    let shuffle = SendMessageW(GetDlgItem(hwnd, IDC_CHK_PARTY_AUTO_SHUFFLE as i32), BM_GETCHECK, 0, 0)
+        == BST_CHECKED as isize;
+    match party::start_auto(target, &name, gap, shuffle) {
+        Err(e) => set_window_text(h_status, &format!("Auto: {}", e)),
+        Ok(n) => {
+            save_remote_config(hwnd, |cfg| {
+                cfg.party_auto_name = name;
+                cfg.party_auto_gap_secs = gap;
+                cfg.party_auto_target = target;
+                cfg.party_auto_shuffle = shuffle;
+            });
+            let hint = if n > 1 {
+                format!("Starting auto ({} items)...", n)
+            } else {
+                "Starting auto...".to_string()
+            };
+            set_window_text(h_status, &hint);
+        }
+    }
 }
 
 unsafe fn do_send(hwnd: HWND, command: &str) {

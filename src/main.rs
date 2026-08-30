@@ -108,6 +108,9 @@ fn main() {
         hotkeys::set_burst_vk(Some(cfg.burst_vk));
     }
 
+    // Load party-auto hotkey binding (None until configured)
+    hotkeys::set_party_auto_vk(cfg.party_auto_vk);
+
     // Wire the burst worker so it can wake the UI when it stops itself
     // (focus loss). Use the main thread ID we already store in hotkeys.
     let main_tid = unsafe { winapi::um::processthreadsapi::GetCurrentThreadId() };
@@ -288,6 +291,7 @@ fn main() {
                         cfg.hp_monitor_window_title.clone(),
                     );
                 }
+                hotkeys::HOTKEY_PARTY_AUTO => gui::handle_party_auto_hotkey(),
                 hotkeys::HOTKEY_PLAY_SEQUENCE => {
                     let vk = msg.lParam as u16;
                     gui::handle_play_sequence(vk);

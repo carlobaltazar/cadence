@@ -638,7 +638,9 @@ unsafe extern "system" fn toolbar_wnd_proc(
                         status.push_str(if monitor::snapshot().skill_idle { " [IDLE!]" } else { " [IdleG]" });
                     }
                     if burst_on { status.push_str(" [BURST]"); }
-                    if crate::party::is_connected() { status.push_str(" [Party]"); }
+                    if crate::party::is_connected() {
+                        status.push_str(if crate::party::auto_active() { " [Party Auto]" } else { " [Party]" });
+                    }
                     SetWindowTextW((*ptr).hwnd_status, wide(&status).as_ptr());
 
                     // Update button text

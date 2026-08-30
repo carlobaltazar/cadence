@@ -1,4 +1,4 @@
-use crate::sequence::RemoteBinding;
+use crate::sequence::{BindingTarget, RemoteBinding};
 use crate::win32_helpers::lock_or_recover;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -173,6 +173,15 @@ pub struct AppConfig {
     pub party_auto_name: String,
     #[serde(default)]
     pub party_auto_gap_secs: u32,
+    /// What party_auto_name refers to (sequence / saved queue / group) — a
+    /// queue or group rotates one item per round.
+    #[serde(default)]
+    pub party_auto_target: BindingTarget,
+    #[serde(default)]
+    pub party_auto_shuffle: bool,
+    /// Global "toggle party auto" hotkey; None = unset (assigned in Settings).
+    #[serde(default)]
+    pub party_auto_vk: Option<u16>,
 }
 
 fn default_remote_port() -> u16 { 9847 }
@@ -264,6 +273,9 @@ impl Default for AppConfig {
             party_receive: true,
             party_auto_name: String::new(),
             party_auto_gap_secs: 0,
+            party_auto_target: BindingTarget::Sequence,
+            party_auto_shuffle: false,
+            party_auto_vk: None,
         }
     }
 }

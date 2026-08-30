@@ -13,7 +13,7 @@ mod players;
 
 pub use toolbar::create_toolbar_window;
 
-use crate::{config, hotkeys, player, recorder, sequence, storage};
+use crate::{config, hotkeys, party, player, recorder, sequence, storage};
 use crate::win32_helpers::lock_or_recover;
 use std::sync::Mutex;
 
@@ -147,6 +147,7 @@ pub(crate) const IDC_CHK_REPORT: u16 = 266;
 pub(crate) const IDC_EDIT_REPORT_TOKEN: u16 = 267;
 pub(crate) const IDC_EDIT_REPORT_LABEL: u16 = 268;
 pub(crate) const IDC_STATIC_REPORT_HELP: u16 = 269;
+pub(crate) const IDC_COMBO_PARTY_AUTO_KEY: u16 = 270;
 
 // Players (detected/ignore) dialog controls
 pub(crate) const IDC_LIST_PLAYERS: u16 = 901;
@@ -240,6 +241,8 @@ pub(crate) const IDC_LIST_PARTY_MEMBERS: u16 = 736;
 pub(crate) const IDC_EDIT_PARTY_AUTO_NAME: u16 = 737;
 pub(crate) const IDC_EDIT_PARTY_AUTO_GAP: u16 = 738;
 pub(crate) const IDC_BTN_PARTY_AUTO: u16 = 739;
+pub(crate) const IDC_COMBO_PARTY_AUTO_KIND: u16 = 740;
+pub(crate) const IDC_CHK_PARTY_AUTO_SHUFFLE: u16 = 741;
 
 // Remote hotkey binding controls
 pub(crate) const IDC_LIST_REMOTE_BINDINGS: u16 = 801;
@@ -312,6 +315,32 @@ pub fn handle_play_toggle() {
                 player::play_sequence(evts.clone());
             }
         }
+    }
+}
+
+/// Party-auto hotkey: toggle the room's auto-loop from the saved Remote-dialog
+/// prefill. Only the recording gate — toggling auto WHILE playing is
+/// legitimate (the next round overrides anyway).
+pub fn handle_party_auto_hotkey() {
+    if recorder::is_recording() {
+        return;
+    }
+    if party::auto_active() {
+        party::stop_auto();
+        return;
+    }
+    let cfg = config::cached_config();
+    let name = cfg.party_auto_name.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    if let Err(e) = party::start_auto(
+        cfg.party_auto_target,
+        &name,
+        cfg.party_auto_gap_secs,
+        cfg.party_auto_shuffle,
+    ) {
+        eprintln!("[Cadence] Party auto hotkey: {}", e);
     }
 }
 

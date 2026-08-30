@@ -10,7 +10,8 @@
 //! loop — the server holds the request up to 25s and answers instantly when a
 //! command arrives, so delivery latency is network round-trip, not poll interval.
 
-use crate::{config, network, player, report, update};
+use crate::sequence::BindingTarget;
+use crate::{config, network, player, report, storage, update};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -33,14 +34,15 @@ static STATUS: Mutex<String> = Mutex::new(String::new());
 static LAST_SEND: Mutex<String> = Mutex::new(String::new());
 static MEMBERS: Mutex<Vec<MemberSnap>> = Mutex::new(Vec::new());
 /// Set when THIS machine started the room's auto-loop, so it can re-assert the
-/// loop after a server restart: (cmd, gap_secs, when it was set — a fresh start
-/// gets a grace window before "auto missing" is read as "someone stopped it").
-/// In-memory only on purpose: it dies with the process, and a restarted client
-/// can no longer prove it still owns the loop (no zombie re-asserts).
-static AUTO_WANTED: Mutex<Option<(String, u32, Instant)>> = Mutex::new(None);
+/// loop after a server restart: (frozen playlist, gap_secs, shuffle, when it
+/// was set — a fresh start gets a grace window before "auto missing" is read
+/// as "someone stopped it"). In-memory only on purpose: it dies with the
+/// process, and a restarted client can no longer prove it still owns the loop
+/// (no zombie re-asserts).
+static AUTO_WANTED: Mutex<Option<(Vec<String>, u32, bool, Instant)>> = Mutex::new(None);
 /// The room's auto-loop as of the last poll, for the UI:
-/// (cmd, round, next-fire deadline).
-static AUTO_SNAP: Mutex<Option<(String, u64, Instant)>> = Mutex::new(None);
+/// (cmd, round, pos, count, next-fire deadline).
+static AUTO_SNAP: Mutex<Option<(String, u64, u64, u64, Instant)>> = Mutex::new(None);
 /// Seconds a freshly-set AUTO_WANTED is trusted even when the poll shows no
 /// auto — our own start POST may still be in flight.
 const AUTO_GRACE_SECS: u64 = 10;
@@ -103,6 +105,11 @@ struct WireAuto {
     cmd: String,
     #[serde(default)]
     round: u64,
+    /// 1-based playlist position / playlist length; 0/0 from an old server.
+    #[serde(default)]
+    pos: u64,
+    #[serde(default)]
+    count: u64,
     #[serde(default)]
     next_in_secs: i64,
     #[serde(default)]
@@ -189,12 +196,50 @@ pub fn auto_active() -> bool {
     AUTO_SNAP.lock().unwrap().is_some()
 }
 
-/// Start (or replace) the room's server-hosted auto-loop: the server re-fires
-/// `PLAY <name>` every round at the longest member's reported duration plus a
-/// small margin plus `gap_secs` of rest. The loop lives on the room, so every
-/// machine (this one included) can go AFK and rounds keep firing.
-pub fn start_auto(name: &str, gap_secs: u32) {
-    post_auto(Some((format!("PLAY {}", name.trim()), gap_secs)));
+/// Start (or replace) the room's server-hosted auto-loop. `name` is resolved
+/// on THIS machine into a frozen playlist — a saved queue or group rotates one
+/// item per round (in order or shuffled); a sequence loops alone. Every round
+/// the server re-fires at the longest member's reported duration plus a small
+/// margin plus `gap_secs` of rest; the loop lives on the room, so every
+/// machine (this one included) can go AFK and rounds keep firing. Returns the
+/// item count for UI feedback; Err strings double as status-line hints.
+pub fn start_auto(
+    target: BindingTarget,
+    name: &str,
+    gap_secs: u32,
+    shuffle: bool,
+) -> Result<usize, &'static str> {
+    let name = name.trim();
+    let items = match target {
+        // No existence check: hosts resolve names against their own files.
+        BindingTarget::Sequence => vec![name.to_string()],
+        BindingTarget::Queue => match storage::load_saved_queue(name) {
+            Ok(q) => q.items,
+            Err(_) => return Err("saved queue not found"),
+        },
+        BindingTarget::Group => storage::group_members(Some(name)),
+    };
+    let cmds = build_cmds(&items)?;
+    let n = cmds.len();
+    post_auto(Some((cmds, gap_secs, shuffle)));
+    Ok(n)
+}
+
+/// Playlist items -> the wire commands the room will rotate through.
+fn build_cmds(items: &[String]) -> Result<Vec<String>, &'static str> {
+    let cmds: Vec<String> = items
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("PLAY {}", s))
+        .collect();
+    if cmds.is_empty() {
+        return Err("nothing to play");
+    }
+    if cmds.len() > 128 {
+        return Err("too many items (max 128)");
+    }
+    Ok(cmds)
 }
 
 /// Stop the auto-loop: future rounds only, running playback is untouched (the
@@ -203,9 +248,9 @@ pub fn stop_auto() {
     post_auto(None);
 }
 
-/// Fire-and-forget POST for auto start (`Some((cmd, gap))`) or stop (`None`);
-/// updates AUTO_WANTED ownership and the LAST_SEND note from the outcome.
-fn post_auto(start: Option<(String, u32)>) {
+/// Fire-and-forget POST for auto start (`Some((cmds, gap, shuffle))`) or stop
+/// (`None`); updates AUTO_WANTED ownership and the LAST_SEND note.
+fn post_auto(start: Option<(Vec<String>, u32, bool)>) {
     if !sender_active() {
         return;
     }
@@ -219,8 +264,11 @@ fn post_auto(start: Option<(String, u32)>) {
             "member": display_name(&cfg.report_label, &agent_id),
         });
         match &start {
-            Some((cmd, gap)) => {
-                body["cmd"] = serde_json::json!(cmd);
+            Some((cmds, gap, shuffle)) => {
+                // "cmd" carries the first item so an old server still loops it.
+                body["cmd"] = serde_json::json!(cmds[0]);
+                body["auto_cmds"] = serde_json::json!(cmds);
+                body["auto_shuffle"] = serde_json::json!(shuffle);
                 body["auto_start"] = serde_json::json!(true);
                 body["auto_gap_secs"] = serde_json::json!(gap);
             }
@@ -230,8 +278,8 @@ fn post_auto(start: Option<(String, u32)>) {
         let json = serde_json::to_vec(&body).unwrap_or_default();
         let note = match update::https_post_json_timeout(&url, &json, SEND_RECV_TIMEOUT_MS) {
             Ok((200, _)) => match start {
-                Some((cmd, gap)) => {
-                    *AUTO_WANTED.lock().unwrap() = Some((cmd, gap, Instant::now()));
+                Some((cmds, gap, shuffle)) => {
+                    *AUTO_WANTED.lock().unwrap() = Some((cmds, gap, shuffle, Instant::now()));
                     "auto started".to_string()
                 }
                 None => {
@@ -252,8 +300,8 @@ fn post_auto(start: Option<(String, u32)>) {
 pub fn status_line() -> String {
     let conn = STATUS.lock().unwrap().clone();
     let sent = LAST_SEND.lock().unwrap().clone();
-    let auto = AUTO_SNAP.lock().unwrap().as_ref().map(|(cmd, round, deadline)| {
-        format_auto(cmd, *round, deadline.saturating_duration_since(Instant::now()).as_secs())
+    let auto = AUTO_SNAP.lock().unwrap().as_ref().map(|(cmd, round, pos, count, deadline)| {
+        format_auto(cmd, *round, *pos, *count, deadline.saturating_duration_since(Instant::now()).as_secs())
     });
     let parts: Vec<String> = [Some(conn), auto, Some(sent)]
         .into_iter()
@@ -264,9 +312,14 @@ pub fn status_line() -> String {
 }
 
 /// Status-line fragment for an active auto-loop; the dialog's timer repaints
-/// every 500ms, so the countdown runs live between polls.
-fn format_auto(cmd: &str, round: u64, secs_left: u64) -> String {
-    format!("Auto: {} r{}, next {}s", cmd, round, secs_left)
+/// every 500ms, so the countdown runs live between polls. The (pos/count)
+/// suffix appears only for a rotating playlist (count 0 = old server).
+fn format_auto(cmd: &str, round: u64, pos: u64, count: u64, secs_left: u64) -> String {
+    if count > 1 {
+        format!("Auto: {} ({}/{}) r{}, next {}s", cmd, pos, count, round, secs_left)
+    } else {
+        format!("Auto: {} r{}, next {}s", cmd, round, secs_left)
+    }
 }
 
 /// Member rows for the dialog, plus a generation stamp: repaint only when it moves.
@@ -335,7 +388,7 @@ fn auto_reconcile(
 fn set_auto_snap(auto: Option<&WireAuto>) {
     *AUTO_SNAP.lock().unwrap() = auto.map(|a| {
         let deadline = Instant::now() + Duration::from_secs(a.next_in_secs.max(0) as u64);
-        (a.cmd.clone(), a.round, deadline)
+        (a.cmd.clone(), a.round, a.pos, a.count, deadline)
     });
 }
 
@@ -344,7 +397,7 @@ fn set_auto_snap(auto: Option<&WireAuto>) {
 fn reconcile_auto(auto: Option<&WireAuto>, agent_id: &str, backwards: bool) {
     let resend = {
         let mut wanted = AUTO_WANTED.lock().unwrap();
-        let Some((cmd, gap, at)) = wanted.clone() else { return };
+        let Some((cmds, gap, shuffle, at)) = wanted.clone() else { return };
         let started_by_me = auto.map(|a| a.started_by == agent_id);
         match auto_reconcile(true, at.elapsed().as_secs(), started_by_me, backwards) {
             AutoAction::Keep => None,
@@ -353,14 +406,16 @@ fn reconcile_auto(auto: Option<&WireAuto>, agent_id: &str, backwards: bool) {
                 None
             }
             AutoAction::Reassert => {
-                *wanted = Some((cmd.clone(), gap, Instant::now()));
-                Some((cmd, gap))
+                *wanted = Some((cmds.clone(), gap, shuffle, Instant::now()));
+                Some((cmds, gap, shuffle))
             }
         }
     };
-    if let Some((cmd, gap)) = resend {
-        println!("[Cadence] Party auto-loop re-asserted after server restart: {}", cmd);
-        post_auto(Some((cmd, gap)));
+    // Re-POSTs the FROZEN playlist verbatim — a queue edited meanwhile doesn't
+    // change the running loop until a manual restart.
+    if let Some((cmds, gap, shuffle)) = resend {
+        println!("[Cadence] Party auto-loop re-asserted after server restart: {}", cmds[0]);
+        post_auto(Some((cmds, gap, shuffle)));
     }
 }
 
@@ -611,11 +666,19 @@ mod tests {
         assert!(hit.auto.is_none()); // absent and null both mean no auto
 
         let with_auto: PollResp = serde_json::from_str(
-            r#"{"seq":7,"cmd":null,"members":[],"auto":{"cmd":"PLAY 3f3","round":12,"gap_secs":3,"next_in_secs":41,"started_by":"PC9"}}"#,
+            r#"{"seq":7,"cmd":null,"members":[],"auto":{"cmd":"PLAY 3f3","round":12,"pos":2,"count":5,"shuffle":true,"gap_secs":3,"next_in_secs":41,"started_by":"PC9"}}"#,
         )
         .unwrap();
         let a = with_auto.auto.unwrap();
         assert_eq!((a.cmd.as_str(), a.round, a.next_in_secs, a.started_by.as_str()), ("PLAY 3f3", 12, 41, "PC9"));
+        assert_eq!((a.pos, a.count), (2, 5));
+        // Old server: no pos/count keys -> 0/0 (renders without the suffix).
+        let old: PollResp = serde_json::from_str(
+            r#"{"seq":7,"cmd":null,"members":[],"auto":{"cmd":"PLAY x","round":1,"next_in_secs":5,"started_by":"PC"}}"#,
+        )
+        .unwrap();
+        let o = old.auto.unwrap();
+        assert_eq!((o.pos, o.count), (0, 0));
         let null_auto: PollResp =
             serde_json::from_str(r#"{"seq":7,"cmd":null,"members":[],"auto":null}"#).unwrap();
         assert!(null_auto.auto.is_none());
@@ -641,8 +704,23 @@ mod tests {
 
     #[test]
     fn auto_status_renders() {
-        assert_eq!(format_auto("PLAY 3f3", 12, 41), "Auto: PLAY 3f3 r12, next 41s");
-        assert_eq!(format_auto("PLAY x", 1, 0), "Auto: PLAY x r1, next 0s");
+        assert_eq!(format_auto("PLAY 3f3", 12, 2, 5, 41), "Auto: PLAY 3f3 (2/5) r12, next 41s");
+        assert_eq!(format_auto("PLAY x", 1, 1, 1, 0), "Auto: PLAY x r1, next 0s");
+        assert_eq!(format_auto("PLAY x", 1, 0, 0, 9), "Auto: PLAY x r1, next 9s"); // old server
+    }
+
+    #[test]
+    fn build_cmds_rules() {
+        let items: Vec<String> = vec!["a".into(), "  b  ".into(), "".into(), "c".into()];
+        assert_eq!(
+            build_cmds(&items).unwrap(),
+            vec!["PLAY a".to_string(), "PLAY b".into(), "PLAY c".into()]
+        );
+        assert_eq!(build_cmds(&[]), Err("nothing to play"));
+        let blank: Vec<String> = vec!["  ".into()];
+        assert_eq!(build_cmds(&blank), Err("nothing to play"));
+        let over: Vec<String> = (0..129).map(|i| format!("s{i}")).collect();
+        assert_eq!(build_cmds(&over), Err("too many items (max 128)"));
     }
 
     #[test]

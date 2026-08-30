@@ -74,7 +74,7 @@ const BAR_LABELS: [&str; 4] = ["HP", "MP", "SP", "Skill"];
 /// X/Y/Pick y0+21, Sample/colour y0+48, live readout y0+74 (bottom y0+SECTION_H). The first
 /// section starts at SECTIONS_TOP; DIALOG_CLIENT_H is derived from these, so adding a section
 /// grows the window instead of hiding OK.
-const SECTIONS_TOP: i32 = 128;
+const SECTIONS_TOP: i32 = 164;
 const SECTION_PITCH: i32 = 96;
 const SECTION_H: i32 = 94;
 
@@ -354,6 +354,12 @@ unsafe extern "system" fn settings_wnd_proc(
                 WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
                 96, 84, 180, 200, IDC_COMBO_QUEUE_KEY);
 
+            create_control(hwnd, hinstance, font, "STATIC", "Party auto:",
+                WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 12, 124, 80, 20, 0);
+            create_control(hwnd, hinstance, font, "COMBOBOX", "",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST as u32 | WS_VSCROLL, 0,
+                96, 120, 180, 200, IDC_COMBO_PARTY_AUTO_KEY);
+
             let (current_rec, current_stop) = hotkeys::current_hotkeys();
             populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_RECORD_KEY as i32), KEY_OPTIONS, Some(current_rec));
             populate_key_combo(GetDlgItem(hwnd, IDC_COMBO_PLAY_KEY as i32), KEY_OPTIONS, Some(current_stop));
@@ -372,8 +378,22 @@ unsafe extern "system" fn settings_wnd_proc(
                 }
             }
 
+            // Party-auto combo leads with "(None)", like the queue combo.
+            let h_combo_party = GetDlgItem(hwnd, IDC_COMBO_PARTY_AUTO_KEY as i32);
+            SendMessageW(h_combo_party, CB_ADDSTRING, 0, wide("(None)").as_ptr() as LPARAM);
+            let current_party_vk = hotkeys::current_party_auto_vk();
+            if current_party_vk.is_none() {
+                SendMessageW(h_combo_party, CB_SETCURSEL, 0, 0);
+            }
+            for (i, (vk, name)) in KEY_OPTIONS.iter().enumerate() {
+                SendMessageW(h_combo_party, CB_ADDSTRING, 0, wide(name).as_ptr() as LPARAM);
+                if current_party_vk == Some(*vk) {
+                    SendMessageW(h_combo_party, CB_SETCURSEL, (i + 1) as WPARAM, 0);
+                }
+            }
+
             create_control(hwnd, hinstance, font, "STATIC", "",
-                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 116, 272, 2, IDC_SETTINGS_DIV1);
+                WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ, 0, 12, 152, 272, 2, IDC_SETTINGS_DIV1);
 
             // -- Pixel monitors (HP / MP / SP + the Idle Guard's skill pixel), all via the
             // shared helper so they're identical --
@@ -836,6 +856,28 @@ unsafe extern "system" fn settings_wnd_proc(
                         }
                     }
 
+                    // Read party-auto key selection
+                    let h_combo_party = GetDlgItem(hwnd, IDC_COMBO_PARTY_AUTO_KEY as i32);
+                    let party_idx = SendMessageW(h_combo_party, CB_GETCURSEL, 0, 0) as usize;
+                    let new_party_vk: Option<u16> = if party_idx == 0 {
+                        None // "(None)" selected
+                    } else if party_idx - 1 < KEY_OPTIONS.len() {
+                        Some(KEY_OPTIONS[party_idx - 1].0)
+                    } else {
+                        None
+                    };
+
+                    if let Some(pvk) = new_party_vk {
+                        if pvk == new_rec_vk || pvk == new_stop_vk
+                            || new_queue_vk == Some(pvk) || new_burst_vk == Some(pvk)
+                        {
+                            let msg = wide("Party auto key must be different from Record, Stop, Queue, and Burst keys!");
+                            let title = wide("Error");
+                            MessageBoxW(hwnd, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+                            return 0;
+                        }
+                    }
+
                     // Read burst rate
                     let mut buf_rate = [0u16; 16];
                     GetWindowTextW(GetDlgItem(hwnd, IDC_EDIT_BURST_RATE as i32), buf_rate.as_mut_ptr(), 16);
@@ -846,6 +888,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     if hotkeys::reregister_hotkeys(new_rec_vk, new_stop_vk) {
                         hotkeys::set_queue_vk(new_queue_vk);
                         hotkeys::set_burst_vk(new_burst_vk);
+                        hotkeys::set_party_auto_vk(new_party_vk);
                         let parent = GetParent(hwnd);
                         let ptr =
                             GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut ToolbarControls;
@@ -853,6 +896,7 @@ unsafe extern "system" fn settings_wnd_proc(
                             (*ptr).config.record_vk = new_rec_vk;
                             (*ptr).config.stop_vk = new_stop_vk;
                             (*ptr).config.queue_vk = new_queue_vk;
+                            (*ptr).config.party_auto_vk = new_party_vk;
                             (*ptr).config.burst_vk = new_burst_vk.unwrap_or(0);
                             (*ptr).config.burst_rate_hz = new_burst_rate;
 

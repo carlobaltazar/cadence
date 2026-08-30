@@ -152,9 +152,10 @@ unsafe extern "system" fn bind_key_wnd_proc(
     }
 }
 
-/// Get keys available for binding (excluding record_vk, stop_vk, and already-bound keys).
+/// Get keys available for binding (excluding record/stop/party-auto and already-bound keys).
 fn available_keys_for_binding() -> Vec<(u16, &'static str)> {
     let (record_vk, stop_vk) = hotkeys::current_hotkeys();
+    let party_vk = hotkeys::current_party_auto_vk();
     let bindings = hotkeys::current_sequence_bindings();
     let editing_name = lock_or_recover(&BIND_SEQ_NAME).clone();
 
@@ -163,6 +164,7 @@ fn available_keys_for_binding() -> Vec<(u16, &'static str)> {
         .filter(|(vk, _)| {
             *vk != record_vk
                 && *vk != stop_vk
+                && Some(*vk) != party_vk
                 && !bindings.iter().any(|(bvk, name)| {
                     *bvk == *vk && editing_name.as_ref().map_or(true, |en| name != en)
                 })
