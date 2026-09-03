@@ -327,6 +327,11 @@ pub fn handle_party_auto_hotkey() {
     if recorder::is_recording() {
         return;
     }
+    // Remote window open → act on what's on screen (the user may have just
+    // edited the Auto row); config prefill only drives closed-window presses.
+    if unsafe { remote::party_auto_from_hotkey() } {
+        return;
+    }
     if party::auto_active() {
         party::stop_auto();
         return;

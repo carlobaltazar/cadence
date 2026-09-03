@@ -210,6 +210,14 @@ pub fn start_auto(
     shuffle: bool,
 ) -> Result<usize, &'static str> {
     let name = name.trim();
+    if let Some(e) = kind_hint(
+        target,
+        storage::load_sequence(name).is_ok(),
+        storage::saved_queue_exists(name),
+        !storage::group_members(Some(name)).is_empty(),
+    ) {
+        return Err(e);
+    }
     let items = match target {
         // No existence check: hosts resolve names against their own files.
         BindingTarget::Sequence => vec![name.to_string()],
@@ -223,6 +231,35 @@ pub fn start_auto(
     let n = cmds.len();
     post_auto(Some((cmds, gap_secs, shuffle)));
     Ok(n)
+}
+
+/// The name doesn't resolve for the chosen kind on THIS machine but does for
+/// another one — almost certainly a wrong kind selection in the Auto row; say
+/// so instead of starting a loop no member can play. A name matching nothing
+/// at all is NOT an error here (hosts resolve names against their own files).
+fn kind_hint(
+    target: BindingTarget,
+    is_seq: bool,
+    is_queue: bool,
+    is_group: bool,
+) -> Option<&'static str> {
+    if match target {
+        BindingTarget::Sequence => is_seq,
+        BindingTarget::Queue => is_queue,
+        BindingTarget::Group => is_group,
+    } {
+        return None;
+    }
+    if is_queue {
+        return Some("that name is a saved queue — set kind to Saved queue");
+    }
+    if is_group {
+        return Some("that name is a group — set kind to Group");
+    }
+    if is_seq {
+        return Some("that name is a sequence — set kind to Sequence");
+    }
+    None
 }
 
 /// Playlist items -> the wire commands the room will rotate through.
@@ -707,6 +744,35 @@ mod tests {
         assert_eq!(format_auto("PLAY 3f3", 12, 2, 5, 41), "Auto: PLAY 3f3 (2/5) r12, next 41s");
         assert_eq!(format_auto("PLAY x", 1, 1, 1, 0), "Auto: PLAY x r1, next 0s");
         assert_eq!(format_auto("PLAY x", 1, 0, 0, 9), "Auto: PLAY x r1, next 9s"); // old server
+    }
+
+    #[test]
+    fn kind_hint_rules() {
+        use BindingTarget::*;
+        // Right kind resolves → no hint, even if the name is also something else.
+        assert_eq!(kind_hint(Sequence, true, true, false), None);
+        assert_eq!(kind_hint(Queue, false, true, false), None);
+        assert_eq!(kind_hint(Group, false, false, true), None);
+        // Wrong kind → point at what the name actually is.
+        assert_eq!(
+            kind_hint(Sequence, false, true, false),
+            Some("that name is a saved queue — set kind to Saved queue")
+        );
+        assert_eq!(
+            kind_hint(Queue, true, false, false),
+            Some("that name is a sequence — set kind to Sequence")
+        );
+        assert_eq!(
+            kind_hint(Group, false, true, false),
+            Some("that name is a saved queue — set kind to Saved queue")
+        );
+        assert_eq!(
+            kind_hint(Sequence, false, false, true),
+            Some("that name is a group — set kind to Group")
+        );
+        // Name matches nothing at all: not this guard's business.
+        assert_eq!(kind_hint(Sequence, false, false, false), None);
+        assert_eq!(kind_hint(Queue, false, false, false), None);
     }
 
     #[test]

@@ -699,6 +699,18 @@ unsafe fn persist_auto_prefill(hwnd: HWND) {
     });
 }
 
+/// Party-auto hotkey pressed while the Remote window is open: act on what is
+/// on screen (exactly the Start auto button), so edits count without closing
+/// the dialog and errors land in the visible status line.
+pub unsafe fn party_auto_from_hotkey() -> bool {
+    let hwnd = REMOTE_HWND.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return false;
+    }
+    handle_party_auto(hwnd);
+    true
+}
+
 unsafe fn do_send(hwnd: HWND, command: &str) {
     let port = get_edit_text_u16(hwnd, IDC_EDIT_SEND_PORT).unwrap_or(9847);
     let password = get_edit_text(hwnd, IDC_EDIT_SEND_PASSWORD);

@@ -153,8 +153,12 @@ sync every round with nobody at the keyboard. Ownership/re-assert intent is the 
 re-asserts the frozen playlist only on the server-restart signature (resp seq < ours) and drops the
 claim when another sender stopped/replaced the loop. `config.party_auto_name`/`gap_secs`/`target`/
 `shuffle` are UI prefill only; `party_auto_vk` is the fifth fixed hotkey (`HOTKEY_PARTY_AUTO`,
-default unset, Settings combo id 270) that toggles the loop from the prefill with every window
-closed — toolbar badge shows `[Party Auto]`. "Stop auto" stops future rounds; the Send-Stop panic
+default unset, Settings combo id 270) that toggles the loop — with the Remote window OPEN it acts
+on the live Auto row via `remote::party_auto_from_hotkey()` (same as clicking Start auto, errors in
+the status line); only with it closed does it fall back to the config prefill — toolbar badge shows
+`[Party Auto]`. `start_auto` refuses a name that doesn't resolve for the chosen kind but does as
+another (`kind_hint`, e.g. a saved-queue name with kind Sequence) so a wrong kind can't start a loop
+of `PLAY`s nobody can play. "Stop auto" stops future rounds; the Send-Stop panic
 button does NOT stop the loop.
 
 **Packet detection.** `proximity.rs` (dynamic `wpcap.dll`, LZO envelope decode, opcode calibration)
