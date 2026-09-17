@@ -192,6 +192,13 @@ unsafe fn get_current_modifiers() -> u32 {
     mods
 }
 
+/// Whether a hook event is one of this process's own synthesized keystrokes:
+/// injected AND stamped with `player::CADENCE_INPUT_TAG`. Injected input without
+/// the tag (remote-desktop tools, other automation) is treated as real.
+fn own_input(is_injected: bool, extra_info: usize) -> bool {
+    is_injected && extra_info == crate::player::CADENCE_INPUT_TAG
+}
+
 unsafe extern "system" fn hotkey_hook_proc(
     n_code: i32,
     w_param: WPARAM,
@@ -200,6 +207,10 @@ unsafe extern "system" fn hotkey_hook_proc(
     if n_code >= 0 && w_param as u32 == WM_KEYDOWN {
         let info = &*(l_param as *const KBDLLHOOKSTRUCT);
         let is_injected = (info.flags & LLKHF_INJECTED) != 0;
+        // Only OUR OWN synthesized keys are ignored below: playback must not
+        // retrigger hotkeys, but a key typed through RustDesk/AnyDesk/Parsec is
+        // injected too and is a real operator keystroke.
+        let is_own = own_input(is_injected, info.dwExtraInfo);
 
         let vk = info.vkCode as u16;
         let thread_id = MAIN_THREAD_ID.load(Ordering::Acquire);
@@ -225,9 +236,10 @@ unsafe extern "system" fn hotkey_hook_proc(
                     }
                 }
 
-                // Local hotkeys only fire on real user input to prevent playback
-                // from retriggering recording or cascading into other sequences.
-                if is_injected {
+                // Local hotkeys never fire on our own playback (recording would
+                // retrigger, sequences would cascade); everything else — physical
+                // or remote-desktop-injected — is the operator.
+                if is_own {
                     return CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param);
                 }
 
@@ -260,4 +272,17 @@ unsafe extern "system" fn hotkey_hook_proc(
     }
 
     CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_tagged_injected_input_is_ours() {
+        assert!(own_input(true, crate::player::CADENCE_INPUT_TAG));
+        assert!(!own_input(true, 0)); // RustDesk/AnyDesk: injected, untagged
+        assert!(!own_input(false, crate::player::CADENCE_INPUT_TAG)); // physical key
+        assert!(!own_input(false, 0));
+    }
 }

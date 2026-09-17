@@ -114,6 +114,12 @@ them from the client layout with `AdjustWindowRectEx` (see `settings::outer_size
 `WM_GETMINMAXINFO` min-track in step, or a bottom-pinned OK ends up below the client edge (v3.8.0
 shipped Settings with an invisible OK — every change was lost to the X button).
 
+**Hotkeys and injected input** (since v3.15.1): every event `player::dispatch` synthesizes is
+stamped `dwExtraInfo = player::CADENCE_INPUT_TAG`; the hook ignores local hotkeys only for
+injected keys carrying that tag (`hotkeys::own_input`). Injected keys WITHOUT it — RustDesk /
+AnyDesk / Parsec typing on the operator's behalf — count as real, so F11 over a remote desktop
+plays. Don't go back to a bare `LLKHF_INJECTED` check.
+
 **Hotkeys — two storage models.** Local play hotkeys live *per sequence file* (`Sequence.hotkey`,
 rebuilt by `gui::refresh_bindings` → `hotkeys::set_sequence_bindings`, no modifiers, ignored for
 injected input). Remote hotkeys live in `config.remote_bindings` (`RemoteBinding`, modifier+key,

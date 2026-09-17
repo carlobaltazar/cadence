@@ -424,7 +424,7 @@ fn make_kbd(vk: u16, scan_code: u16, flags: u32) -> INPUT {
         ki.wScan = scan_code;
         ki.dwFlags = flags;
         ki.time = 0;
-        ki.dwExtraInfo = 0;
+        ki.dwExtraInfo = CADENCE_INPUT_TAG;
     }
     input
 }
@@ -439,10 +439,16 @@ fn make_mouse(flags: u32, dx: i32, dy: i32, mouse_data: i32) -> INPUT {
         mi.mouseData = mouse_data as u32;
         mi.dwFlags = flags;
         mi.time = 0;
-        mi.dwExtraInfo = 0;
+        mi.dwExtraInfo = CADENCE_INPUT_TAG;
     }
     input
 }
+
+/// Stamped into `dwExtraInfo` of every event this process synthesizes, so the
+/// keyboard hook can tell OUR playback apart from other injected input: keys a
+/// remote-desktop tool (RustDesk, AnyDesk, Parsec) injects on the operator's
+/// behalf carry LLKHF_INJECTED too, but not this tag, and must count as real.
+pub const CADENCE_INPUT_TAG: usize = 0xCADE_0001;
 
 fn dispatch(events: &mut [INPUT]) {
     let _g = lock_or_recover(&INPUT_LOCK);
