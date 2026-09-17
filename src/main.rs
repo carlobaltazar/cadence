@@ -2,6 +2,7 @@
 
 mod burst;
 mod config;
+mod fleet;
 mod gui;
 mod hotkeys;
 mod mapcoord;
@@ -204,6 +205,10 @@ fn main() {
     // room + passkey, and re-reads config live like the reporter.
     party::start();
 
+    // Dashboard ▶/■ channel (token-authenticated long-poll to the report server);
+    // idles while reporting is off, like the reporter.
+    fleet::start();
+
     // Load the proximity ignore list into the live detector unconditionally, so it mirrors
     // config even when detection starts disabled (keeps the Settings save from wiping it).
     proximity::set_ignored(cfg.proximity_ignore.clone());
@@ -347,6 +352,7 @@ fn main() {
     // Cleanup
     report::stop();
     party::stop();
+    fleet::stop();
     proximity::stop();
     burst::stop();
     monitor::stop_all();

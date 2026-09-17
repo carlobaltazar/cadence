@@ -473,6 +473,21 @@ pub(crate) fn https_post_json_timeout(
     )
 }
 
+/// JSON POST with the fleet token AND a caller-chosen receive timeout: the
+/// dashboard-command long-poll (fleet.rs) needs both.
+pub(crate) fn https_post_json_token_timeout(
+    url: &str,
+    token: &str,
+    body: &[u8],
+    recv_timeout_ms: c_int,
+) -> Result<(u32, Vec<u8>), String> {
+    let headers = format!(
+        "Content-Type: application/json\r\nX-Auth-Token: {}\r\n",
+        token
+    );
+    https_request("POST", url, &headers, Some(body), recv_timeout_ms, 64 * 1024)
+}
+
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(test)]

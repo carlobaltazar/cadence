@@ -139,6 +139,16 @@ Party section (IDs 730–739) shows status + member list. Remote hotkeys and the
 also broadcast to the room when `party::sender_active()`. Server side lives in
 `../cadence-server/src/party.rs` (in-memory rooms, evaporate when empty).
 
+**Fleet control channel** (`fleet.rs`, since v3.15.0): the dashboard's per-card ▶/■. A second
+long-poll thread (modeled on party.rs) POSTs `{report origin}/api/agent/poll` with the
+`report_token` (`fleet::poll_url` derives it from `report_url`), body `{agent_id, last_seq,
+last_result, resume_cmd}`; the server holds ≤25s and answers `{seq, cmd}` when the token's
+owner presses a button on that machine's card. Commands run through `network::execute_command`
+and are acked on the next poll. `resume_cmd` is what THIS machine is playing / last played as a
+wire command (`fleet::resume_cmd_from`: live `PlaybackSource` + `gui::QUEUE_LABEL`, else
+`storage::last_played()`), so dashboard ▶ resumes exactly that. Independent of party rooms;
+idles while `report_enabled` is off or the token is blank. No UI.
+
 **Party auto-loop.** Rounds are hosted on the server Room, not on any machine: a sender's
 "Start auto" (Remote dialog, IDs 737–741; dialog is 720 tall and clamps itself into the monitor
 work area on open — do not let it grow past ~728 or 1366×768 screens hide the bottom rows)
