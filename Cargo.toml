@@ -1,6 +1,6 @@
 ﻿[package]
 name = "cadence"
-version = "3.15.0"
+version = "3.15.1"
 edition = "2021"
 
 [dependencies]
