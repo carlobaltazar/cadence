@@ -1,7 +1,7 @@
 use crate::config;
 use crate::sequence::RemoteBinding;
 use crate::win32_helpers::lock_or_recover;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 use winapi::shared::minwindef::*;
 use winapi::shared::windef::*;
@@ -56,6 +56,14 @@ impl Default for HotkeySet {
 static CURRENT_HOTKEYS: Mutex<Option<HotkeySet>> = Mutex::new(None);
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static HOTKEY_HOOK: AtomicIsize = AtomicIsize::new(0);
+
+// Pixel-pick capture (Settings › Pick): while armed, the next key the operator presses —
+// ANY key, since not every keyboard has Insert — is latched in PICK_KEY for the Settings
+// timer to take, and swallowed (down, repeats and its key-up) so it reaches neither the
+// game nor the focused Pick/Stop button nor the hotkey dispatch below.
+static PICK_ARMED: AtomicBool = AtomicBool::new(false);
+static PICK_KEY: AtomicU32 = AtomicU32::new(0); // latched vk, 0 = none yet
+static PICK_SWALLOW_VK: AtomicU32 = AtomicU32::new(0); // captured key still held, 0 = none
 
 /// Lock the shared hotkey set (lazily creating the default set on first use) and
 /// run `f` against it. Centralizes the ensure + lock + access boilerplate.
@@ -177,6 +185,42 @@ pub fn current_sequence_bindings() -> Vec<(u16, String)> {
     with_set(|set| set.sequence_bindings.clone())
 }
 
+/// Arm (or disarm) pixel-pick capture; either way any previously latched key is dropped.
+pub fn arm_pick_capture(on: bool) {
+    PICK_KEY.store(0, Ordering::Release);
+    PICK_ARMED.store(on, Ordering::Release);
+}
+
+/// The key that ended pixel-pick capture, if one was pressed since arming (consumes it).
+pub fn take_pick_key() -> Option<u16> {
+    match PICK_KEY.swap(0, Ordering::AcqRel) {
+        0 => None,
+        vk => Some(vk as u16),
+    }
+}
+
+/// Pick-capture step for one hook event; returns true when the event must be swallowed.
+/// The first real key-down while armed is latched and disarms; that key's auto-repeats
+/// and its key-up are swallowed too.
+fn pick_capture_event(vk: u16, is_down: bool, is_own: bool) -> bool {
+    if is_own {
+        return false;
+    }
+    let held = PICK_SWALLOW_VK.load(Ordering::Acquire);
+    if held != 0 && held == vk as u32 {
+        if !is_down {
+            PICK_SWALLOW_VK.store(0, Ordering::Release);
+        }
+        return true;
+    }
+    if is_down && PICK_ARMED.swap(false, Ordering::AcqRel) {
+        PICK_SWALLOW_VK.store(vk as u32, Ordering::Release);
+        PICK_KEY.store(vk as u32, Ordering::Release);
+        return true;
+    }
+    false
+}
+
 /// Get current modifier state using GetAsyncKeyState.
 unsafe fn get_current_modifiers() -> u32 {
     let mut mods: u32 = 0;
@@ -204,6 +248,16 @@ unsafe extern "system" fn hotkey_hook_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
+    if n_code >= 0 {
+        let info = &*(l_param as *const KBDLLHOOKSTRUCT);
+        let msg = w_param as u32;
+        let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let is_injected = (info.flags & LLKHF_INJECTED) != 0;
+        if pick_capture_event(info.vkCode as u16, is_down, own_input(is_injected, info.dwExtraInfo)) {
+            return 1;
+        }
+    }
+
     if n_code >= 0 && w_param as u32 == WM_KEYDOWN {
         let info = &*(l_param as *const KBDLLHOOKSTRUCT);
         let is_injected = (info.flags & LLKHF_INJECTED) != 0;
@@ -284,5 +338,27 @@ mod tests {
         assert!(!own_input(true, 0)); // RustDesk/AnyDesk: injected, untagged
         assert!(!own_input(false, crate::player::CADENCE_INPUT_TAG)); // physical key
         assert!(!own_input(false, 0));
+    }
+
+    #[test]
+    fn pick_capture_latches_any_key_and_swallows_it() {
+        // Disarmed: nothing is swallowed or latched.
+        arm_pick_capture(false);
+        assert!(!pick_capture_event(0x41, true, false));
+        assert_eq!(take_pick_key(), None);
+
+        // Our own playback keys never end a pick.
+        arm_pick_capture(true);
+        assert!(!pick_capture_event(0x51, true, true));
+        assert_eq!(take_pick_key(), None);
+
+        // First real key (here Space) captures; repeats and its key-up are swallowed.
+        assert!(pick_capture_event(0x20, true, false));
+        assert!(pick_capture_event(0x20, true, false));
+        assert!(!pick_capture_event(0x41, true, false)); // other keys pass once captured
+        assert!(pick_capture_event(0x20, false, false));
+        assert!(!pick_capture_event(0x20, false, false));
+        assert_eq!(take_pick_key(), Some(0x20));
+        assert_eq!(take_pick_key(), None);
     }
 }

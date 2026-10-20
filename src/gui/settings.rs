@@ -653,6 +653,7 @@ unsafe extern "system" fn settings_wnd_proc(
                 if PICKING.load(Ordering::Acquire) {
                     // Stop picking — reset whichever section was active
                     PICKING.store(false, Ordering::Release);
+                    hotkeys::arm_pick_capture(false);
                     KillTimer(hwnd, TIMER_HP_PICK);
                     let active = PICK_TARGET.load(Ordering::Acquire);
                     let (_x, _y, _c, active_pick, active_live) = pick_ctrl_ids(active);
@@ -662,10 +663,11 @@ unsafe extern "system" fn settings_wnd_proc(
                     // Start picking — poll cursor every 50ms
                     PICK_TARGET.store(target, Ordering::Release);
                     PICKING.store(true, Ordering::Release);
+                    hotkeys::arm_pick_capture(true);
                     SetTimer(hwnd, TIMER_HP_PICK, 50, None);
                     let (_x, _y, _c, pick_id, live_id) = pick_ctrl_ids(target);
                     SetWindowTextW(GetDlgItem(hwnd, pick_id as i32), wide("Stop").as_ptr());
-                    let msg = format!("Move to {} pixel, press INSERT", BAR_LABELS[target as usize]);
+                    let msg = format!("Move to {} pixel, press any key (Esc cancels)", BAR_LABELS[target as usize]);
                     SetWindowTextW(GetDlgItem(hwnd, live_id as i32), wide(&msg).as_ptr());
                 }
                 return 0;
@@ -1023,7 +1025,7 @@ unsafe extern "system" fn settings_wnd_proc(
                             if cfg.idle_guard_enabled && cfg.idle_guard_color == 0 {
                                 let msg = wide(
                                     "Idle Guard is on, but no skill pixel has been sampled.\n\
-                                     Pick a pixel on a quickbar skill icon and press INSERT (or Sample) \
+                                     Pick a pixel on a quickbar skill icon and press any key (or Sample) \
                                      WHILE the skill shows its cooldown, then press OK again.",
                                 );
                                 let title = wide("Idle Guard");
@@ -1189,8 +1191,15 @@ unsafe extern "system" fn settings_wnd_proc(
                     SetWindowTextW(GetDlgItem(hwnd, live_id as i32), text.as_ptr());
                 }
 
-                let insert_down = GetAsyncKeyState(VK_INSERT) & (0x8000u16 as i16) != 0;
-                if insert_down {
+                // Any key ends the pick (the keyboard hook latches and swallows it);
+                // Esc cancels without capturing.
+                let pressed = hotkeys::take_pick_key();
+                if pressed == Some(VK_ESCAPE as u16) {
+                    PICKING.store(false, Ordering::Release);
+                    KillTimer(hwnd, TIMER_HP_PICK);
+                    SetWindowTextW(GetDlgItem(hwnd, pick_id as i32), wide("Pick").as_ptr());
+                    SetWindowTextW(GetDlgItem(hwnd, live_id as i32), wide("Pick cancelled").as_ptr());
+                } else if pressed.is_some() {
                     // Convert the captured screen point into the target window's
                     // client coords. If we couldn't resolve a top-level window,
                     // fall back to absolute coords (legacy behavior).
@@ -1263,6 +1272,12 @@ unsafe extern "system" fn settings_wnd_proc(
             }
             DestroyWindow(hwnd);
             SETTINGS_HWND.store(0, Ordering::Release);
+            0
+        }
+        WM_DESTROY => {
+            // Every exit path (X, OK mid-pick) — an armed pick would swallow the next keystroke.
+            PICKING.store(false, Ordering::Release);
+            hotkeys::arm_pick_capture(false);
             0
         }
         _ => DefWindowProcW(hwnd, msg, w_param, l_param),
